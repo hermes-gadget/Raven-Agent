@@ -46,7 +46,12 @@ pub async fn retrieve_task_context(
         if used + line.len() > budget_chars {
             let remaining = budget_chars.saturating_sub(used);
             if remaining > 16 {
-                packed.push_str(&line.chars().take(remaining.saturating_sub(1)).collect::<String>());
+                packed.push_str(
+                    &line
+                        .chars()
+                        .take(remaining.saturating_sub(1))
+                        .collect::<String>(),
+                );
                 packed.push('\n');
             }
             break;
@@ -185,9 +190,16 @@ mod tests {
     #[tokio::test]
     async fn store_outcome_tags_provenance() {
         let store = CountingStore::new();
-        store_task_outcome(&store, "agent finished chat screen", "run-1", "task-1", "agent-1", 0.7)
-            .await
-            .unwrap();
+        store_task_outcome(
+            &store,
+            "agent finished chat screen",
+            "run-1",
+            "task-1",
+            "agent-1",
+            0.7,
+        )
+        .await
+        .unwrap();
         let hits = store.search("chat screen", 5).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].tags.iter().any(|tag| tag == "run:run-1"));

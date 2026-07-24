@@ -112,7 +112,10 @@ pub enum ControlAuth {
 /// - When `expected_token` is `None`, local/unauthenticated clients are allowed
 ///   (matches the default single-operator local deployment).
 /// - When configured, the caller must supply the exact token.
-pub fn authorize_control(expected_token: Option<&str>, provided_token: Option<&str>) -> ControlAuth {
+pub fn authorize_control(
+    expected_token: Option<&str>,
+    provided_token: Option<&str>,
+) -> ControlAuth {
     match expected_token {
         None => ControlAuth::Allowed,
         Some(expected) if provided_token == Some(expected) => ControlAuth::Allowed,

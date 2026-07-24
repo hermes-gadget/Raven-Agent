@@ -518,8 +518,9 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         let now = Utc::now();
         let mut commands = Vec::with_capacity(rows.len());
         for row in rows {
-            let id = Uuid::parse_str(&row.0)
-                .map_err(|error| StoreError::InvalidStatus(format!("invalid control id: {error}")))?;
+            let id = Uuid::parse_str(&row.0).map_err(|error| {
+                StoreError::InvalidStatus(format!("invalid control id: {error}"))
+            })?;
             query("UPDATE run_controls SET status = 'claimed', claimed_at = ? WHERE id = ?")
                 .bind(now.to_rfc3339())
                 .bind(id.to_string())
@@ -543,13 +544,12 @@ impl OrchestrationStore for SqliteOrchestrationStore {
 
     async fn mark_control_applied(&self, command_id: Uuid) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let result = query(
-            "UPDATE run_controls SET status = 'applied', applied_at = ? WHERE id = ?",
-        )
-        .bind(&now)
-        .bind(command_id.to_string())
-        .execute(&self.pool)
-        .await?;
+        let result =
+            query("UPDATE run_controls SET status = 'applied', applied_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(command_id.to_string())
+                .execute(&self.pool)
+                .await?;
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!(
                 "control command '{command_id}' not found"
@@ -601,6 +601,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_control_row(
     id: Uuid,
     graph_id: String,
@@ -630,14 +631,18 @@ fn parse_control_row(
             .map(|value| {
                 DateTime::parse_from_rfc3339(&value)
                     .map(|date| date.with_timezone(&Utc))
-                    .map_err(|error| StoreError::InvalidStatus(format!("invalid claimed_at: {error}")))
+                    .map_err(|error| {
+                        StoreError::InvalidStatus(format!("invalid claimed_at: {error}"))
+                    })
             })
             .transpose()?,
         applied_at: applied_at
             .map(|value| {
                 DateTime::parse_from_rfc3339(&value)
                     .map(|date| date.with_timezone(&Utc))
-                    .map_err(|error| StoreError::InvalidStatus(format!("invalid applied_at: {error}")))
+                    .map_err(|error| {
+                        StoreError::InvalidStatus(format!("invalid applied_at: {error}"))
+                    })
             })
             .transpose()?,
     })
@@ -788,7 +793,13 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].kind, RunControlKind::Cancel);
         assert_eq!(claimed[0].status, RunControlStatus::Claimed);
-        assert!(store.claim_pending_controls(&graph_id).await.unwrap().is_empty());
+        assert!(
+            store
+                .claim_pending_controls(&graph_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         store.mark_control_applied(claimed[0].id).await.unwrap();
         let listed = store.list_controls(&graph_id, 10).await.unwrap();
