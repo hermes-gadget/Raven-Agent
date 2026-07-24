@@ -12,6 +12,7 @@ use sqlx_sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::control::{RunControlCommand, RunControlKind, RunControlStatus};
 use crate::lifecycle::AgentLifecycle;
 use crate::task_graph::{TaskGraph, TaskGraphStatus};
 
@@ -58,6 +59,22 @@ pub trait OrchestrationStore: Send + Sync {
     async fn save_lock_snapshot(&self, snapshot: &str) -> Result<(), StoreError>;
     /// Load the most recent file lock snapshot.
     async fn load_lock_snapshot(&self) -> Result<Option<String>, StoreError>;
+
+    /// Enqueue a live control command for a graph UUID.
+    async fn enqueue_control(&self, command: &RunControlCommand) -> Result<(), StoreError>;
+    /// Atomically claim all pending control commands for a graph.
+    async fn claim_pending_controls(
+        &self,
+        graph_id: &str,
+    ) -> Result<Vec<RunControlCommand>, StoreError>;
+    /// Mark a claimed control command as applied by the owner process.
+    async fn mark_control_applied(&self, command_id: Uuid) -> Result<(), StoreError>;
+    /// List recent control commands for a graph (newest first).
+    async fn list_controls(
+        &self,
+        graph_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunControlCommand>, StoreError>;
 
     /// Initialize the database (create tables if needed).
     async fn initialize(&self) -> Result<(), StoreError>;
@@ -155,6 +172,33 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 snapshot_json TEXT NOT NULL,
                 saved_at TEXT NOT NULL
             )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        query(
+            r#"
+            CREATE TABLE IF NOT EXISTS run_controls (
+                id TEXT PRIMARY KEY,
+                graph_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                reason TEXT,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                claimed_at TEXT,
+                applied_at TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_run_controls_graph_status
+            ON run_controls(graph_id, status, created_at)
             "#,
         )
         .execute(&self.pool)
@@ -418,6 +462,185 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         .await?;
         Ok(row.map(|r| r.0))
     }
+
+    async fn enqueue_control(&self, command: &RunControlCommand) -> Result<(), StoreError> {
+        query(
+            r#"
+            INSERT INTO run_controls
+                (id, graph_id, kind, reason, source, status, created_at, claimed_at, applied_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(command.id.to_string())
+        .bind(&command.graph_id)
+        .bind(command.kind.as_str())
+        .bind(&command.reason)
+        .bind(&command.source)
+        .bind(command.status.as_str())
+        .bind(command.created_at.to_rfc3339())
+        .bind(command.claimed_at.map(|value| value.to_rfc3339()))
+        .bind(command.applied_at.map(|value| value.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn claim_pending_controls(
+        &self,
+        graph_id: &str,
+    ) -> Result<Vec<RunControlCommand>, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let rows = query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT id, graph_id, kind, reason, source, status, created_at, claimed_at, applied_at
+            FROM run_controls
+            WHERE graph_id = ? AND status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(graph_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let now = Utc::now();
+        let mut commands = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = Uuid::parse_str(&row.0)
+                .map_err(|error| StoreError::InvalidStatus(format!("invalid control id: {error}")))?;
+            query("UPDATE run_controls SET status = 'claimed', claimed_at = ? WHERE id = ?")
+                .bind(now.to_rfc3339())
+                .bind(id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            commands.push(parse_control_row(
+                id,
+                row.1,
+                row.2,
+                row.3,
+                row.4,
+                "claimed",
+                row.6,
+                Some(now.to_rfc3339()),
+                row.8,
+            )?);
+        }
+        transaction.commit().await?;
+        Ok(commands)
+    }
+
+    async fn mark_control_applied(&self, command_id: Uuid) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let result = query(
+            "UPDATE run_controls SET status = 'applied', applied_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(command_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!(
+                "control command '{command_id}' not found"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_controls(
+        &self,
+        graph_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunControlCommand>, StoreError> {
+        let rows = query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT id, graph_id, kind, reason, source, status, created_at, claimed_at, applied_at
+            FROM run_controls
+            WHERE graph_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(graph_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id = Uuid::parse_str(&row.0).map_err(|error| {
+                    StoreError::InvalidStatus(format!("invalid control id: {error}"))
+                })?;
+                parse_control_row(id, row.1, row.2, row.3, row.4, &row.5, row.6, row.7, row.8)
+            })
+            .collect()
+    }
+}
+
+fn parse_control_row(
+    id: Uuid,
+    graph_id: String,
+    kind: String,
+    reason: Option<String>,
+    source: String,
+    status: &str,
+    created_at: String,
+    claimed_at: Option<String>,
+    applied_at: Option<String>,
+) -> Result<RunControlCommand, StoreError> {
+    let kind = RunControlKind::parse(&kind)
+        .ok_or_else(|| StoreError::InvalidStatus(format!("invalid control kind '{kind}'")))?;
+    let status = RunControlStatus::parse(status)
+        .ok_or_else(|| StoreError::InvalidStatus(format!("invalid control status '{status}'")))?;
+    Ok(RunControlCommand {
+        id,
+        graph_id,
+        kind,
+        reason,
+        source,
+        status,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|error| StoreError::InvalidStatus(format!("invalid created_at: {error}")))?
+            .with_timezone(&Utc),
+        claimed_at: claimed_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|date| date.with_timezone(&Utc))
+                    .map_err(|error| StoreError::InvalidStatus(format!("invalid claimed_at: {error}")))
+            })
+            .transpose()?,
+        applied_at: applied_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|date| date.with_timezone(&Utc))
+                    .map_err(|error| StoreError::InvalidStatus(format!("invalid applied_at: {error}")))
+            })
+            .transpose()?,
+    })
 }
 
 fn graph_status_label(status: TaskGraphStatus) -> &'static str {
@@ -545,5 +768,30 @@ mod tests {
         assert_eq!(summaries[0].run_id, run_id);
         assert_eq!(summaries[0].status, "paused");
         assert_eq!(store.find_unfinished_graphs().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_commands_are_claimed_once_and_applied() {
+        use crate::control::{RunControlCommand, RunControlKind, RunControlStatus};
+
+        let store = setup_store().await;
+        let graph_id = Uuid::new_v4().to_string();
+        let command = RunControlCommand::new(
+            &graph_id,
+            RunControlKind::Cancel,
+            "cli",
+            Some("stop now".into()),
+        );
+        store.enqueue_control(&command).await.unwrap();
+
+        let claimed = store.claim_pending_controls(&graph_id).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].kind, RunControlKind::Cancel);
+        assert_eq!(claimed[0].status, RunControlStatus::Claimed);
+        assert!(store.claim_pending_controls(&graph_id).await.unwrap().is_empty());
+
+        store.mark_control_applied(claimed[0].id).await.unwrap();
+        let listed = store.list_controls(&graph_id, 10).await.unwrap();
+        assert_eq!(listed[0].status, RunControlStatus::Applied);
     }
 }

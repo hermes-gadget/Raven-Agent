@@ -12,6 +12,7 @@
 //! independent workstreams → spawn parallel sub-agents → merge results.
 
 pub mod composer;
+pub mod control;
 pub mod file_lock;
 pub mod lifecycle;
 pub mod merge;
@@ -23,6 +24,7 @@ pub mod task_graph;
 pub use composer::{
     Composer, capabilities_to_tools, default_agent_tools, default_capabilities_for_goal,
 };
+pub use control::{ControlAuth, RunControlCommand, RunControlKind, RunControlStatus, authorize_control};
 pub use file_lock::{FileLock, FileLockManager};
 pub use lifecycle::{AgentLifecycle, AgentPhase};
 pub use merge::{MergeResolver, MergeStrategy};
