@@ -110,7 +110,9 @@ When enabled in gateway configuration, **raven serve** starts and gracefully sto
 
 ### Scheduler
 
-CLI scheduler commands load and persist definitions in SQLite on every invocation. Hosted runtime jobs resolve a registered agent and fail clearly if runtime wiring is absent. Continuous execution requires a process that starts and keeps the scheduler loop and runtime alive.
+CLI scheduler commands load and persist definitions in SQLite on every invocation. **raven schedule host** keeps the scheduler, SQLite store, runtime agent, memory, tools, and audit logger alive until SIGINT/SIGTERM. It starts only when `scheduler.enabled` is true.
+
+The host coalesces missed cron occurrences into one immediate execution after restart. Per-job overlap defaults to one execution; an overlapping due occurrence remains pending until the prior run finishes. `scheduler.max_concurrent` bounds total host executions. Shutdown stops new dispatch immediately and waits for in-flight jobs. Starts and terminal outcomes are written to the audit log, while durable outcomes in `scheduler_runs` back **raven schedule status** and **raven schedule history**.
 
 ## Data paths
 

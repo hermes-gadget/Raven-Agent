@@ -16,4 +16,6 @@ pub mod store;
 
 pub use job::{CronField, Job, JobId, JobTask, Schedule, noop_task};
 pub use scheduler::Scheduler;
-pub use store::{PersistedJob, SchedulerJobConfig, SchedulerStore, SqliteSchedulerStore};
+pub use store::{
+    JobRun, JobRunStatus, PersistedJob, SchedulerJobConfig, SchedulerStore, SqliteSchedulerStore,
+};

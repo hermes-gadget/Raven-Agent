@@ -314,6 +314,9 @@ enum Commands {
     Schedule {
         #[command(subcommand)]
         action: ScheduleAction,
+        /// Optional config file path.
+        #[arg(short, long, global = true, env = "RAVEN_CONFIG")]
+        config: Option<PathBuf>,
     },
 
     /// List configured providers with health status.
@@ -366,6 +369,16 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ScheduleAction {
+    /// Continuously host due jobs until SIGINT/SIGTERM.
+    Host,
+    /// Show scheduler configuration, job counts, and the latest outcome.
+    Status,
+    /// Show recent durable execution outcomes.
+    History {
+        /// Maximum number of outcomes to show.
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Add a new scheduled job.
     Add {
         /// Human-readable name for this job.
@@ -584,7 +597,7 @@ pub async fn run(default_to_ui: bool) -> anyhow::Result<()> {
         Some(Commands::Serve { addr, config }) => cmd_serve(addr, config).await,
         Some(Commands::Ui { db_path }) => cmd_ui(db_path).await,
         Some(Commands::Config { path, edit }) => cmd_config(path, edit),
-        Some(Commands::Schedule { action }) => cmd_schedule(action).await,
+        Some(Commands::Schedule { action, config }) => cmd_schedule(action, config).await,
         Some(Commands::Providers { action, config }) => cmd_providers(action, config).await,
         Some(Commands::Eval { action }) => cmd_eval(action).await,
         Some(Commands::Skills { action }) => cmd_skills(action).await,
@@ -2202,8 +2215,8 @@ async fn cmd_ui(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// `raven schedule` — Manage scheduled cron jobs.
-async fn cmd_schedule(action: ScheduleAction) -> anyhow::Result<()> {
-    let config = load_config(None)?;
+async fn cmd_schedule(action: ScheduleAction, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = load_config(config_path.as_deref())?;
     let db_path = config.scheduler.db_path.as_ref().map_or_else(
         || {
             config.general.data_dir.clone().map_or_else(
@@ -2229,9 +2242,146 @@ async fn cmd_schedule(action: ScheduleAction) -> anyhow::Result<()> {
         )
     })?);
     let scheduler = Scheduler::new(config.scheduler.clone()).with_store(store);
-    scheduler.start().await?;
+    scheduler.load_persisted().await?;
 
     match action {
+        ScheduleAction::Host => {
+            if !config.scheduler.enabled {
+                println!(
+                    "Scheduler host is disabled. Set scheduler.enabled: true in the Raven config."
+                );
+                return Ok(());
+            }
+
+            let provider_cfg = config
+                .models
+                .providers
+                .get(&config.models.default_provider)
+                .cloned()
+                .unwrap_or_else(|| odin_core::config::ProviderConfig {
+                    provider_type: "openai_compat".into(),
+                    base_url: Some("http://localhost:11434/v1".into()),
+                    api_key: None,
+                    api_key_env: None,
+                    default_model: None,
+                    headers: Default::default(),
+                    timeout_secs: 120,
+                    max_retries: 3,
+                    fallback_chain: None,
+                    health_check_interval_secs: 0,
+                    circuit_breaker_threshold: 0,
+                });
+            let provider = odin_providers::create_provider(&provider_cfg)?;
+            let policy_engine = Arc::new(odin_permissions::PolicyEngine::new(
+                config.safety.permissions.clone(),
+                &config.safety.dangerous_commands,
+                config.tools.path_boundary.clone(),
+                config.safety.max_rate_per_minute,
+                config.safety.require_approval,
+            ));
+            let sandbox = Arc::new(odin_tools::Sandbox::new(config.tools.path_boundary.clone()));
+            let enabled_tools = config.tools.effective_enabled_tools();
+            let tool_registry = Arc::new(build_tool_registry_with(sandbox, Some(&enabled_tools)));
+            load_mcp_tools(&tool_registry, &config).await;
+            let tools: Vec<Arc<dyn Tool>> = tool_registry
+                .list_schemas()
+                .iter()
+                .filter_map(|schema| tool_registry.get(&schema.function.name))
+                .collect();
+            let audit_logger = Arc::new(build_audit_logger(&config));
+            let engine = odin_loop::LoopEngine::new()
+                .with_provider(provider.clone())
+                .with_model_name(config.models.default_model.clone().unwrap_or_default())
+                .with_policy_engine(policy_engine)
+                .with_max_iterations(config.agent.max_iterations)
+                .with_tool_registry(tool_registry)
+                .with_audit_logger(audit_logger.clone());
+            let agent = Agent::new("scheduler-host", Arc::new(engine), provider, tools);
+            let runtime = Arc::new(
+                Runtime::new()
+                    .with_memory(Arc::new(build_memory_store(&config)?))
+                    .with_default_max_iterations(config.agent.max_iterations),
+            );
+            runtime.register_agent(agent);
+
+            let store = Arc::new(SqliteSchedulerStore::new(&db_path_str)?);
+            let host = Scheduler::new(config.scheduler.clone())
+                .with_store(store)
+                .with_runtime(runtime)
+                .with_audit_logger(audit_logger);
+            host.start().await?;
+            println!(
+                "Scheduler host running: {} job(s), tick={}s, concurrency={}.",
+                host.job_count().await,
+                config.scheduler.check_interval_secs,
+                config.scheduler.max_concurrent
+            );
+            println!("Press Ctrl-C to stop; in-flight jobs will be allowed to finish.");
+            wait_for_shutdown_signal().await?;
+            println!("Shutdown requested; draining scheduler jobs...");
+            host.stop().await?;
+            println!("Scheduler host stopped.");
+            return Ok(());
+        }
+        ScheduleAction::Status => {
+            let jobs = scheduler.list_jobs().await;
+            let enabled_jobs = jobs.iter().filter(|job| job.enabled).count();
+            let latest = scheduler.recent_runs(1).await?.into_iter().next();
+            println!("Scheduler health:");
+            println!(
+                "  Host mode: {}",
+                if config.scheduler.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("  Database: {}", db_path.display());
+            println!(
+                "  Jobs: {} total, {} enabled, {} disabled",
+                jobs.len(),
+                enabled_jobs,
+                jobs.len() - enabled_jobs
+            );
+            println!(
+                "  Tick/concurrency: {}s / {}",
+                config.scheduler.check_interval_secs, config.scheduler.max_concurrent
+            );
+            if let Some(run) = latest {
+                println!(
+                    "  Latest outcome: {:?} — {} at {}{}",
+                    run.status,
+                    run.job_name,
+                    run.started_at.to_rfc3339(),
+                    run.error
+                        .as_deref()
+                        .map(|error| format!(" ({error})"))
+                        .unwrap_or_default()
+                );
+            } else {
+                println!("  Latest outcome: none");
+            }
+        }
+        ScheduleAction::History { limit } => {
+            let runs = scheduler.recent_runs(limit).await?;
+            if runs.is_empty() {
+                println!("No scheduler execution history.");
+            }
+            for run in runs {
+                println!(
+                    "{:?} {} job={} task={} started={}{}",
+                    run.status,
+                    run.job_name,
+                    run.job_id,
+                    run.task_id,
+                    run.started_at.to_rfc3339(),
+                    run.error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         ScheduleAction::Add {
             name,
             schedule,
@@ -2305,8 +2455,22 @@ async fn cmd_schedule(action: ScheduleAction) -> anyhow::Result<()> {
         }
     }
 
-    scheduler.stop().await?;
+    Ok(())
+}
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
@@ -3706,6 +3870,18 @@ mod tests {
     fn test_cli_parses_schedule_list() {
         let cli = Cli::parse_from(["raven", "schedule", "list"]);
         assert!(matches!(cli.command, Some(Commands::Schedule { .. })));
+    }
+
+    #[test]
+    fn test_cli_parses_schedule_host_and_health_surfaces() {
+        for args in [
+            vec!["raven", "schedule", "host"],
+            vec!["raven", "schedule", "status"],
+            vec!["raven", "schedule", "history", "--limit", "5"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(matches!(cli.command, Some(Commands::Schedule { .. })));
+        }
     }
 
     #[test]
