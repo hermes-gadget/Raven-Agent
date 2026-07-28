@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 odin-core.workspace = true
+odin-permissions.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

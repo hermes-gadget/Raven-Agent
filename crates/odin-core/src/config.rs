@@ -588,6 +588,12 @@ pub struct GatewayConfig {
     /// Discord token env var name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord_token_env: Option<String>,
+
+    /// Optional shared secret required for remote orchestration control
+    /// (WebSocket pause/resume/cancel). When unset, local unauthenticated
+    /// control is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
 }
 
 fn default_http_addr() -> String {
@@ -602,6 +608,7 @@ impl Default for GatewayConfig {
             discord_enabled: false,
             discord_token: None,
             discord_token_env: None,
+            control_token: None,
         }
     }
 }

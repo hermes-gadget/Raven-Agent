@@ -335,6 +335,12 @@ pub struct WsConnectionManager {
 
     /// Start time for uptime calculation.
     start_time: Arc<std::time::Instant>,
+
+    /// Optional orchestration store used to dispatch live control commands.
+    control_store: Option<Arc<odin_orchestrator::persistence::SqliteOrchestrationStore>>,
+
+    /// Optional shared secret required for remote control commands.
+    control_token: Option<String>,
 }
 
 impl WsConnectionManager {
@@ -345,7 +351,20 @@ impl WsConnectionManager {
             connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             broadcast_tx: tx,
             start_time: Arc::new(std::time::Instant::now()),
+            control_store: None,
+            control_token: None,
         }
+    }
+
+    /// Attach an orchestration store and optional control token for live dispatch.
+    pub fn with_control(
+        mut self,
+        store: Arc<odin_orchestrator::persistence::SqliteOrchestrationStore>,
+        control_token: Option<String>,
+    ) -> Self {
+        self.control_store = Some(store);
+        self.control_token = control_token;
+        self
     }
 
     /// Get the current uptime in seconds.
@@ -393,6 +412,48 @@ impl WsConnectionManager {
     /// Check if at connection limit.
     pub fn at_capacity(&self, config: &WsConfig) -> bool {
         self.connection_count() >= config.max_connections
+    }
+
+    /// Dispatch a live control command from an authorized WebSocket client.
+    pub async fn dispatch_control(
+        &self,
+        kind: odin_orchestrator::RunControlKind,
+        graph_id: &str,
+        token: Option<&str>,
+        reason: Option<String>,
+        source: &str,
+    ) -> Result<odin_orchestrator::RunControlCommand, String> {
+        use odin_orchestrator::persistence::OrchestrationStore;
+        use odin_orchestrator::{ControlAuth, RunControlCommand, authorize_control};
+
+        match authorize_control(self.control_token.as_deref(), token) {
+            ControlAuth::Allowed => {}
+            ControlAuth::Denied(message) => return Err(message.to_string()),
+        }
+        let Some(store) = &self.control_store else {
+            return Err("orchestration control store is not configured".into());
+        };
+        if graph_id.trim().is_empty() {
+            return Err("graph_id is required".into());
+        }
+        // Reject control for unknown graphs so disconnected/stale owners fail closed.
+        store
+            .load_task_graph(graph_id)
+            .await
+            .map_err(|_| format!("graph '{graph_id}' not found"))?;
+        let command = RunControlCommand::new(graph_id, kind, source, reason);
+        store
+            .enqueue_control(&command)
+            .await
+            .map_err(|error| format!("failed to enqueue control: {error}"))?;
+        // Keep persisted status consistent with the live command.
+        let status = match kind {
+            odin_orchestrator::RunControlKind::Pause => "paused",
+            odin_orchestrator::RunControlKind::Resume => "running",
+            odin_orchestrator::RunControlKind::Cancel => "cancelled",
+        };
+        let _ = store.update_graph_status(graph_id, status).await;
+        Ok(command)
     }
 }
 
@@ -498,9 +559,71 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                             conn_mgr.broadcast(&ws_msg);
                             tracing::info!("[WS] Task submitted by {conn_id_clone}");
                         }
-                        "task_cancel" => {
-                            conn_mgr.broadcast(&ws_msg);
-                            tracing::info!("[WS] Task cancel requested by {conn_id_clone}");
+                        "task_cancel" | "task_pause" | "task_resume" => {
+                            let kind = match ws_msg.msg_type.as_str() {
+                                "task_cancel" => odin_orchestrator::RunControlKind::Cancel,
+                                "task_pause" => odin_orchestrator::RunControlKind::Pause,
+                                _ => odin_orchestrator::RunControlKind::Resume,
+                            };
+                            let payload = ws_msg.payload.clone().unwrap_or(serde_json::json!({}));
+                            let graph_id = payload
+                                .get("graph_id")
+                                .or_else(|| payload.get("run_id"))
+                                .or_else(|| payload.get("task_id"))
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let token = payload
+                                .get("token")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string);
+                            let reason = payload
+                                .get("reason")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string);
+                            match conn_mgr
+                                .dispatch_control(
+                                    kind,
+                                    &graph_id,
+                                    token.as_deref(),
+                                    reason,
+                                    &format!("ws:{conn_id_clone}"),
+                                )
+                                .await
+                            {
+                                Ok(command) => {
+                                    let ack = WsMessage {
+                                        msg_type: "control_ack".into(),
+                                        payload: Some(serde_json::json!({
+                                            "command_id": command.id,
+                                            "graph_id": command.graph_id,
+                                            "kind": command.kind.as_str(),
+                                            "status": "enqueued",
+                                        })),
+                                        correlation_id: ws_msg.correlation_id.clone(),
+                                    };
+                                    conn_mgr.broadcast(&ack);
+                                    tracing::info!(
+                                        "[WS] Control {:?} enqueued for {} by {conn_id_clone}",
+                                        kind,
+                                        graph_id
+                                    );
+                                }
+                                Err(error) => {
+                                    let err = WsMessage {
+                                        msg_type: "control_error".into(),
+                                        payload: Some(serde_json::json!({
+                                            "error": error,
+                                            "graph_id": graph_id,
+                                        })),
+                                        correlation_id: ws_msg.correlation_id.clone(),
+                                    };
+                                    conn_mgr.broadcast(&err);
+                                    tracing::warn!(
+                                        "[WS] Control rejected from {conn_id_clone}: {error}"
+                                    );
+                                }
+                            }
                         }
                         "status_query" => {
                             let status = WsMessage::status(
@@ -625,6 +748,9 @@ impl WsGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use odin_orchestrator::persistence::{OrchestrationStore, SqliteOrchestrationStore};
+    use odin_orchestrator::task_graph::{TaskGraph, TaskGraphStatus};
+    use odin_orchestrator::{RunControlKind, RunControlStatus};
 
     #[test]
     fn test_ws_config_default() {
@@ -766,5 +892,47 @@ mod tests {
         assert!(!mgr.at_capacity(&config));
         let _rx = mgr.register();
         assert!(mgr.at_capacity(&config));
+    }
+
+    #[tokio::test]
+    async fn websocket_control_requires_token_and_enqueues_for_known_graph() {
+        let store = Arc::new(SqliteOrchestrationStore::new_in_memory().await.unwrap());
+        store.initialize().await.unwrap();
+        let mut graph = TaskGraph::new("controlled run");
+        graph.status = TaskGraphStatus::Running;
+        let graph_id = graph.id.to_string();
+        store.save_task_graph(&graph).await.unwrap();
+
+        let manager =
+            WsConnectionManager::new(16).with_control(store.clone(), Some("secret".into()));
+        let denied = manager
+            .dispatch_control(
+                RunControlKind::Cancel,
+                &graph_id,
+                Some("wrong"),
+                None,
+                "ws:test",
+            )
+            .await;
+        assert!(denied.is_err());
+        assert!(store.list_controls(&graph_id, 10).await.unwrap().is_empty());
+
+        manager
+            .dispatch_control(
+                RunControlKind::Cancel,
+                &graph_id,
+                Some("secret"),
+                Some("stop".into()),
+                "ws:test",
+            )
+            .await
+            .unwrap();
+        let controls = store.list_controls(&graph_id, 10).await.unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].status, RunControlStatus::Pending);
+        assert_eq!(
+            store.load_task_graph(&graph_id).await.unwrap().status,
+            TaskGraphStatus::Cancelled
+        );
     }
 }

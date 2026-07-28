@@ -915,12 +915,14 @@ async fn run_orchestrated(
     tool_registry: Arc<odin_tools::ToolRegistry>,
     _sandbox: Arc<odin_tools::Sandbox>,
     config: &OdinConfig,
-    _memory: Arc<odin_memory::SqliteMemoryStore>,
+    memory: Arc<odin_memory::SqliteMemoryStore>,
     audit_logger: Arc<odin_audit::AuditLoggerImpl>,
     reliability_tracker: Arc<odin_tools::ReliabilityTracker>,
 ) -> anyhow::Result<()> {
+    use odin_orchestrator::RunControlKind;
     use odin_orchestrator::composer::ComposerConfig;
     use odin_orchestrator::merge::{MergeStrategy, SubAgentResult};
+    use odin_orchestrator::persistence::OrchestrationStore;
 
     let mut composer = Composer::new(ComposerConfig {
         max_parallel: 10,
@@ -947,6 +949,9 @@ async fn run_orchestrated(
     store
         .save_task_graph(composer.get_graph(goal).unwrap())
         .await?;
+    let memory_enabled = config.memory.enabled;
+    let memory_max_entries = config.memory.max_entries.max(1);
+    let run_id_str = run_id.to_string();
 
     println!("╔══════════════════════════════════════════╗");
     println!("║     Raven Agent — Orchestrated Run      ║");
@@ -1033,16 +1038,68 @@ async fn run_orchestrated(
     );
 
     let all_agent_ids: Vec<uuid::Uuid> = pending.iter().map(|agent| agent.agent_id).collect();
+    let mut paused = false;
+    let mut cancelled = false;
     let execution_result: anyhow::Result<()> = async {
         while terminal.len() < pending.len() {
+            // Apply live cross-process control commands (CLI/WS/second process).
+            let controls = store
+                .claim_pending_controls(&run_id_str)
+                .await
+                .map_err(|error| anyhow::anyhow!("Failed to claim control commands: {error}"))?;
+            for command in controls {
+                match command.kind {
+                    RunControlKind::Pause => {
+                        paused = true;
+                        composer.set_graph_status(
+                            &root_goal,
+                            odin_orchestrator::task_graph::TaskGraphStatus::Paused,
+                        );
+                        println!("⏸️  Live pause received from {}", command.source);
+                    }
+                    RunControlKind::Resume => {
+                        paused = false;
+                        composer.set_graph_status(
+                            &root_goal,
+                            odin_orchestrator::task_graph::TaskGraphStatus::Running,
+                        );
+                        println!("▶️  Live resume received from {}", command.source);
+                    }
+                    RunControlKind::Cancel => {
+                        cancelled = true;
+                        composer.set_graph_status(
+                            &root_goal,
+                            odin_orchestrator::task_graph::TaskGraphStatus::Cancelled,
+                        );
+                        println!("🛑 Live cancel received from {}", command.source);
+                    }
+                }
+                if let Some(graph) = composer.get_graph(&root_goal) {
+                    store.save_task_graph(graph).await?;
+                }
+                store.mark_control_applied(command.id).await?;
+            }
+            if cancelled {
+                agent_handles.abort_all_and_drain().await;
+                composer.cancel_all("cancelled by live control command");
+                for agent_id in &all_agent_ids {
+                    let _ =
+                        persist_orchestration_state(&store, &composer, &root_goal, *agent_id).await;
+                }
+                break;
+            }
             // Start any queued agents that can acquire locks now.
-            let mut ordered: Vec<_> = pending
-                .iter()
-                .filter(|agent| {
-                    !spawned.contains(&agent.agent_id) && !terminal.contains(&agent.agent_id)
-                })
-                .cloned()
-                .collect();
+            let mut ordered: Vec<_> = if paused {
+                Vec::new()
+            } else {
+                pending
+                    .iter()
+                    .filter(|agent| {
+                        !spawned.contains(&agent.agent_id) && !terminal.contains(&agent.agent_id)
+                    })
+                    .cloned()
+                    .collect()
+            };
             ordered.sort_by_key(|agent| (agent.priority, agent.label.clone()));
 
             for agent in ordered {
@@ -1079,10 +1136,12 @@ async fn run_orchestrated(
                         let policy_engine = policy_engine.clone();
                         let audit_logger = audit_logger.clone();
                         let reliability_tracker = reliability_tracker.clone();
+                        let memory = memory.clone();
                         let task_goal = agent.task_goal.clone();
                         let label_for_result = agent.label.clone();
                         let model_name = model_name.clone();
                         let agent_id = agent.agent_id;
+                        let run_id_for_mem = run_id_str.clone();
 
                         agent_handles.spawn(agent.agent_id, async move {
                             let mut final_result = Err(odin_core::error::OdinError::Internal(
@@ -1100,10 +1159,32 @@ async fn run_orchestrated(
                                     .with_audit_logger(audit_logger.clone())
                                     .with_reliability_tracker(reliability_tracker.clone());
 
+                                let task_id = uuid::Uuid::new_v4();
+                                let context = if memory_enabled {
+                                    match odin_memory::retrieve_task_context(
+                                        memory.as_ref(),
+                                        &task_goal,
+                                        memory_max_entries.min(8),
+                                        odin_memory::DEFAULT_CONTEXT_CHARS,
+                                    )
+                                    .await
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "[ORCH] memory retrieve failed for '{}': {error}",
+                                                label_for_result
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 let task = AgentTask {
-                                    id: uuid::Uuid::new_v4(),
+                                    id: task_id,
                                     goal: task_goal.clone(),
-                                    context: None,
+                                    context,
                                     sub_tasks: vec![],
                                     success_criteria: vec![],
                                     max_iterations,
@@ -1117,6 +1198,26 @@ async fn run_orchestrated(
 
                                 let is_success =
                                     result.as_ref().map(|r| r.success).unwrap_or(false);
+
+                                if memory_enabled && let Ok(task_result) = result.as_ref() {
+                                    let redacted = odin_permissions::SecretRedactor::full()
+                                        .redact(&task_result.summary);
+                                    if let Err(error) = odin_memory::store_task_outcome(
+                                        memory.as_ref(),
+                                        redacted,
+                                        &run_id_for_mem,
+                                        &task_id.to_string(),
+                                        &agent_id.to_string(),
+                                        if task_result.success { 0.7 } else { 0.3 },
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            "[ORCH] memory store failed for '{}': {error}",
+                                            label_for_result
+                                        );
+                                    }
+                                }
 
                                 if is_success || attempt == max_retries {
                                     final_result = result;
@@ -1157,6 +1258,10 @@ async fn run_orchestrated(
             }
 
             if agent_handles.is_empty() {
+                if paused {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
                 // No in-flight work remains, but some agents never started — fail them.
                 let stuck: Vec<uuid::Uuid> = pending
                     .iter()
@@ -1177,10 +1282,12 @@ async fn run_orchestrated(
             }
 
             // Process whichever agent finishes first so its locks are released promptly.
-            let (spawned_agent_id, completion) = agent_handles
-                .join_next()
-                .await
-                .expect("non-empty orchestration task set must yield a completion");
+            let joined = tokio::select! {
+                joined = agent_handles.join_next() => joined,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => continue,
+            };
+            let (spawned_agent_id, completion) =
+                joined.expect("non-empty orchestration task set must yield a completion");
             match completion {
                 Ok((agent_id, label, result, elapsed)) => {
                     match result {
@@ -1599,7 +1706,17 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
 
             match store.update_graph_status(&id, "cancelled").await {
                 Ok(()) => {
-                    println!("🛑 Task graph '{}' cancelled.", id);
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &id,
+                        odin_orchestrator::RunControlKind::Cancel,
+                        "cli:orchestrate-cancel",
+                        Some("cancelled via raven orchestrate cancel".into()),
+                    );
+                    if let Err(error) = store.enqueue_control(&command).await {
+                        println!("⚠️  Status updated but live control enqueue failed: {error}");
+                    } else {
+                        println!("🛑 Task graph '{}' cancelled (live control enqueued).", id);
+                    }
                     // Also cancel any associated agent lifecycles
                     let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
                     for lc in &lifecycles {
@@ -1638,11 +1755,18 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             for g in &graphs {
                 if g.status != "complete" && g.status != "failed" && g.status != "cancelled" {
                     let _ = store.update_graph_status(&g.run_id, "paused").await;
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &g.run_id,
+                        odin_orchestrator::RunControlKind::Pause,
+                        "cli:orchestrate-pause",
+                        None,
+                    );
+                    let _ = store.enqueue_control(&command).await;
                     paused += 1;
                 }
             }
             println!(
-                "Marked {} stored task graph(s) as paused. This does not signal a separate running process.",
+                "Marked {} stored task graph(s) as paused and enqueued live pause control.",
                 paused
             );
         }
@@ -1659,11 +1783,18 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             for g in &graphs {
                 if g.status == "paused" {
                     let _ = store.update_graph_status(&g.run_id, "running").await;
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &g.run_id,
+                        odin_orchestrator::RunControlKind::Resume,
+                        "cli:orchestrate-resume",
+                        None,
+                    );
+                    let _ = store.enqueue_control(&command).await;
                     resumed += 1;
                 }
             }
             println!(
-                "Marked {} stored task graph(s) as running. Use 'raven run <goal>' to execute work.",
+                "Marked {} stored task graph(s) as running and enqueued live resume control.",
                 resumed
             );
         }
@@ -2120,7 +2251,21 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     println!("╚══════════════════════════════════════════╝");
     println!();
 
-    let ws_manager = Arc::new(odin_gateway::ws::WsConnectionManager::new(256));
+    let orch_store = Arc::new(
+        odin_orchestrator::persistence::SqliteOrchestrationStore::new(dirs_state_path(
+            "orchestration.db",
+        ))
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to open orchestration store: {error}"))?,
+    );
+    orch_store
+        .initialize()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to initialize orchestration store: {error}"))?;
+    let ws_manager = Arc::new(
+        odin_gateway::ws::WsConnectionManager::new(256)
+            .with_control(orch_store, config.gateway.control_token.clone()),
+    );
     let server_result = odin_gateway::run_http_server_with_approvals(
         &addr,
         Some(handler),

@@ -39,11 +39,14 @@ pub async fn retrieve_task_context(
         return Ok(None);
     }
 
+    let redactor = odin_permissions::SecretRedactor::full();
     let mut packed = String::from("Relevant memory:\n");
-    let mut used = packed.len();
+    let mut used = packed.chars().count();
     for entry in entries {
-        let line = format!("- [{}] {}\n", entry.category, entry.content.trim());
-        if used + line.len() > budget_chars {
+        let content = redactor.redact(entry.content.trim());
+        let line = format!("- [{}] {content}\n", entry.category);
+        let line_chars = line.chars().count();
+        if used + line_chars > budget_chars {
             let remaining = budget_chars.saturating_sub(used);
             if remaining > 16 {
                 packed.push_str(
@@ -57,7 +60,7 @@ pub async fn retrieve_task_context(
             break;
         }
         packed.push_str(&line);
-        used += line.len();
+        used += line_chars;
     }
 
     if packed.trim() == "Relevant memory:" {
@@ -75,7 +78,7 @@ pub async fn store_task_outcome(
     agent_id: &str,
     importance: f32,
 ) -> OdinResult<()> {
-    let content = content.into();
+    let content = odin_permissions::SecretRedactor::full().redact(&content.into());
     if content.trim().is_empty() {
         return Ok(());
     }
@@ -183,7 +186,7 @@ mod tests {
             .expect("expected memory hit");
         assert!(context.contains("SX1262"));
         assert!(!context.contains("pasta"));
-        assert!(context.len() <= 200);
+        assert!(context.chars().count() <= 200);
         assert_eq!(store.searches.load(Ordering::SeqCst), 1);
     }
 
@@ -205,5 +208,68 @@ mod tests {
         assert!(hits[0].tags.iter().any(|tag| tag == "run:run-1"));
         assert!(hits[0].tags.iter().any(|tag| tag == "agent:agent-1"));
         assert_eq!(store.stores.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_and_outcomes_are_redacted() {
+        let store = CountingStore::new();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let now = chrono::Utc::now();
+        store
+            .store(MemoryEntry {
+                id: "secret-context".into(),
+                content: format!("deployment token {secret}"),
+                category: MemoryCategory::Fact,
+                created_at: now,
+                updated_at: now,
+                tags: vec![],
+                importance: 1.0,
+            })
+            .await
+            .unwrap();
+
+        let context = retrieve_task_context(&store, "deployment token", 5, 400)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!context.contains(secret));
+        assert!(context.contains("[REDACTED:"));
+
+        store_task_outcome(
+            &store,
+            format!("completed with {secret}"),
+            "run-redact",
+            "task-redact",
+            "agent-redact",
+            0.5,
+        )
+        .await
+        .unwrap();
+        let stored = store.search("completed", 5).await.unwrap();
+        assert!(!stored[0].content.contains(secret));
+        assert!(stored[0].content.contains("[REDACTED:"));
+    }
+
+    #[tokio::test]
+    async fn separate_memory_stores_do_not_leak_context() {
+        let first = CountingStore::new();
+        let second = CountingStore::new();
+        store_task_outcome(
+            &first,
+            "isolated raven memory",
+            "run-1",
+            "task-1",
+            "agent-1",
+            0.5,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            retrieve_task_context(&second, "isolated raven", 5, 400)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

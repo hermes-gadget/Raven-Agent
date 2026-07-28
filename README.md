@@ -202,15 +202,15 @@ More detail: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Known limitations
 
-- The TUI controls runs it starts in-process. **raven orchestrate pause/resume/cancel** still update persistent markers only and do not signal a separate process.
+- Live run owners poll durable controls, allowing a second CLI process, HTTP client, or authorized WebSocket client to pause, resume, or cancel by graph UUID.
 - The HTTP and Discord orchestration submission endpoints create persisted plans. Task execution is available through **raven run**, HTTP **/chat**, and Discord **/raven run**.
 - **raven serve** also starts Discord when **gateway.discord_enabled** is true and a token is available from the configured value or environment variable.
 - The TUI currently approval-gates dangerous TUI actions such as cancellation,
   but model-driven tool-call approval is connected only for **raven run** and
   **raven serve**.
 - Scheduler hosting is a separate process; run **raven schedule host** (normally under a service manager) when `scheduler.enabled` is true.
-- WebSocket clients receive task/orchestration events, but inbound pause/resume/cancel control messages are not dispatched.
-- Memory is attached to the direct runtime path; orchestrated sub-agent memory retrieval is not yet integrated.
+- Live pause/resume/cancel can be enqueued via `raven orchestrate` or authorized WebSocket control messages (`task_pause`/`task_resume`/`task_cancel`) against a stable graph UUID; the owning CLI/TUI process claims and applies them.
+- Orchestrated sub-agents retrieve and store redacted memory entries when `memory.enabled` is true; disabled memory performs no I/O on the orchestration path.
 
 Deferred work is tracked in [TODO.md](TODO.md) and repository issues.
 

@@ -265,11 +265,11 @@ Only mark these items complete when they are implemented, wired to real state, t
 
 These items are intentionally not represented as complete:
 
-- [ ] [#1 Interactive approval responder](https://github.com/hermes-gadget/raven-ai-harness/issues/1)
-- [ ] [#4 Live cross-process orchestration control and WebSocket dispatch](https://github.com/hermes-gadget/raven-ai-harness/issues/4)
-- [ ] [#5 Orchestrated sub-agent memory integration](https://github.com/hermes-gadget/raven-ai-harness/issues/5)
-- [x] [#3 Continuously hosted scheduler execution mode](https://github.com/hermes-gadget/Raven-Agent/issues/3)
-- [ ] [#2 Persisted real tool reliability samples](https://github.com/hermes-gadget/raven-ai-harness/issues/2)
+- [x] [#1 Interactive approval responder](https://github.com/hermes-gadget/Raven-Agent/issues/1) — **PR #13 merged**
+- [x] [#2 Persisted real tool reliability samples](https://github.com/hermes-gadget/Raven-Agent/issues/2) — **PR #12 merged**
+- [x] [#3 Continuously hosted scheduler execution mode](https://github.com/hermes-gadget/Raven-Agent/issues/3) — **PR #14 merged**
+- [x] [#4 Live cross-process orchestration control and WebSocket dispatch](https://github.com/hermes-gadget/Raven-Agent/issues/4)
+- [x] [#5 Orchestrated sub-agent memory integration](https://github.com/hermes-gadget/Raven-Agent/issues/5)
 
 ## Definition of done
 

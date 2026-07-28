@@ -10,6 +10,7 @@ use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::control::{RunControlCommand, RunControlKind, RunControlStatus};
@@ -110,7 +111,8 @@ impl SqliteOrchestrationStore {
     pub async fn new(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let options = SqliteConnectOptions::new()
             .filename(path.into())
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -489,7 +491,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         &self,
         graph_id: &str,
     ) -> Result<Vec<RunControlCommand>, StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
         let rows = query_as::<
             _,
             (
@@ -505,51 +507,43 @@ impl OrchestrationStore for SqliteOrchestrationStore {
             ),
         >(
             r#"
-            SELECT id, graph_id, kind, reason, source, status, created_at, claimed_at, applied_at
-            FROM run_controls
+            UPDATE run_controls
+            SET status = 'claimed', claimed_at = ?
             WHERE graph_id = ? AND status = 'pending'
-            ORDER BY created_at ASC
+            RETURNING
+                id, graph_id, kind, reason, source, status,
+                created_at, claimed_at, applied_at
             "#,
         )
+        .bind(&now)
         .bind(graph_id)
-        .fetch_all(&mut *transaction)
+        .fetch_all(&self.pool)
         .await?;
 
-        let now = Utc::now();
         let mut commands = Vec::with_capacity(rows.len());
         for row in rows {
             let id = Uuid::parse_str(&row.0).map_err(|error| {
                 StoreError::InvalidStatus(format!("invalid control id: {error}"))
             })?;
-            query("UPDATE run_controls SET status = 'claimed', claimed_at = ? WHERE id = ?")
-                .bind(now.to_rfc3339())
-                .bind(id.to_string())
-                .execute(&mut *transaction)
-                .await?;
             commands.push(parse_control_row(
-                id,
-                row.1,
-                row.2,
-                row.3,
-                row.4,
-                "claimed",
-                row.6,
-                Some(now.to_rfc3339()),
-                row.8,
+                id, row.1, row.2, row.3, row.4, &row.5, row.6, row.7, row.8,
             )?);
         }
-        transaction.commit().await?;
+        commands.sort_by_key(|command| command.created_at);
         Ok(commands)
     }
 
     async fn mark_control_applied(&self, command_id: Uuid) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let result =
-            query("UPDATE run_controls SET status = 'applied', applied_at = ? WHERE id = ?")
-                .bind(&now)
-                .bind(command_id.to_string())
-                .execute(&self.pool)
-                .await?;
+        let result = query(
+            "UPDATE run_controls
+             SET status = 'applied', applied_at = ?
+             WHERE id = ? AND status = 'claimed'",
+        )
+        .bind(&now)
+        .bind(command_id.to_string())
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!(
                 "control command '{command_id}' not found"

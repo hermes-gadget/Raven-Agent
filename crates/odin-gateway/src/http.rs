@@ -1075,14 +1075,32 @@ async fn orchestrate_pause_handler(
         Ok(store) => {
             let _ = store.initialize().await;
             match store.update_graph_status(&run_id, "paused").await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "status": "paused",
-                        "run_id": run_id
-                    })),
-                )
-                    .into_response(),
+                Ok(()) => {
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &run_id,
+                        odin_orchestrator::RunControlKind::Pause,
+                        "http:orchestrate-pause",
+                        None,
+                    );
+                    match store.enqueue_control(&command).await {
+                        Ok(()) => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "paused",
+                                "run_id": run_id,
+                                "command_id": command.id
+                            })),
+                        )
+                            .into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to enqueue live pause: {}", e)
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
                 Err(e) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
@@ -1118,14 +1136,32 @@ async fn orchestrate_resume_handler(
         Ok(store) => {
             let _ = store.initialize().await;
             match store.update_graph_status(&run_id, "running").await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "status": "resumed",
-                        "run_id": run_id
-                    })),
-                )
-                    .into_response(),
+                Ok(()) => {
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &run_id,
+                        odin_orchestrator::RunControlKind::Resume,
+                        "http:orchestrate-resume",
+                        None,
+                    );
+                    match store.enqueue_control(&command).await {
+                        Ok(()) => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "resumed",
+                                "run_id": run_id,
+                                "command_id": command.id
+                            })),
+                        )
+                            .into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to enqueue live resume: {}", e)
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
                 Err(e) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
@@ -1161,14 +1197,32 @@ async fn orchestrate_cancel_handler(
         Ok(store) => {
             let _ = store.initialize().await;
             match store.update_graph_status(&run_id, "cancelled").await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "status": "cancelled",
-                        "run_id": run_id
-                    })),
-                )
-                    .into_response(),
+                Ok(()) => {
+                    let command = odin_orchestrator::RunControlCommand::new(
+                        &run_id,
+                        odin_orchestrator::RunControlKind::Cancel,
+                        "http:orchestrate-cancel",
+                        None,
+                    );
+                    match store.enqueue_control(&command).await {
+                        Ok(()) => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": "cancelled",
+                                "run_id": run_id,
+                                "command_id": command.id
+                            })),
+                        )
+                            .into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to enqueue live cancel: {}", e)
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
                 Err(e) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
