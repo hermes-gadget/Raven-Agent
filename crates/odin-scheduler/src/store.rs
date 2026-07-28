@@ -14,6 +14,48 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// Durable outcome of one scheduled execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl JobRunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> odin_core::error::OdinResult<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            other => Err(OdinError::Database(format!(
+                "Invalid scheduler run status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Durable scheduler execution record used by health and audit surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRun {
+    pub task_id: Uuid,
+    pub job_id: JobId,
+    pub job_name: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: JobRunStatus,
+    pub error: Option<String>,
+}
+
 // ── SchedulerJobConfig ────────────────────────────────────────────────
 
 /// Configuration for a scheduled job that executes an agent task.
@@ -151,6 +193,20 @@ pub trait SchedulerStore: Send + Sync {
         next_run: Option<DateTime<Utc>>,
         run_count: u64,
     ) -> odin_core::error::OdinResult<()>;
+
+    /// Record the start of a scheduled execution.
+    async fn record_run_started(&self, run: &JobRun) -> odin_core::error::OdinResult<()>;
+
+    /// Record the terminal outcome of a scheduled execution.
+    async fn record_run_finished(
+        &self,
+        task_id: &Uuid,
+        status: JobRunStatus,
+        error: Option<&str>,
+    ) -> odin_core::error::OdinResult<()>;
+
+    /// Return the most recent scheduler executions.
+    async fn recent_runs(&self, limit: usize) -> odin_core::error::OdinResult<Vec<JobRun>>;
 }
 
 // ── SqliteSchedulerStore ──────────────────────────────────────────────
@@ -219,7 +275,18 @@ impl SqliteSchedulerStore {
                 next_run    TEXT,
                 run_count   INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT    NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS scheduler_runs (
+                task_id     TEXT PRIMARY KEY,
+                job_id      TEXT NOT NULL,
+                job_name    TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT,
+                status      TEXT NOT NULL,
+                error       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started_at
+                ON scheduler_runs(started_at DESC);",
         )
         .map_err(|e| OdinError::Database(format!("Failed to create scheduler_jobs table: {e}")))?;
 
@@ -385,6 +452,99 @@ impl SchedulerStore for SqliteSchedulerStore {
         .map_err(|e| OdinError::Database(format!("Failed to update scheduler job state: {e}")))?;
 
         Ok(())
+    }
+
+    async fn record_run_started(&self, run: &JobRun) -> odin_core::error::OdinResult<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO scheduler_runs
+                (task_id, job_id, job_name, started_at, finished_at, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run.task_id.to_string(),
+                run.job_id.to_string(),
+                run.job_name,
+                run.started_at.to_rfc3339(),
+                run.finished_at.map(|value| value.to_rfc3339()),
+                run.status.as_str(),
+                run.error,
+            ],
+        )
+        .map_err(|e| OdinError::Database(format!("Failed to record scheduler run: {e}")))?;
+        Ok(())
+    }
+
+    async fn record_run_finished(
+        &self,
+        task_id: &Uuid,
+        status: JobRunStatus,
+        error: Option<&str>,
+    ) -> odin_core::error::OdinResult<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE scheduler_runs
+             SET finished_at = ?1, status = ?2, error = ?3
+             WHERE task_id = ?4",
+            params![
+                Utc::now().to_rfc3339(),
+                status.as_str(),
+                error,
+                task_id.to_string(),
+            ],
+        )
+        .map_err(|e| OdinError::Database(format!("Failed to finish scheduler run: {e}")))?;
+        Ok(())
+    }
+
+    async fn recent_runs(&self, limit: usize) -> odin_core::error::OdinResult<Vec<JobRun>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, job_id, job_name, started_at, finished_at, status, error
+                 FROM scheduler_runs
+                 ORDER BY started_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to prepare run query: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| OdinError::Database(format!("Failed to query scheduler runs: {e}")))?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            let (task_id, job_id, job_name, started_at, finished_at, status, error) =
+                row.map_err(|e| OdinError::Database(format!("Failed to read scheduler run: {e}")))?;
+            runs.push(JobRun {
+                task_id: Uuid::parse_str(&task_id)
+                    .map_err(|e| OdinError::Database(format!("Invalid task id: {e}")))?,
+                job_id: Uuid::parse_str(&job_id)
+                    .map_err(|e| OdinError::Database(format!("Invalid job id: {e}")))?,
+                job_name,
+                started_at: DateTime::parse_from_rfc3339(&started_at)
+                    .map_err(|e| OdinError::Database(format!("Invalid started_at: {e}")))?
+                    .with_timezone(&Utc),
+                finished_at: finished_at
+                    .map(|value| {
+                        DateTime::parse_from_rfc3339(&value)
+                            .map(|date| date.with_timezone(&Utc))
+                            .map_err(|e| OdinError::Database(format!("Invalid finished_at: {e}")))
+                    })
+                    .transpose()?,
+                status: JobRunStatus::parse(&status)?,
+                error,
+            });
+        }
+        Ok(runs)
     }
 }
 

@@ -91,6 +91,8 @@ MCP tools are treated as unsafe and approval-required by default. A server can o
 | **raven orchestrate agents / locks / queue / restore** | Inspect persisted orchestration data |
 | **raven serve** | Start the HTTP API; WebSocket upgrades are served at **/ws** |
 | **raven schedule add / list / remove / enable / disable** | Manage SQLite-backed scheduled job definitions |
+| **raven schedule host** | Continuously execute due jobs with the configured Runtime until shutdown |
+| **raven schedule status / history** | Report scheduler configuration, job health, and durable outcomes |
 | **raven tools list / inspect / validate / doctor / catalog / reliability** | Inspect the built-in tool system |
 | **raven tools test &lt;name&gt; --dry-run** | Validate a tool call without executing it |
 | **raven tools test &lt;name&gt; --args &lt;json&gt; --approve** | Explicitly approve direct execution of a dangerous tool |
@@ -206,7 +208,7 @@ More detail: [ARCHITECTURE.md](ARCHITECTURE.md).
 - The TUI currently approval-gates dangerous TUI actions such as cancellation,
   but model-driven tool-call approval is connected only for **raven run** and
   **raven serve**.
-- Scheduler definitions persist, but a separate long-running scheduler process is required to execute due jobs continuously.
+- Scheduler hosting is a separate process; run **raven schedule host** (normally under a service manager) when `scheduler.enabled` is true.
 - WebSocket clients receive task/orchestration events, but inbound pause/resume/cancel control messages are not dispatched.
 - Memory is attached to the direct runtime path; orchestrated sub-agent memory retrieval is not yet integrated.
 

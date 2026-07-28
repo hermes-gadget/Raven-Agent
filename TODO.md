@@ -225,6 +225,7 @@ Only mark these items complete when they are implemented, wired to real state, t
 - [x] Start and stop Discord from **raven serve** when gateway configuration enables it.
 - [x] Make scheduler CLI definitions and task goals survive separate invocations.
 - [x] Dispatch scheduled runtime jobs to a registered agent and fail clearly instead of running an inert closure when runtime wiring is missing.
+- [x] Add continuously hosted scheduler execution with restart recovery, bounded overlap, graceful shutdown, and durable outcomes.
 - [x] Pass configured MCP environment variables to child processes.
 - [x] Make unknown MCP tools unsafe and approval-required by default.
 - [x] Remove generated reliability scores and other demonstration status output.
@@ -267,7 +268,7 @@ These items are intentionally not represented as complete:
 - [ ] [#1 Interactive approval responder](https://github.com/hermes-gadget/raven-ai-harness/issues/1)
 - [ ] [#4 Live cross-process orchestration control and WebSocket dispatch](https://github.com/hermes-gadget/raven-ai-harness/issues/4)
 - [ ] [#5 Orchestrated sub-agent memory integration](https://github.com/hermes-gadget/raven-ai-harness/issues/5)
-- [ ] [#3 Continuously hosted scheduler execution mode](https://github.com/hermes-gadget/raven-ai-harness/issues/3)
+- [x] [#3 Continuously hosted scheduler execution mode](https://github.com/hermes-gadget/Raven-Agent/issues/3)
 - [ ] [#2 Persisted real tool reliability samples](https://github.com/hermes-gadget/raven-ai-harness/issues/2)
 
 ## Definition of done

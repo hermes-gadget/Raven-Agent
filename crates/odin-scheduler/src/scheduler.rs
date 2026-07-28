@@ -6,14 +6,16 @@
 //! optional runtime-driven task execution via [`Runtime`].
 
 use crate::job::{Job, JobId, JobTask, Schedule};
-use crate::store::{PersistedJob, SchedulerJobConfig, SchedulerStore};
+use crate::store::{JobRun, JobRunStatus, PersistedJob, SchedulerJobConfig, SchedulerStore};
 use chrono::Utc;
 use odin_core::config::SchedulerConfig;
 use odin_core::error::{OdinError, OdinResult};
+use odin_core::traits::AuditLogger;
+use odin_core::types::{AuditEntry, AuditEventType, AuditResult};
 use odin_runtime::Runtime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{Duration, interval};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -40,6 +42,12 @@ pub struct Scheduler {
     store: Option<Arc<dyn SchedulerStore>>,
     /// Optional runtime for submitting agent tasks.
     runtime: Option<Arc<Runtime>>,
+    /// Optional structured audit sink for scheduler outcomes.
+    audit_logger: Option<Arc<dyn AuditLogger>>,
+    /// In-flight executions, drained during graceful shutdown.
+    execution_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Wakes the tick loop immediately during shutdown.
+    shutdown: Arc<Notify>,
 }
 
 impl Scheduler {
@@ -52,6 +60,9 @@ impl Scheduler {
             tick_handle: Arc::new(RwLock::new(None)),
             store: None,
             runtime: None,
+            audit_logger: None,
+            execution_handles: Arc::new(Mutex::new(Vec::new())),
+            shutdown: Arc::new(Notify::new()),
         }
     }
 
@@ -77,6 +88,34 @@ impl Scheduler {
     pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
+    }
+
+    /// Attach an audit logger for durable scheduler start/outcome events.
+    pub fn with_audit_logger(mut self, audit_logger: Arc<dyn AuditLogger>) -> Self {
+        self.audit_logger = Some(audit_logger);
+        self
+    }
+
+    /// Load persisted definitions without starting the host loop.
+    pub async fn load_persisted(&self) -> OdinResult<usize> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        let persisted_jobs = store.load_all_jobs().await?;
+        let count = persisted_jobs.len();
+        let mut jobs = self.jobs.write().await;
+        for persisted in persisted_jobs {
+            jobs.insert(persisted.id, persisted.into_job());
+        }
+        Ok(count)
+    }
+
+    /// Return recent durable execution outcomes.
+    pub async fn recent_runs(&self, limit: usize) -> OdinResult<Vec<JobRun>> {
+        match &self.store {
+            Some(store) => store.recent_runs(limit).await,
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Add a job to the scheduler using a generic closure task.
@@ -330,6 +369,15 @@ impl Scheduler {
     /// If a [`SchedulerStore`] is configured, all persisted jobs are
     /// loaded into memory before the loop starts.
     pub async fn start(&self) -> OdinResult<()> {
+        if !self.config.enabled {
+            info!("Scheduler is disabled; host loop will not start");
+            return Ok(());
+        }
+        if self.config.check_interval_secs == 0 {
+            return Err(OdinError::Config(
+                "scheduler.check_interval_secs must be greater than zero".into(),
+            ));
+        }
         let mut running = self.running.write().await;
         if *running {
             warn!("Scheduler is already running");
@@ -339,30 +387,24 @@ impl Scheduler {
         drop(running);
 
         // Load persisted jobs from store
-        if let Some(ref store) = self.store {
-            let persisted_jobs = store.load_all_jobs().await?;
-            info!(
-                count = persisted_jobs.len(),
-                "Loading persisted jobs into scheduler"
-            );
-            let mut jobs = self.jobs.write().await;
-            for pj in persisted_jobs {
-                let mut job = pj.into_job();
-                // If we have a runtime and the job has a task_goal, the
-                // run_pending method will handle runtime dispatch separately.
-                // The closure can stay as noop.
-                if self.runtime.is_some() && job.task_goal.is_some() {
-                    job.task = crate::job::noop_task();
-                }
-                jobs.insert(job.id, job);
+        let loaded = match self.load_persisted().await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                *self.running.write().await = false;
+                return Err(error);
             }
-        }
+        };
+        info!(count = loaded, "Loaded persisted jobs into scheduler");
 
         let interval_secs = self.config.check_interval_secs;
         let jobs = self.jobs.clone();
         let running_flag = self.running.clone();
         let store = self.store.clone();
         let runtime = self.runtime.clone();
+        let audit_logger = self.audit_logger.clone();
+        let execution_handles = self.execution_handles.clone();
+        let shutdown = self.shutdown.clone();
+        let permits = Arc::new(Semaphore::new(self.config.max_concurrent.max(1) as usize));
 
         info!(
             check_interval_secs = interval_secs,
@@ -374,7 +416,13 @@ impl Scheduler {
             ticker.tick().await; // Skip the first immediate tick
 
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown.notified() => {
+                        info!("Scheduler loop received shutdown signal");
+                        break;
+                    }
+                }
 
                 let is_running = *running_flag.read().await;
                 if !is_running {
@@ -393,6 +441,16 @@ impl Scheduler {
                 };
 
                 for job_id in due_ids {
+                    if !*running_flag.read().await {
+                        break;
+                    }
+                    let permit = match permits.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            trace!(job_id = %job_id, "Deferring job: host concurrency limit reached");
+                            continue;
+                        }
+                    };
                     // Read job details under read lock
                     let (task_fn, name, task_goal, max_iterations) = {
                         let jobs_guard = jobs.read().await;
@@ -450,25 +508,63 @@ impl Scheduler {
 
                     // Persist updated state
                     if let Some(ref store) = store {
-                        let jobs_guard = jobs.read().await;
-                        if let Some(active) = jobs_guard.get(&job_id) {
-                            let _ = store
-                                .update_job_state(
-                                    &job_id,
-                                    active.enabled,
-                                    active.last_run,
-                                    active.next_run,
-                                    active.run_count,
-                                )
-                                .await;
+                        let state = jobs.read().await.get(&job_id).map(|active| {
+                            (
+                                active.enabled,
+                                active.last_run,
+                                active.next_run,
+                                active.run_count,
+                            )
+                        });
+                        if let Some((enabled, last_run, next_run, run_count)) = state
+                            && let Err(error) = store
+                                .update_job_state(&job_id, enabled, last_run, next_run, run_count)
+                                .await
+                        {
+                            warn!(job_id = %job_id, "Failed to persist scheduler state: {error}");
                         }
-                        drop(jobs_guard);
+                        let run = JobRun {
+                            task_id,
+                            job_id,
+                            job_name: name.clone(),
+                            started_at: Utc::now(),
+                            finished_at: None,
+                            status: JobRunStatus::Running,
+                            error: None,
+                        };
+                        if let Err(error) = store.record_run_started(&run).await {
+                            warn!(job_id = %job_id, "Failed to persist scheduler run: {error}");
+                        }
                     }
 
-                    if let Some((runtime, agent_id, goal)) = runtime_dispatch {
+                    if let Some(logger) = &audit_logger {
+                        let _ = logger
+                            .log(AuditEntry {
+                                id: Uuid::new_v4(),
+                                timestamp: Utc::now(),
+                                agent_id: runtime_dispatch
+                                    .as_ref()
+                                    .map_or_else(Uuid::nil, |(_, agent_id, _)| *agent_id),
+                                session_id: job_id,
+                                event_type: AuditEventType::SessionStart,
+                                action: "scheduler_job_started".into(),
+                                details: serde_json::json!({
+                                    "job_id": job_id,
+                                    "job_name": name,
+                                    "task_id": task_id,
+                                }),
+                                result: AuditResult::Pending,
+                            })
+                            .await;
+                    }
+
+                    let handle = if let Some((runtime, agent_id, goal)) = runtime_dispatch {
                         // Runtime-driven execution path in the loop
                         let jobs_clone = jobs.clone();
+                        let store = store.clone();
+                        let audit_logger = audit_logger.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             debug!(task_id = %task_id, "Job task started (loop, runtime)");
 
                             let agent_task = odin_core::types::AgentTask {
@@ -481,36 +577,49 @@ impl Scheduler {
                                 created_at: chrono::Utc::now(),
                             };
 
-                            if let Err(error) =
-                                runtime.submit_task(&agent_id, &agent_task, None).await
-                            {
-                                warn!(task_id = %task_id, "Scheduled runtime task failed: {error}");
+                            let outcome = runtime
+                                .submit_task(&agent_id, &agent_task, None)
+                                .await
+                                .map(|result| result.success)
+                                .map_err(|error| error.to_string());
+                            ExecutionCompletion {
+                                store,
+                                audit_logger,
+                                jobs: jobs_clone,
+                                job_id,
+                                job_name: name,
+                                task_id,
+                                agent_id,
                             }
-
-                            let mut jobs_guard = jobs_clone.write().await;
-                            if let Some(active) = jobs_guard.get_mut(&job_id) {
-                                active.running_count = active.running_count.saturating_sub(1);
-                            }
-                        });
+                            .finish(outcome)
+                            .await;
+                        })
                     } else {
                         // Standard closure-based execution
                         let jobs_clone = jobs.clone();
+                        let store = store.clone();
+                        let audit_logger = audit_logger.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             debug!(task_id = %task_id, "Job task started (loop)");
-                            let start = std::time::Instant::now();
                             (task_fn)().await;
-                            let duration = start.elapsed();
-                            debug!(
-                                task_id = %task_id,
-                                duration_ms = duration.as_millis() as u64,
-                                "Job task completed (loop)"
-                            );
-                            let mut jobs_guard = jobs_clone.write().await;
-                            if let Some(active) = jobs_guard.get_mut(&job_id) {
-                                active.running_count = active.running_count.saturating_sub(1);
+                            ExecutionCompletion {
+                                store,
+                                audit_logger,
+                                jobs: jobs_clone,
+                                job_id,
+                                job_name: name,
+                                task_id,
+                                agent_id: Uuid::nil(),
                             }
-                        });
-                    }
+                            .finish(Ok(true))
+                            .await;
+                        })
+                    };
+
+                    let mut handles = execution_handles.lock().await;
+                    handles.retain(|existing| !existing.is_finished());
+                    handles.push(handle);
                 }
             }
         });
@@ -524,11 +633,25 @@ impl Scheduler {
         let mut running = self.running.write().await;
         *running = false;
         drop(running);
+        // `notify_one` retains a permit if the loop has not reached
+        // `notified()` yet, so an immediate stop cannot miss the wake-up.
+        self.shutdown.notify_one();
 
         if let Some(handle) = self.tick_handle.write().await.take() {
             info!("Scheduler stop requested, waiting for loop to finish");
-            // Don't await forever — just detach
-            drop(handle);
+            handle
+                .await
+                .map_err(|error| OdinError::Internal(format!("Scheduler loop failed: {error}")))?;
+        }
+
+        let handles = {
+            let mut handles = self.execution_handles.lock().await;
+            std::mem::take(&mut *handles)
+        };
+        for handle in handles {
+            if let Err(error) = handle.await {
+                warn!("Scheduled execution task failed to join: {error}");
+            }
         }
 
         info!("Scheduler stopped");
@@ -551,11 +674,77 @@ impl Scheduler {
     }
 }
 
+struct ExecutionCompletion {
+    store: Option<Arc<dyn SchedulerStore>>,
+    audit_logger: Option<Arc<dyn AuditLogger>>,
+    jobs: Arc<RwLock<HashMap<JobId, Job>>>,
+    job_id: JobId,
+    job_name: String,
+    task_id: Uuid,
+    agent_id: Uuid,
+}
+
+impl ExecutionCompletion {
+    async fn finish(self, outcome: Result<bool, String>) {
+        let (status, error) = match outcome {
+            Ok(true) => (JobRunStatus::Succeeded, None),
+            Ok(false) => (
+                JobRunStatus::Failed,
+                Some("runtime returned an unsuccessful task result".to_string()),
+            ),
+            Err(error) => (JobRunStatus::Failed, Some(error)),
+        };
+        if let Some(store) = self.store
+            && let Err(persist_error) = store
+                .record_run_finished(&self.task_id, status, error.as_deref())
+                .await
+        {
+            warn!(task_id = %self.task_id, "Failed to persist scheduler outcome: {persist_error}");
+        }
+        if let Some(logger) = self.audit_logger {
+            let _ = logger
+                .log(AuditEntry {
+                    id: Uuid::new_v4(),
+                    timestamp: Utc::now(),
+                    agent_id: self.agent_id,
+                    session_id: self.job_id,
+                    event_type: AuditEventType::SessionEnd,
+                    action: "scheduler_job_finished".into(),
+                    details: serde_json::json!({
+                        "job_id": self.job_id,
+                        "job_name": self.job_name,
+                        "task_id": self.task_id,
+                        "error": error,
+                    }),
+                    result: if status == JobRunStatus::Succeeded {
+                        AuditResult::Success
+                    } else {
+                        AuditResult::Failure
+                    },
+                })
+                .await;
+        }
+        let mut jobs = self.jobs.write().await;
+        if let Some(active) = jobs.get_mut(&self.job_id) {
+            active.running_count = active.running_count.saturating_sub(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::SqliteSchedulerStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn enabled_config() -> SchedulerConfig {
+        SchedulerConfig {
+            enabled: true,
+            check_interval_secs: 1,
+            max_concurrent: 2,
+            db_path: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_add_and_list_jobs() {
@@ -639,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_stop() {
-        let sched = Scheduler::default();
+        let sched = Scheduler::new(enabled_config());
         assert!(!sched.is_running().await);
 
         sched.start().await.unwrap();
@@ -652,12 +841,28 @@ mod tests {
         assert!(!sched.is_running().await);
     }
 
+    #[tokio::test]
+    async fn immediate_stop_wakes_long_interval_loop() {
+        let sched = Scheduler::new(SchedulerConfig {
+            enabled: true,
+            check_interval_secs: 3_600,
+            max_concurrent: 1,
+            db_path: None,
+        });
+
+        sched.start().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sched.stop())
+            .await
+            .expect("stop should not wait for the next scheduler tick")
+            .unwrap();
+    }
+
     // ── Persistence Integration Tests ───────────────────────────────
 
     #[tokio::test]
     async fn test_add_job_with_store_persists() {
         let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
-        let sched = Scheduler::default().with_store(store.clone());
+        let sched = Scheduler::new(enabled_config()).with_store(store.clone());
         let task: JobTask = Arc::new(|| Box::pin(async {}));
 
         let id = sched
@@ -673,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_job_with_config_persists() {
         let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
-        let sched = Scheduler::default().with_store(store.clone());
+        let sched = Scheduler::new(enabled_config()).with_store(store.clone());
 
         let config = SchedulerJobConfig::new("Run my task").with_max_iterations(50);
         let _id = sched
@@ -691,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_job_deletes_from_store() {
         let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
-        let sched = Scheduler::default().with_store(store.clone());
+        let sched = Scheduler::new(enabled_config()).with_store(store.clone());
         let task: JobTask = Arc::new(|| Box::pin(async {}));
 
         let id = sched.add_job("delete-me", "0 9 * * *", task).await.unwrap();
@@ -736,7 +941,7 @@ mod tests {
         store.save_job(&pj).await.unwrap();
 
         // Create scheduler with this store and start it
-        let sched = Scheduler::default().with_store(store.clone());
+        let sched = Scheduler::new(enabled_config()).with_store(store.clone());
         assert_eq!(sched.job_count().await, 0);
 
         sched.start().await.unwrap();
@@ -758,7 +963,7 @@ mod tests {
         // First scheduler: add job via store
         let id = {
             let store = Arc::new(SqliteSchedulerStore::new(&path_str).unwrap());
-            let sched = Scheduler::default().with_store(store.clone());
+            let sched = Scheduler::new(enabled_config()).with_store(store.clone());
             let task: JobTask = Arc::new(|| Box::pin(async {}));
             sched
                 .add_job("restart-test", "*/5 * * * *", task)
@@ -769,7 +974,7 @@ mod tests {
         // Second scheduler (simulating restart): verify job is loaded
         {
             let store = Arc::new(SqliteSchedulerStore::new(&path_str).unwrap());
-            let sched = Scheduler::default().with_store(store.clone());
+            let sched = Scheduler::new(enabled_config()).with_store(store.clone());
 
             sched.start().await.unwrap();
             let jobs = sched.list_jobs().await;
@@ -855,5 +1060,12 @@ mod tests {
         let error = sched.run_pending().await.unwrap_err();
         assert!(error.to_string().contains("requires a runtime"));
         assert_eq!(sched.get_job(id).await.unwrap().run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_scheduler_does_not_start() {
+        let sched = Scheduler::default();
+        sched.start().await.unwrap();
+        assert!(!sched.is_running().await);
     }
 }

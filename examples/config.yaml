@@ -122,6 +122,7 @@ gateway:
   # discord_token: direct-value-is-discouraged
   discord_token_env: DISCORD_BOT_TOKEN
 
+# `raven schedule host` runs continuously only when enabled.
 scheduler:
   enabled: false
   check_interval_secs: 30
