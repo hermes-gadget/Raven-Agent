@@ -15,6 +15,7 @@ odin-providers.workspace = true
 odin-tools.workspace = true
 odin-permissions = { path = "../odin-permissions" }
 odin-audit.workspace = true
+odin-memory.workspace = true
 odin-skills.workspace = true
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 crossterm = "0.29"

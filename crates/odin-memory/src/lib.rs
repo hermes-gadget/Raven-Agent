@@ -30,7 +30,9 @@
 //! # }
 //! ```
 
+pub mod context;
 pub mod models;
 pub mod store;
 
+pub use context::{DEFAULT_CONTEXT_CHARS, retrieve_task_context, store_task_outcome};
 pub use store::SqliteMemoryStore;

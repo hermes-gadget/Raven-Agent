@@ -178,7 +178,10 @@ struct ExecutionResources {
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     audit_logger: Option<Arc<dyn AuditLogger>>,
     reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
+    memory: Option<Arc<odin_memory::SqliteMemoryStore>>,
+    memory_max_entries: usize,
     model_name: String,
+    run_id: String,
 }
 
 impl ExecutionResources {
@@ -224,6 +227,24 @@ impl ExecutionResources {
             .clone()
             .or_else(|| provider_cfg.default_model.clone())
             .unwrap_or_default();
+        let memory = if config.memory.enabled {
+            let path = config.memory.db_path.as_ref().map_or_else(
+                || configured_data_dir(&config).join("memory.db"),
+                |path| {
+                    std::path::PathBuf::from(
+                        shellexpand::tilde(&path.to_string_lossy()).to_string(),
+                    )
+                },
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Some(Arc::new(odin_memory::SqliteMemoryStore::new(
+                &path.to_string_lossy(),
+            )?))
+        } else {
+            None
+        };
 
         Ok(Self {
             provider: Some(provider),
@@ -231,7 +252,10 @@ impl ExecutionResources {
             tool_registry: Some(tool_registry),
             audit_logger: Some(audit_logger),
             reliability_tracker: Some(reliability_tracker),
+            memory,
+            memory_max_entries: config.memory.max_entries.max(1),
             model_name,
+            run_id: String::new(),
         })
     }
 }
@@ -291,7 +315,10 @@ pub async fn spawn_run(db_path: PathBuf, goal: String, max_iterations: u32) -> R
             elapsed_ms: 0,
         });
         let resources = match ExecutionResources::from_environment().await {
-            Ok(resources) => resources,
+            Ok(mut resources) => {
+                resources.run_id = run_id_for_task.clone();
+                resources
+            }
             Err(error) => {
                 let _ = event_tx.send(RunnerEvent::FatalError {
                     message: odin_permissions::SecretRedactor::full().redact(&format!(
@@ -394,6 +421,45 @@ async fn run_loop(
     let mut cancelled = false;
 
     loop {
+        // Live cross-process controls from CLI/WebSocket.
+        if let Ok(commands) = store.claim_pending_controls(&run_id).await {
+            for command in commands {
+                match command.kind {
+                    odin_orchestrator::RunControlKind::Pause => {
+                        paused = true;
+                        composer.set_graph_status(&goal_key, TaskGraphStatus::Paused);
+                        let _ = event_tx.send(RunnerEvent::RunStage {
+                            run_id: run_id.clone(),
+                            stage: AgentStage::Paused,
+                            detail: format!("live pause from {}", command.source),
+                            elapsed_ms: run_start.elapsed().as_millis() as u64,
+                        });
+                    }
+                    odin_orchestrator::RunControlKind::Resume => {
+                        paused = false;
+                        composer.set_graph_status(&goal_key, TaskGraphStatus::Running);
+                        let _ = event_tx.send(RunnerEvent::RunStage {
+                            run_id: run_id.clone(),
+                            stage: AgentStage::SpawningAgents,
+                            detail: format!("live resume from {}", command.source),
+                            elapsed_ms: run_start.elapsed().as_millis() as u64,
+                        });
+                    }
+                    odin_orchestrator::RunControlKind::Cancel => {
+                        cancelled = true;
+                        composer.set_graph_status(&goal_key, TaskGraphStatus::Cancelled);
+                        let _ = event_tx.send(RunnerEvent::RunStage {
+                            run_id: run_id.clone(),
+                            stage: AgentStage::Cancelled,
+                            detail: format!("live cancel from {}", command.source),
+                            elapsed_ms: run_start.elapsed().as_millis() as u64,
+                        });
+                    }
+                }
+                store.mark_control_applied(command.id).await?;
+            }
+        }
+
         while let Ok(command) = command_rx.try_recv() {
             handle_command(
                 command,
@@ -426,39 +492,20 @@ async fn run_loop(
             return Ok(());
         }
 
-        if paused {
-            tokio::select! {
-                Some(command) = command_rx.recv() => {
-                    handle_command(
-                        command,
-                        &store,
-                        &mut composer,
-                        &goal_key,
-                        &run_id,
-                        &mut exec_agents,
-                        &mut paused,
-                        &mut cancelled,
-                        &mut join_set,
-                        &event_tx,
-                    ).await?;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-            }
-            continue;
+        if !paused {
+            start_ready_agents(
+                &store,
+                &mut composer,
+                &goal_key,
+                &exec_agents,
+                max_iterations,
+                &resources,
+                &mut spawned,
+                &mut join_set,
+                &event_tx,
+            )
+            .await?;
         }
-
-        start_ready_agents(
-            &store,
-            &mut composer,
-            &goal_key,
-            &exec_agents,
-            max_iterations,
-            &resources,
-            &mut spawned,
-            &mut join_set,
-            &event_tx,
-        )
-        .await?;
 
         if terminal.len() == exec_agents.len() && join_set.is_empty() {
             break;
@@ -578,7 +625,7 @@ async fn handle_command(
     match command {
         RunnerCommand::Pause => {
             *paused = true;
-            composer.pause_all();
+            composer.set_graph_status(goal_key, TaskGraphStatus::Paused);
             persist_all(
                 store,
                 composer,
@@ -602,7 +649,7 @@ async fn handle_command(
         }
         RunnerCommand::Resume => {
             *paused = false;
-            let _ = composer.resume_all();
+            composer.set_graph_status(goal_key, TaskGraphStatus::Running);
             persist_all(
                 store,
                 composer,
@@ -843,23 +890,39 @@ fn spawn_agent_execution(
                 detail: "agent loop starting".into(),
                 elapsed_ms: 0,
             });
-            let context = format!(
-                "Read files: {}\nWrite files: {}",
-                if agent.read_files.is_empty() {
-                    "-".to_string()
-                } else {
-                    agent.read_files.join(", ")
-                },
-                if agent.write_files.is_empty() {
-                    "-".to_string()
-                } else {
-                    agent.write_files.join(", ")
+            let context = {
+                let files_context = format!(
+                    "Read files: {}\nWrite files: {}",
+                    if agent.read_files.is_empty() {
+                        "-".to_string()
+                    } else {
+                        agent.read_files.join(", ")
+                    },
+                    if agent.write_files.is_empty() {
+                        "-".to_string()
+                    } else {
+                        agent.write_files.join(", ")
+                    }
+                );
+                let mut parts = vec![files_context];
+                if let Some(memory) = resources.memory.as_ref()
+                    && let Ok(Some(memory_context)) = odin_memory::retrieve_task_context(
+                        memory.as_ref(),
+                        &agent.goal,
+                        resources.memory_max_entries.min(8),
+                        odin_memory::DEFAULT_CONTEXT_CHARS,
+                    )
+                    .await
+                {
+                    parts.push(memory_context);
                 }
-            );
+                Some(parts.join("\n\n"))
+            };
+            let task_id = Uuid::new_v4();
             let task = AgentTask {
-                id: Uuid::new_v4(),
+                id: task_id,
                 goal: agent.goal.clone(),
-                context: Some(context),
+                context,
                 sub_tasks: vec![],
                 success_criteria: vec![],
                 max_iterations,
@@ -901,6 +964,19 @@ fn spawn_agent_execution(
                 engine = engine.with_reliability_tracker(reliability_tracker);
             }
             let result = engine.execute_task(&task).await;
+            if let (Some(memory), Ok(task_result)) = (resources.memory.as_ref(), result.as_ref()) {
+                let redacted =
+                    odin_permissions::SecretRedactor::full().redact(&task_result.summary);
+                let _ = odin_memory::store_task_outcome(
+                    memory.as_ref(),
+                    redacted,
+                    &resources.run_id,
+                    &task_id.to_string(),
+                    &agent.agent_id.to_string(),
+                    if task_result.success { 0.7 } else { 0.3 },
+                )
+                .await;
+            }
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let stage = if result.as_ref().map(|r| r.success).unwrap_or(false) {
                 AgentStage::Done

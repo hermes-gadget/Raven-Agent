@@ -908,6 +908,16 @@ impl Composer {
         self.graphs.get(root_goal)
     }
 
+    /// Set the persisted run status without changing active agent lifecycles.
+    ///
+    /// This is used for drain-to-safe-point pauses: no new agents start while
+    /// already-running agents retain their locks until they finish.
+    pub fn set_graph_status(&mut self, root_goal: &str, status: TaskGraphStatus) {
+        if let Some(graph) = self.graphs.get_mut(root_goal) {
+            graph.status = status;
+        }
+    }
+
     /// Update a node status in the task graph.
     pub fn update_node_status(&mut self, root_goal: &str, node_id: Uuid, status: TaskNodeStatus) {
         if let Some(graph) = self.graphs.get_mut(root_goal) {
