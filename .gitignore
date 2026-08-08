@@ -21,3 +21,4 @@ Thumbs.db
 .odin/
 odin
 *.audit.jsonl
+.tokensave/
