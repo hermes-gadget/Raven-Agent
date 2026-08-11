@@ -2111,7 +2111,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
             odin_gateway::DiscordConfig {
                 enabled: true,
                 token,
-                admin_role: None,
+                admin_role: config.gateway.discord_admin_role.clone(),
+                admin_user_ids: config.gateway.discord_admin_user_ids.clone(),
+                guild_id: config.gateway.discord_guild_id,
+                allow_dms: config.gateway.discord_allow_dms,
                 command_prefix: None,
                 orchestration_db_path: Some(dirs_state_path("orchestration.db")),
             },
@@ -2125,6 +2128,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     } else {
         None
     };
+
+    // Public HTTP submissions share one process-lifetime security principal so
+    // repeated requests cannot reset per-principal tool rate limits.
+    let serve_principal_id = uuid::Uuid::new_v4();
 
     // Build the task handler closure
     let handler: odin_gateway::TaskHandlerFn = {
@@ -2144,6 +2151,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                 let start = std::time::Instant::now();
 
                 let engine = odin_loop::LoopEngine::new()
+                    .with_principal_id(serve_principal_id)
                     .with_provider(provider.clone())
                     .with_policy_engine(policy_engine.clone())
                     .with_max_iterations(req.max_iterations.unwrap_or(100))

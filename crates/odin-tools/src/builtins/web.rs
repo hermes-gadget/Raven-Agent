@@ -1,5 +1,7 @@
 //! Web search and fetch tools — HTTP GET with timeout, basic web operations.
 
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +23,310 @@ fn http_client() -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+const MAX_REDIRECTS: usize = 5;
+
+#[derive(Debug, Clone, Default)]
+struct EgressPolicy {
+    allowed_hosts: Arc<HashSet<String>>,
+    allowed_networks: Arc<Vec<IpNetwork>>,
+}
+
+impl EgressPolicy {
+    fn with_allowed_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            allowed_hosts: Arc::new(
+                hosts
+                    .into_iter()
+                    .map(|host| normalize_host(&host))
+                    .collect(),
+            ),
+            allowed_networks: Arc::new(Vec::new()),
+        }
+    }
+
+    fn with_allowlist(
+        hosts: impl IntoIterator<Item = String>,
+        cidrs: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        let allowed_networks = cidrs
+            .into_iter()
+            .map(|cidr| IpNetwork::parse(&cidr))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            allowed_hosts: Arc::new(
+                hosts
+                    .into_iter()
+                    .map(|host| normalize_host(&host))
+                    .collect(),
+            ),
+            allowed_networks: Arc::new(allowed_networks),
+        })
+    }
+
+    fn explicitly_allows(&self, host: &str, address: IpAddr) -> bool {
+        self.allowed_hosts.contains(&normalize_host(host))
+            || self
+                .allowed_networks
+                .iter()
+                .any(|network| network.contains(address))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IpNetwork {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+impl IpNetwork {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let (address, prefix) = raw
+            .split_once('/')
+            .ok_or_else(|| format!("Invalid CIDR allowlist entry '{raw}'"))?;
+        let address: IpAddr = address
+            .parse()
+            .map_err(|error| format!("Invalid CIDR address '{raw}': {error}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|error| format!("Invalid CIDR prefix '{raw}': {error}"))?;
+        match address {
+            IpAddr::V4(address) if prefix <= 32 => {
+                let mask = u32::MAX.checked_shl((32 - prefix) as u32).unwrap_or(0);
+                Ok(Self::V4 {
+                    network: u32::from(address) & mask,
+                    prefix,
+                })
+            }
+            IpAddr::V6(address) if prefix <= 128 => {
+                let mask = u128::MAX.checked_shl((128 - prefix) as u32).unwrap_or(0);
+                Ok(Self::V6 {
+                    network: u128::from(address) & mask,
+                    prefix,
+                })
+            }
+            IpAddr::V4(_) => Err(format!("IPv4 CIDR prefix exceeds 32 in '{raw}'")),
+            IpAddr::V6(_) => Err(format!("IPv6 CIDR prefix exceeds 128 in '{raw}'")),
+        }
+    }
+
+    fn contains(self, address: IpAddr) -> bool {
+        match (self, address) {
+            (Self::V4 { network, prefix }, IpAddr::V4(address)) => {
+                let mask = u32::MAX.checked_shl((32 - prefix) as u32).unwrap_or(0);
+                u32::from(address) & mask == network
+            }
+            (Self::V6 { network, prefix }, IpAddr::V6(address)) => {
+                let mask = u128::MAX.checked_shl((128 - prefix) as u32).unwrap_or(0);
+                u128::from(address) & mask == network
+            }
+            _ => false,
+        }
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn parse_http_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|error| format!("Invalid URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("URL scheme must be http or https".into());
+    }
+    if url.host_str().is_none() {
+        return Err("URL must include a host".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Embedded URL credentials are not allowed".into());
+    }
+    Ok(url)
+}
+
+async fn pinned_client(url: &reqwest::Url, policy: &EgressPolicy) -> OdinResult<reqwest::Client> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| OdinError::Validation("URL must include a host".into()))?;
+    let resolution_host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| OdinError::Validation("URL must include a valid port".into()))?;
+    let addresses: Vec<SocketAddr> = if let Ok(ip) = resolution_host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((resolution_host, port))
+            .await
+            .map_err(|error| {
+                OdinError::Network(format!("Failed to resolve destination '{host}': {error}"))
+            })?
+            .collect()
+    };
+    if addresses.is_empty() {
+        return Err(OdinError::Network(format!(
+            "Destination '{host}' resolved to no addresses"
+        )));
+    }
+    for address in &addresses {
+        if !is_public_ip(address.ip()) && !policy.explicitly_allows(host, address.ip()) {
+            return Err(OdinError::PermissionDenied(format!(
+                "Destination '{host}' resolves to blocked address {}",
+                address.ip()
+            )));
+        }
+    }
+
+    // Pin the connection to an address that was classified above. Keeping the
+    // original hostname in the URL preserves Host/SNI while preventing a
+    // second DNS lookup from rebinding it to a private address.
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("OdinTools/0.3 (Raven Agent)")
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if resolution_host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve(resolution_host, addresses[0]);
+    }
+    builder
+        .build()
+        .map_err(|error| OdinError::Network(format!("Failed to build HTTP client: {error}")))
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(is_public_ipv4)
+            .unwrap_or_else(|| is_public_ipv6(ip)),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(octets[0] == 0
+        || octets[0] == 10
+        || octets[0] == 127
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 224)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    // Conservatively allow only global-unicast 2000::/3 while excluding the
+    // documentation, tunnelling, benchmarking, and ORCHID prefixes. This
+    // rejects loopback, unspecified, ULA, link-local, multicast, and other
+    // special-purpose ranges by default.
+    (segments[0] & 0xe000) == 0x2000
+        && !(segments[0] == 0x2001
+            && (segments[1] == 0
+                || segments[1] == 2
+                || (0x10..=0x2f).contains(&segments[1])
+                || segments[1] == 0x0db8))
+        && segments[0] != 0x2002
+}
+
+fn is_sensitive_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "x-api-key" | "x-auth-token"
+    )
+}
+
+fn is_forbidden_destination_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "upgrade"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-original-url"
+            | "x-rewrite-url"
+    )
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(normalize_host) == right.host_str().map(normalize_host)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+async fn send_with_egress_policy(
+    mut method: reqwest::Method,
+    mut url: reqwest::Url,
+    headers: &reqwest::header::HeaderMap,
+    mut body: Option<String>,
+    policy: &EgressPolicy,
+) -> OdinResult<reqwest::Response> {
+    let original = url.clone();
+    for redirects in 0..=MAX_REDIRECTS {
+        let client = pinned_client(&url, policy).await?;
+        let mut request = client.request(method.clone(), url.clone());
+        let forwarding_sensitive = same_origin(&original, &url);
+        for (name, value) in headers {
+            if forwarding_sensitive || !is_sensitive_header(name) {
+                request = request.header(name, value);
+            }
+        }
+        if let Some(payload) = body.as_ref() {
+            request = request.body(payload.clone());
+        }
+
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                OdinError::Timeout(format!("Request to {url} timed out"))
+            } else {
+                OdinError::Network(format!("Request to {url} failed: {error}"))
+            }
+        })?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirects == MAX_REDIRECTS {
+            return Err(OdinError::Network(format!(
+                "Request exceeded {MAX_REDIRECTS} redirects"
+            )));
+        }
+
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| OdinError::Network("Redirect omitted Location header".into()))?
+            .to_str()
+            .map_err(|error| OdinError::Network(format!("Invalid redirect location: {error}")))?;
+        let next = url.join(location).map_err(|error| {
+            OdinError::Network(format!(
+                "Invalid redirect destination '{location}': {error}"
+            ))
+        })?;
+        let next = parse_http_url(next.as_str()).map_err(OdinError::Validation)?;
+        if response.status() == reqwest::StatusCode::SEE_OTHER
+            || ((response.status() == reqwest::StatusCode::MOVED_PERMANENTLY
+                || response.status() == reqwest::StatusCode::FOUND)
+                && method == reqwest::Method::POST)
+        {
+            method = reqwest::Method::GET;
+            body = None;
+        }
+        url = next;
+    }
+    unreachable!("redirect loop returns or errors at its fixed bound")
+}
+
 /// Arguments for `web_fetch`.
 #[derive(Debug, Deserialize)]
 struct WebFetchArgs {
@@ -34,7 +340,7 @@ struct WebFetchArgs {
 pub struct WebFetch {
     name: String,
     description: String,
-    client: Arc<reqwest::Client>,
+    egress_policy: EgressPolicy,
 }
 
 impl WebFetch {
@@ -45,8 +351,30 @@ impl WebFetch {
             description:
                 "Fetch the contents of a URL via HTTP GET. Returns the raw text response body."
                     .into(),
-            client: Arc::new(http_client()),
+            egress_policy: EgressPolicy::default(),
         }
+    }
+
+    /// Explicitly allow trusted hostnames even when they resolve to a
+    /// non-public address. Hostnames are matched exactly after normalization.
+    pub fn with_allowed_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            egress_policy: EgressPolicy::with_allowed_hosts(hosts),
+            ..Self::new()
+        }
+    }
+
+    /// Configure exact hostname and IP-CIDR exceptions for trusted internal
+    /// services. Invalid CIDRs fail construction rather than weakening policy.
+    pub fn with_egress_allowlist(
+        hosts: impl IntoIterator<Item = String>,
+        cidrs: impl IntoIterator<Item = String>,
+    ) -> OdinResult<Self> {
+        Ok(Self {
+            egress_policy: EgressPolicy::with_allowlist(hosts, cidrs)
+                .map_err(OdinError::Validation)?,
+            ..Self::new()
+        })
     }
 
     /// Construct the JSON schema.
@@ -113,30 +441,29 @@ impl Tool for WebFetch {
             source: Some(Box::new(e)),
         })?;
 
-        let url = &parsed.url;
-
-        // Validate URL
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                tool_name: self.name.clone(),
-                success: false,
-                output: String::new(),
-                error: Some("URL must start with http:// or https://".into()),
-                duration_ms: 0,
-                timestamp: Utc::now(),
-            });
-        }
-
-        let response = self.client.get(url).send().await.map_err(|e| {
-            if e.is_timeout() {
-                OdinError::Timeout(format!("Request to {url} timed out"))
-            } else if e.is_connect() {
-                OdinError::Network(format!("Could not connect to {url}: {e}"))
-            } else {
-                OdinError::Network(format!("Request to {url} failed: {e}"))
+        let url = match parse_http_url(&parsed.url) {
+            Ok(url) => url,
+            Err(error) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    tool_name: self.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                    duration_ms: 0,
+                    timestamp: Utc::now(),
+                });
             }
-        })?;
+        };
+
+        let response = send_with_egress_policy(
+            reqwest::Method::GET,
+            url.clone(),
+            &reqwest::header::HeaderMap::new(),
+            None,
+            &self.egress_policy,
+        )
+        .await?;
 
         let status = response.status();
         let body = response.text().await.map_err(|e| {
@@ -357,6 +684,30 @@ struct HeaderPair {
     value: String,
 }
 
+fn http_request_is_risky(args: &serde_json::Value) -> bool {
+    let method = args
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    ) {
+        return true;
+    }
+    args.get("headers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|headers| {
+            headers.iter().any(|header| {
+                header
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|name| reqwest::header::HeaderName::from_bytes(name.as_bytes()).ok())
+                    .is_some_and(|name| is_sensitive_header(&name))
+            })
+        })
+}
+
 /// Tool that makes arbitrary HTTP requests.
 ///
 /// Supports GET, POST, PUT, DELETE methods with optional headers and body.
@@ -364,7 +715,7 @@ struct HeaderPair {
 pub struct HttpRequest {
     name: String,
     description: String,
-    client: Arc<reqwest::Client>,
+    egress_policy: EgressPolicy,
 }
 
 impl HttpRequest {
@@ -372,9 +723,31 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             name: "http_request".into(),
-            description: "Make an HTTP request with the given method (GET/POST/PUT/DELETE), URL, optional headers, and optional body. Safe with URL validation.".into(),
-            client: Arc::new(http_client()),
+            description: "Make an HTTP request with the given method (GET/POST/PUT/DELETE), URL, optional headers, and optional body. Private and special-purpose destinations are blocked.".into(),
+            egress_policy: EgressPolicy::default(),
         }
+    }
+
+    /// Explicitly allow trusted hostnames even when they resolve to a
+    /// non-public address. Hostnames are matched exactly after normalization.
+    pub fn with_allowed_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            egress_policy: EgressPolicy::with_allowed_hosts(hosts),
+            ..Self::new()
+        }
+    }
+
+    /// Configure exact hostname and IP-CIDR exceptions for trusted internal
+    /// services. Invalid CIDRs fail construction rather than weakening policy.
+    pub fn with_egress_allowlist(
+        hosts: impl IntoIterator<Item = String>,
+        cidrs: impl IntoIterator<Item = String>,
+    ) -> OdinResult<Self> {
+        Ok(Self {
+            egress_policy: EgressPolicy::with_allowlist(hosts, cidrs)
+                .map_err(OdinError::Validation)?,
+            ..Self::new()
+        })
     }
 
     fn make_schema(name: &str) -> ToolSchema {
@@ -440,11 +813,23 @@ impl Tool for HttpRequest {
     }
 
     fn is_safe(&self) -> bool {
+        false
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn requires_approval_for(&self, args: &serde_json::Value) -> bool {
+        http_request_is_risky(args)
+    }
+
+    fn is_dangerous(&self) -> bool {
         true
     }
 
     fn capability_tags(&self) -> &[&str] {
-        &["web", "http", "safe"]
+        &["web", "http", "network", "dangerous"]
     }
 
     #[instrument(skip(self, _context), fields(tool = self.name))]
@@ -462,18 +847,20 @@ impl Tool for HttpRequest {
                 source: Some(Box::new(e)),
             })?;
 
-        // Validate URL
-        if !parsed.url.starts_with("http://") && !parsed.url.starts_with("https://") {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                tool_name: self.name.clone(),
-                success: false,
-                output: String::new(),
-                error: Some("URL must start with http:// or https://".into()),
-                duration_ms: 0,
-                timestamp: Utc::now(),
-            });
-        }
+        let url = match parse_http_url(&parsed.url) {
+            Ok(url) => url,
+            Err(error) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    tool_name: self.name.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                    duration_ms: 0,
+                    timestamp: Utc::now(),
+                });
+            }
+        };
 
         // Validate method
         let method = match parsed.method.to_uppercase().as_str() {
@@ -496,34 +883,36 @@ impl Tool for HttpRequest {
             }
         };
 
-        // Build request
-        let mut req = self.client.request(method, &parsed.url);
-
-        if let Some(ref headers) = parsed.headers {
-            for h in headers {
-                if let (Ok(name), Ok(value)) = (
-                    reqwest::header::HeaderName::from_bytes(h.name.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(&h.value),
-                ) {
-                    req = req.header(name, value);
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(ref configured_headers) = parsed.headers {
+            for header in configured_headers {
+                let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|error| {
+                        OdinError::Validation(format!(
+                            "Invalid HTTP header name '{}': {error}",
+                            header.name
+                        ))
+                    })?;
+                if is_forbidden_destination_header(&name) {
+                    return Err(OdinError::Validation(format!(
+                        "HTTP header '{}' cannot override the validated destination",
+                        header.name
+                    )));
                 }
+                let value =
+                    reqwest::header::HeaderValue::from_str(&header.value).map_err(|error| {
+                        OdinError::Validation(format!(
+                            "Invalid value for HTTP header '{}': {error}",
+                            header.name
+                        ))
+                    })?;
+                headers.insert(name, value);
             }
         }
 
-        if let Some(ref body) = parsed.body {
-            req = req.body(body.clone());
-        }
-
-        // Execute
-        let response = req.send().await.map_err(|e| {
-            if e.is_timeout() {
-                OdinError::Timeout(format!("Request to {} timed out", parsed.url))
-            } else if e.is_connect() {
-                OdinError::Network(format!("Could not connect to {}: {e}", parsed.url))
-            } else {
-                OdinError::Network(format!("Request to {} failed: {e}", parsed.url))
-            }
-        })?;
+        let response =
+            send_with_egress_policy(method, url, &headers, parsed.body, &self.egress_policy)
+                .await?;
 
         let status = response.status();
         let body = response.text().await.map_err(|e| {
@@ -604,7 +993,7 @@ mod tests {
         });
         let result = fetch.execute(args, &test_context()).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("URL must start with"));
+        assert!(result.error.unwrap().contains("Invalid URL"));
     }
 
     #[tokio::test]
@@ -664,7 +1053,7 @@ mod tests {
         });
         let result = req.execute(args, &test_context()).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("URL must start with"));
+        assert!(result.error.unwrap().contains("Invalid URL"));
     }
 
     #[tokio::test]
@@ -693,5 +1082,43 @@ mod tests {
         {
             assert!(res.error.unwrap().contains("HTTP"));
         }
+    }
+
+    #[test]
+    fn blocks_private_and_special_purpose_destinations() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "192.168.1.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "2002:7f00:1::",
+        ] {
+            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+        }
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn parses_urls_structurally_and_rejects_embedded_credentials() {
+        assert!(parse_http_url("HTTPS://example.com/path").is_ok());
+        assert!(parse_http_url("file:///etc/passwd").is_err());
+        assert!(parse_http_url("https://user:secret@example.com").is_err());
+    }
+
+    #[test]
+    fn explicit_cidr_allowlist_matches_only_its_network() {
+        let network = IpNetwork::parse("10.20.0.0/16").unwrap();
+        assert!(network.contains("10.20.1.2".parse().unwrap()));
+        assert!(!network.contains("10.21.1.2".parse().unwrap()));
+        assert!(IpNetwork::parse("10.0.0.0/33").is_err());
     }
 }

@@ -328,7 +328,9 @@ async fn chat_handler(
 fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry {
     let registry = odin_tools::ToolRegistry::new();
     let sandbox = Arc::new(odin_tools::Sandbox::new(
-        odin_core::types::PathBoundary::default(),
+        config
+            .map(|tools| tools.path_boundary.clone())
+            .unwrap_or_default(),
     ));
 
     // Helper to check whether a tool should be registered
@@ -368,7 +370,9 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
     if tool_enabled("shell") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::shell::Shell::new())
+            Box::new(odin_tools::builtins::shell::Shell::with_sandbox(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("web_fetch") {
@@ -390,7 +394,12 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
         );
     }
     if tool_enabled("git") {
-        try_reg!(registry, Box::new(odin_tools::builtins::git::Git::new()));
+        try_reg!(
+            registry,
+            Box::new(odin_tools::builtins::git::Git::with_sandbox(
+                sandbox.clone()
+            ))
+        );
     }
     if tool_enabled("system_info") {
         try_reg!(
@@ -412,18 +421,27 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
     }
     // Utility tools (Phase 4.0 expansion — 10 new tools)
     if tool_enabled("file_list") {
-        try_reg!(registry, Box::new(odin_tools::builtins::utility::FileList));
+        try_reg!(
+            registry,
+            Box::new(odin_tools::builtins::utility::FileList::new(
+                sandbox.clone()
+            ))
+        );
     }
     if tool_enabled("file_delete") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::utility::FileDelete)
+            Box::new(odin_tools::builtins::utility::FileDelete::new(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("file_exists") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::utility::FileExists)
+            Box::new(odin_tools::builtins::utility::FileExists::new(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("env_var") {

@@ -95,6 +95,7 @@ async fn test_skills_loaded_and_injected_into_plan_phase() {
     };
 
     let context = odin_loop::phases::PhaseContext {
+        principal_id: uuid::Uuid::new_v4(),
         confidence_scorer: odin_loop::ConfidenceScorer::default(),
         decomposer: odin_loop::GoalDecomposer::default(),
         summarizer: odin_loop::StateSummarizer::default(),
