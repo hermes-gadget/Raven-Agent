@@ -14,6 +14,7 @@ use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
 use crate::Sandbox;
+use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
 
 /// Arguments for the `git` tool.
 #[derive(Debug, Deserialize)]
@@ -180,21 +181,19 @@ impl Tool for Git {
         // Set timeout
         let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
 
-        // Spawn and wait with timeout
-        let output = tokio::time::timeout(timeout, cmd.output())
+        let output = process::run_command(cmd, timeout, DEFAULT_MAX_OUTPUT_BYTES)
             .await
-            .map_err(|_| {
-                OdinError::Timeout(format!(
+            .map_err(|error| match error {
+                ProcessError::Timeout => OdinError::Timeout(format!(
                     "Git command timed out after {}s: git {}",
                     parsed.timeout_secs, command_str
-                ))
+                )),
+                ProcessError::Io(error) => OdinError::Tool {
+                    tool: self.name.clone(),
+                    message: format!("Failed to execute git command: {error}"),
+                    source: Some(Box::new(error)),
+                },
             })?;
-
-        let output = output.map_err(|e| OdinError::Tool {
-            tool: self.name.clone(),
-            message: format!("Failed to execute git command: {e}"),
-            source: Some(Box::new(e)),
-        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -209,6 +208,11 @@ impl Tool for Git {
             }
             result_output.push_str("STDERR:\n");
             result_output.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            result_output.push_str(&format!(
+                "\n\n[TRUNCATED: output exceeded {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+            ));
         }
 
         let success = output.status.success();

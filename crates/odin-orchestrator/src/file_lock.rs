@@ -8,6 +8,7 @@
 
 use dashmap::DashMap;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -39,6 +40,8 @@ pub struct FileLock {
 /// - No READ locks are allowed while a WRITE lock is held.
 /// - Writers are queued FIFO.
 pub struct FileLockManager {
+    /// Canonical workspace root used to turn aliases into one lock identity.
+    workspace_root: Arc<PathBuf>,
     /// Currently held locks: file_path → Vec<FileLock>
     locks: Arc<DashMap<String, Vec<FileLock>>>,
     /// Queue of agents waiting for a write lock: file_path → VecDeque<(agent_id, queued_at)>
@@ -60,16 +63,94 @@ impl Default for FileLockManager {
 impl FileLockManager {
     /// Create a new empty file lock manager.
     pub fn new() -> Self {
+        let root = std::env::current_dir()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::from_root(root)
+    }
+
+    /// Create a lock manager rooted at a configured workspace.
+    pub fn with_workspace_root(path: impl AsRef<Path>) -> Result<Self, String> {
+        let root = std::fs::canonicalize(path.as_ref()).map_err(|error| {
+            format!(
+                "Unable to resolve file-lock workspace root '{}': {error}",
+                path.as_ref().display()
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(format!(
+                "File-lock workspace root '{}' is not a directory",
+                root.display()
+            ));
+        }
+        Ok(Self::from_root(root))
+    }
+
+    fn from_root(root: PathBuf) -> Self {
         Self {
+            workspace_root: Arc::new(root),
             locks: Arc::new(DashMap::new()),
             write_queue: Arc::new(DashMap::new()),
         }
     }
 
+    /// Normalize a path against the workspace root for use in lifecycle state
+    /// and lock operations.
+    pub fn normalize_path(&self, raw: &str) -> Result<String, String> {
+        let raw_path = Path::new(raw);
+        let candidate = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            self.workspace_root.join(raw_path)
+        };
+
+        let mut missing = Vec::new();
+        let mut current = candidate.as_path();
+        while !current.exists() {
+            let component = current
+                .file_name()
+                .ok_or_else(|| format!("Unable to resolve lock path '{}'", raw_path.display()))?;
+            missing.push(component.to_os_string());
+            current = current
+                .parent()
+                .ok_or_else(|| format!("Unable to resolve lock path '{}'", raw_path.display()))?;
+        }
+
+        let mut resolved = std::fs::canonicalize(current).map_err(|error| {
+            format!(
+                "Unable to resolve lock path '{}': {error}",
+                raw_path.display()
+            )
+        })?;
+        for component in missing.iter().rev() {
+            resolved.push(component);
+        }
+
+        if !resolved.starts_with(self.workspace_root.as_path()) {
+            return Err(format!(
+                "Lock path '{}' is outside workspace root '{}'",
+                raw,
+                self.workspace_root.display()
+            ));
+        }
+
+        let relative = resolved
+            .strip_prefix(self.workspace_root.as_path())
+            .map_err(|_| format!("Unable to make lock path '{}' workspace-relative", raw))?;
+        let normalized = relative.to_string_lossy().to_string();
+        Ok(if normalized.is_empty() {
+            ".".into()
+        } else {
+            normalized
+        })
+    }
+
     /// Try to acquire a read lock on a file.
     /// Returns `Ok(())` if acquired, or `Err(msg)` if a write lock is held.
     pub fn acquire_read(&self, path: &str, agent_id: Uuid) -> Result<(), String> {
-        let mut entry = self.locks.entry(path.to_string()).or_default();
+        let path = self.normalize_path(path)?;
+        let mut entry = self.locks.entry(path.clone()).or_default();
 
         // A write lock held by this agent already grants read access, and
         // repeated read acquisition must not create duplicate holders.
@@ -105,7 +186,8 @@ impl FileLockManager {
     /// If a lock (read or write) is held, the writer is queued.
     /// Returns `Ok(())` if acquired immediately, or `Err(queued_message)` if queued.
     pub fn acquire_write(&self, path: &str, agent_id: Uuid) -> Result<(), String> {
-        let mut entry = self.locks.entry(path.to_string()).or_default();
+        let path = self.normalize_path(path)?;
+        let mut entry = self.locks.entry(path.clone()).or_default();
 
         // Re-acquiring a lock that was granted from the queue is idempotent.
         // Without this, a woken writer queues behind its own lock forever.
@@ -210,16 +292,19 @@ impl FileLockManager {
 
     /// Release a specific lock.
     pub fn release(&self, path: &str, agent_id: Uuid) {
-        if let Some(mut entry) = self.locks.get_mut(path) {
+        let Ok(path) = self.normalize_path(path) else {
+            return;
+        };
+        if let Some(mut entry) = self.locks.get_mut(&path) {
             entry.retain(|l| l.agent_id != agent_id);
             if entry.is_empty() {
                 drop(entry);
-                self.locks.remove(path);
+                self.locks.remove(&path);
 
                 // Grant to next queued writer
-                if let Some(mut queue) = self.write_queue.get_mut(path) {
+                if let Some(mut queue) = self.write_queue.get_mut(&path) {
                     if let Some(next) = queue.pop_front() {
-                        let mut new_entry = self.locks.entry(path.to_string()).or_default();
+                        let mut new_entry = self.locks.entry(path.clone()).or_default();
                         new_entry.push(FileLock {
                             path: path.to_string(),
                             mode: LockMode::Write,
@@ -228,7 +313,7 @@ impl FileLockManager {
                     }
                     if queue.is_empty() {
                         drop(queue);
-                        self.write_queue.remove(path);
+                        self.write_queue.remove(&path);
                     }
                 }
             }
@@ -237,28 +322,39 @@ impl FileLockManager {
 
     /// Check if a file has any locks.
     pub fn is_locked(&self, path: &str) -> bool {
-        self.locks.contains_key(path)
+        self.normalize_path(path)
+            .map(|path| self.locks.contains_key(&path))
+            .unwrap_or(false)
     }
 
     /// Check if a file has a write lock.
     pub fn has_write_lock(&self, path: &str) -> bool {
+        let Ok(path) = self.normalize_path(path) else {
+            return false;
+        };
         self.locks
-            .get(path)
+            .get(&path)
             .map(|entry| entry.iter().any(|l| l.mode == LockMode::Write))
             .unwrap_or(false)
     }
 
     /// Get all agents holding locks on a file.
     pub fn lock_holders(&self, path: &str) -> Vec<Uuid> {
+        let Ok(path) = self.normalize_path(path) else {
+            return Vec::new();
+        };
         self.locks
-            .get(path)
+            .get(&path)
             .map(|entry| entry.iter().map(|l| l.agent_id).collect())
             .unwrap_or_default()
     }
 
     /// Get the queue length for a file.
     pub fn queue_length(&self, path: &str) -> usize {
-        self.write_queue.get(path).map(|q| q.len()).unwrap_or(0)
+        self.normalize_path(path)
+            .ok()
+            .and_then(|path| self.write_queue.get(&path).map(|q| q.len()))
+            .unwrap_or(0)
     }
 
     /// List all currently locked files.
@@ -570,5 +666,42 @@ mod tests {
 
         mgr.release_all(holder);
         assert!(!mgr.is_locked("test.txt"));
+    }
+
+    #[test]
+    fn test_equivalent_path_spellings_share_one_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "data").unwrap();
+        let manager = FileLockManager::with_workspace_root(root.path()).unwrap();
+        let holder = Uuid::new_v4();
+        let waiter = Uuid::new_v4();
+
+        manager.acquire_write("file.txt", holder).unwrap();
+        assert!(manager.acquire_read("./file.txt", waiter).is_err());
+        assert!(
+            manager
+                .acquire_write(file.to_str().unwrap(), waiter)
+                .is_err()
+        );
+        assert_eq!(manager.lock_holders("file.txt"), vec![holder]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_alias_shares_one_lock() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.txt");
+        let alias = root.path().join("alias.txt");
+        std::fs::write(&file, "data").unwrap();
+        symlink(&file, &alias).unwrap();
+        let manager = FileLockManager::with_workspace_root(root.path()).unwrap();
+        let holder = Uuid::new_v4();
+        let waiter = Uuid::new_v4();
+
+        manager.acquire_write("file.txt", holder).unwrap();
+        assert!(manager.acquire_read("alias.txt", waiter).is_err());
     }
 }

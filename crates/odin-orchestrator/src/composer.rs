@@ -107,9 +107,16 @@ impl Default for Composer {
 impl Composer {
     /// Create a new Composer.
     pub fn new(config: ComposerConfig) -> Self {
+        let file_locks = match FileLockManager::with_workspace_root(&config.workspace_root) {
+            Ok(manager) => Arc::new(manager),
+            Err(error) => {
+                tracing::warn!(%error, "Falling back to current directory for file locks");
+                Arc::new(FileLockManager::new())
+            }
+        };
         Self {
             config,
-            file_locks: Arc::new(FileLockManager::new()),
+            file_locks,
             merge_resolver: MergeResolver::new(),
             progress: ProgressTracker::new(),
             graphs: HashMap::new(),
@@ -468,6 +475,62 @@ impl Composer {
     /// Start a sub-agent (transition from Queued to Running).
     pub fn start_agent(&mut self, id: Uuid) -> Result<(), String> {
         let file_locks = self.file_locks.clone();
+        let (write_files, read_files) = {
+            let (agent, lifecycle) = self
+                .agents
+                .get(&id)
+                .ok_or_else(|| format!("Agent {} not found", id))?;
+
+            if self
+                .agents
+                .values()
+                .filter(|(agent, _)| agent.phase == AgentPhase::Running)
+                .count()
+                >= self.config.max_parallel.max(1)
+            {
+                return Err(format!(
+                    "Cannot start agent {}: max_parallel ({}) reached",
+                    id,
+                    self.config.max_parallel.max(1)
+                ));
+            }
+
+            if let Some(node_id) = agent.config.task_node_id
+                && let Some(graph) = self
+                    .graphs
+                    .values()
+                    .find(|graph| graph.nodes.contains_key(&node_id))
+            {
+                let blocked = graph.edges.iter().any(|edge| {
+                    edge.to == node_id
+                        && graph
+                            .nodes
+                            .get(&edge.from)
+                            .is_some_and(|node| node.status != TaskNodeStatus::Done)
+                });
+                if blocked {
+                    return Err(format!(
+                        "Cannot start agent {}: upstream task dependencies are incomplete",
+                        id
+                    ));
+                }
+            }
+
+            let write_files = agent
+                .config
+                .write_files
+                .iter()
+                .map(|file| file_locks.normalize_path(file))
+                .collect::<Result<Vec<_>, _>>()?;
+            let read_files = agent
+                .config
+                .read_files
+                .iter()
+                .map(|file| file_locks.normalize_path(file))
+                .collect::<Result<Vec<_>, _>>()?;
+            let _ = lifecycle;
+            (write_files, read_files)
+        };
         let agent_id = id.to_string();
         let held_before: std::collections::HashSet<String> = file_locks
             .snapshot()
@@ -494,7 +557,7 @@ impl Composer {
             // Acquire file locks if needed. If any acquisition fails, roll
             // back only locks added by this attempt and preserve FIFO grants.
             if agent.needs_write_locks() {
-                for file in &agent.config.write_files {
+                for file in &write_files {
                     match file_locks.acquire_write(file, id) {
                         Ok(()) => {
                             lifecycle.lock_acquired(file);
@@ -509,8 +572,8 @@ impl Composer {
             }
 
             // A write lock already grants read access for the same path.
-            for file in &agent.config.read_files {
-                if agent.config.write_files.contains(file) {
+            for file in &read_files {
+                if write_files.contains(file) {
                     continue;
                 }
                 match file_locks.acquire_read(file, id) {
@@ -675,48 +738,9 @@ impl Composer {
             .collect();
 
         for id in ids {
-            // Re-acquire file locks if needed, then start
-            let needs_locks = {
-                if let Some((agent, _)) = self.agents.get(&id) {
-                    agent.needs_write_locks()
-                } else {
-                    false
-                }
-            };
-
-            if needs_locks {
-                // Try to acquire write locks
-                let write_files: Vec<String> = self
-                    .agents
-                    .get(&id)
-                    .map(|(a, _)| a.config.write_files.clone())
-                    .unwrap_or_default();
-
-                let mut all_acquired = true;
-                for file in &write_files {
-                    if self.file_locks.acquire_write(file, id).is_err() {
-                        all_acquired = false;
-                        break;
-                    }
-                }
-                if !all_acquired {
-                    continue; // could not re-acquire locks, skip
-                }
+            if self.start_agent(id).is_ok() {
+                resumed += 1;
             }
-
-            // Also acquire read locks
-            if let Some((agent, _)) = self.agents.get(&id) {
-                for file in &agent.config.read_files {
-                    let _ = self.file_locks.acquire_read(file, id);
-                }
-            }
-
-            // Transition to running
-            if let Some((agent, lifecycle)) = self.agents.get_mut(&id) {
-                agent.phase = AgentPhase::Running;
-                lifecycle.start();
-            }
-            resumed += 1;
         }
         Ok(resumed)
     }

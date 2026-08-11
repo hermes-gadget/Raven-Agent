@@ -221,8 +221,14 @@ async fn persist_orchestration_state(
     root_goal: &str,
     agent_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
+    let graph_root_id = composer
+        .get_graph(root_goal)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{root_goal}' not found"))?;
     if let Some((_, lifecycle)) = composer.get_agent(&agent_id) {
-        store.save_agent_lifecycle(lifecycle).await?;
+        store
+            .save_agent_lifecycle(&graph_root_id, lifecycle)
+            .await?;
     }
     if let Some(graph) = composer.get_graph(root_goal) {
         store.save_task_graph(graph).await?;
@@ -1122,7 +1128,7 @@ async fn run_orchestrated(
                         tracing::info!("[ORCH] Agent '{}' started", agent.label);
                         spawned.insert(agent.agent_id);
                         if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                            store.save_agent_lifecycle(lifecycle).await?;
+                            store.save_agent_lifecycle(&run_id_str, lifecycle).await?;
                         }
                         let graph = composer.get_graph(&root_goal).ok_or_else(|| {
                             anyhow::anyhow!("task graph missing for root goal during spawn")
@@ -1245,7 +1251,7 @@ async fn run_orchestrated(
                     Err(msg) => {
                         tracing::info!("[ORCH] Agent '{}' queued: {}", agent.label, msg);
                         if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                            store.save_agent_lifecycle(lifecycle).await?;
+                            store.save_agent_lifecycle(&run_id_str, lifecycle).await?;
                         }
                         if let Some(graph) = composer.get_graph(&root_goal) {
                             store.save_task_graph(graph).await?;
@@ -1718,9 +1724,20 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
                         println!("🛑 Task graph '{}' cancelled (live control enqueued).", id);
                     }
                     // Also cancel any associated agent lifecycles
+                    let graph_root_id = store
+                        .list_task_graphs()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|graph| graph.run_id == id || graph.root_goal == id)
+                        .map(|graph| graph.run_id);
                     let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
                     for lc in &lifecycles {
-                        if lc.phase != "done" && lc.phase != "failed" && lc.phase != "cancelled" {
+                        if graph_root_id.as_deref() == lc.graph_root_id.as_deref()
+                            && lc.phase != "done"
+                            && lc.phase != "failed"
+                            && lc.phase != "cancelled"
+                        {
                             let _ = store
                                 .update_lifecycle_phase(&lc.agent_id, "cancelled")
                                 .await;
@@ -3197,7 +3214,7 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                 let dangerous = if tool.is_dangerous() { " ⚠" } else { "  " };
                 let name = tool.name();
                 let truncated = if name.len() > 28 {
-                    format!("{}…", &name[..27])
+                    format!("{}…", name.chars().take(27).collect::<String>())
                 } else {
                     name.to_string()
                 };
@@ -3972,8 +3989,12 @@ mod tests {
             .save_task_graph(composer.get_graph(root_goal).unwrap())
             .await
             .unwrap();
+        let graph_root_id = composer.get_graph(root_goal).unwrap().id.to_string();
         let (_, initial_lifecycle) = composer.get_agent(&agent_id).unwrap();
-        store.save_agent_lifecycle(initial_lifecycle).await.unwrap();
+        store
+            .save_agent_lifecycle(&graph_root_id, initial_lifecycle)
+            .await
+            .unwrap();
         store
             .save_lock_snapshot(&serde_json::to_string(&composer.file_locks().snapshot()).unwrap())
             .await

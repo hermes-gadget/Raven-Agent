@@ -215,7 +215,7 @@ async fn test_circuit_breaker_opens_after_n_failures() {
     );
 
     // Check circuit breaker states
-    let states = provider.circuit_breaker_states();
+    let states = provider.circuit_breaker_states().await;
     assert!(
         states.contains_key("primary"),
         "primary should have a circuit breaker state"
@@ -265,7 +265,7 @@ async fn test_circuit_breaker_state_persists_across_calls() {
     }
 
     // Circuit should still be closed (only threshold-1 failures)
-    let states = provider.circuit_breaker_states();
+    let states = provider.circuit_breaker_states().await;
     let (failure_count, circuit_open) = states.get("primary").copied().unwrap_or_default();
     assert_eq!(
         failure_count,
@@ -279,7 +279,7 @@ async fn test_circuit_breaker_state_persists_across_calls() {
     let r = provider.chat("gpt-4", msgs, &[], &opts).await;
     assert!(r.is_ok(), "call {} should succeed via fallback", threshold);
 
-    let states = provider.circuit_breaker_states();
+    let states = provider.circuit_breaker_states().await;
     let (failure_count, circuit_open) = states.get("primary").copied().unwrap_or_default();
     assert_eq!(failure_count, threshold, "{} failures total", threshold);
     assert!(circuit_open, "circuit should now be open");

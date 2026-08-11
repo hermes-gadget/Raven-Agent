@@ -748,7 +748,7 @@ fn render_history_view(frame: &mut Frame, area: Rect, app: &App) {
         .map(|r| {
             let (icon, color) = phase_icon(&r.status);
             let goal = if r.goal.len() > 30 {
-                format!("{}...", &r.goal[..27])
+                format!("{}...", truncate(&r.goal, 27))
             } else {
                 r.goal.clone()
             };

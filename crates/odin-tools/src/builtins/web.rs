@@ -24,6 +24,29 @@ fn http_client() -> reqwest::Client {
 }
 
 const MAX_REDIRECTS: usize = 5;
+const MAX_HTTP_BODY_BYTES: usize = 100_000;
+
+/// Read at most the configured response size while allowing the caller to
+/// report that bytes were discarded. This avoids `Response::text()` buffering
+/// an attacker-controlled body before the display limit is applied.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+) -> Result<(String, bool), reqwest::Error> {
+    let mut bytes = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
+    let mut truncated = false;
+
+    while let Some(chunk) = response.chunk().await? {
+        let remaining = MAX_HTTP_BODY_BYTES.saturating_sub(bytes.len());
+        let keep = remaining.min(chunk.len());
+        bytes.extend_from_slice(&chunk[..keep]);
+        if keep < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
 
 #[derive(Debug, Clone, Default)]
 struct EgressPolicy {
@@ -466,19 +489,15 @@ impl Tool for WebFetch {
         .await?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
+        let (body, truncated) = read_bounded_body(response).await.map_err(|e| {
             OdinError::Network(format!("Failed to read response body from {url}: {e}"))
         })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = status.is_success();
 
-        let output = if body.len() > 100_000 {
-            format!(
-                "{} (truncated from {} bytes to 100000)",
-                &body[..100_000],
-                body.len()
-            )
+        let output = if truncated {
+            format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
         } else {
             body
         };
@@ -626,15 +645,17 @@ impl Tool for WebSearch {
                 .map_err(|e| OdinError::Network(format!("Search request failed: {e}")))?;
 
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let (body, truncated) = read_bounded_body(response)
+                .await
+                .map_err(|e| OdinError::Network(format!("Failed to read search response: {e}")))?;
             let duration_ms = start.elapsed().as_millis() as u64;
 
             return Ok(ToolResult {
                 call_id: String::new(),
                 tool_name: self.name.clone(),
                 success: status.is_success(),
-                output: if body.len() > 100_000 {
-                    format!("{} (truncated)", &body[..100_000])
+                output: if truncated {
+                    format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
                 } else {
                     body
                 },
@@ -915,7 +936,7 @@ impl Tool for HttpRequest {
                 .await?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
+        let (body, truncated) = read_bounded_body(response).await.map_err(|e| {
             OdinError::Network(format!(
                 "Failed to read response body from {}: {e}",
                 parsed.url
@@ -925,12 +946,8 @@ impl Tool for HttpRequest {
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = status.is_success();
 
-        let output = if body.len() > 100_000 {
-            format!(
-                "{} (truncated from {} bytes to 100000)",
-                &body[..100_000],
-                body.len()
-            )
+        let output = if truncated {
+            format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
         } else {
             body
         };

@@ -1,16 +1,19 @@
 //! Secure credential and secret management for Raven Agent.
 //!
-//! The [`SecretManager`] provides encrypted storage for API keys, tokens,
-//! and other sensitive credentials used by providers and tools.
+//! The [`SecretManager`] provides in-memory storage for API keys, tokens, and
+//! other sensitive credentials used by providers and tools. It does not
+//! provide encryption at rest; callers should use an OS keychain or dedicated
+//! secrets backend when persistence is required.
 
 use odin_core::error::OdinResult;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// A stored secret with metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Secret {
     /// Name/key identifying this secret.
     pub name: String,
@@ -21,6 +24,29 @@ pub struct Secret {
     /// Whether this secret came from an environment variable.
     pub from_env: bool,
     /// The environment variable name (if from_env is true).
+    pub env_var: Option<String>,
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Secret")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("description", &self.description)
+            .field("from_env", &self.from_env)
+            .field("env_var", &self.env_var)
+            .finish()
+    }
+}
+
+/// Public metadata for a stored secret. Secret material is deliberately not
+/// represented by this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretMetadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub from_env: bool,
     pub env_var: Option<String>,
 }
 
@@ -111,9 +137,14 @@ impl SecretManager {
     }
 
     /// Get metadata about a secret (without revealing the value).
-    pub async fn get_secret_info(&self, name: &str) -> Option<Secret> {
+    pub async fn get_secret_info(&self, name: &str) -> Option<SecretMetadata> {
         let secrets = self.secrets.read().await;
-        secrets.get(name).cloned()
+        secrets.get(name).map(|secret| SecretMetadata {
+            name: secret.name.clone(),
+            description: secret.description.clone(),
+            from_env: secret.from_env,
+            env_var: secret.env_var.clone(),
+        })
     }
 
     /// Remove a secret.
@@ -270,6 +301,18 @@ mod tests {
         assert_eq!(info.name, "key");
         assert_eq!(info.description, Some("desc".into()));
         assert!(!info.from_env);
+    }
+
+    #[tokio::test]
+    async fn test_secret_debug_and_metadata_redact_value() {
+        let mgr = SecretManager::default();
+        mgr.set_secret("key", "plaintext-secret", None)
+            .await
+            .unwrap();
+
+        let secret = mgr.secrets.read().await.get("key").cloned().unwrap();
+        assert!(!format!("{secret:?}").contains("plaintext-secret"));
+        assert!(!format!("{:?}", mgr.get_secret_info("key").await).contains("plaintext-secret"));
     }
 
     #[tokio::test]

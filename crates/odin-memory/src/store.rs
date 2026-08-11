@@ -7,15 +7,13 @@ use crate::models::MemoryRow;
 use async_trait::async_trait;
 use odin_core::{MemoryCategory, MemoryEntry, OdinError, error::OdinResult, traits::MemoryStore};
 use rusqlite::{Connection, params};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::instrument;
 
 /// Persistent memory store backed by SQLite.
 ///
-/// All database operations are serialised through a `tokio::sync::Mutex`
-/// so the synchronous `rusqlite::Connection` can be shared safely across
-/// async tasks.
+/// Synchronous SQLite work is moved to Tokio's blocking pool so slow queries
+/// never hold an async mutex or block an executor worker.
 #[derive(Debug, Clone)]
 pub struct SqliteMemoryStore {
     conn: Arc<Mutex<Connection>>,
@@ -53,8 +51,8 @@ impl SqliteMemoryStore {
         // Mutex can be contended, a blocking access is safe here.
         let conn = self
             .conn
-            .try_lock()
-            .expect("store just created, no contention");
+            .lock()
+            .map_err(|error| OdinError::Database(format!("Memory store lock poisoned: {error}")))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_entries (
@@ -77,49 +75,65 @@ impl SqliteMemoryStore {
 
         Ok(())
     }
+
+    async fn run_db<T, F>(&self, operation: F) -> OdinResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> OdinResult<T> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|error| {
+                OdinError::Database(format!("Memory store lock poisoned: {error}"))
+            })?;
+            operation(&conn)
+        })
+        .await
+        .map_err(|error| OdinError::Database(format!("SQLite worker failed: {error}")))?
+    }
 }
 
 #[async_trait]
 impl MemoryStore for SqliteMemoryStore {
     #[instrument(skip(self, entry), fields(entry_id = %entry.id))]
     async fn store(&self, entry: MemoryEntry) -> OdinResult<()> {
-        let conn = self.conn.lock().await;
         let row = MemoryRow::from_entry(&entry);
+        self.run_db(move |conn| {
+            conn.execute(
+                "INSERT INTO memory_entries (id, content, category, created_at, updated_at, tags, importance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     content    = excluded.content,
+                     category   = excluded.category,
+                     updated_at = excluded.updated_at,
+                     tags       = excluded.tags,
+                     importance = excluded.importance",
+                params![
+                    row.id,
+                    row.content,
+                    row.category,
+                    row.created_at,
+                    row.updated_at,
+                    row.tags,
+                    row.importance,
+                ],
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to store memory entry: {e}")))?;
 
-        conn.execute(
-            "INSERT INTO memory_entries (id, content, category, created_at, updated_at, tags, importance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                 content    = excluded.content,
-                 category   = excluded.category,
-                 updated_at = excluded.updated_at,
-                 tags       = excluded.tags,
-                 importance = excluded.importance",
-            params![
-                row.id,
-                row.content,
-                row.category,
-                row.created_at,
-                row.updated_at,
-                row.tags,
-                row.importance,
-            ],
-        )
-        .map_err(|e| OdinError::Database(format!("Failed to store memory entry: {e}")))?;
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     #[instrument(skip(self))]
     async fn get(&self, id: &str) -> OdinResult<Option<MemoryEntry>> {
-        let conn = self.conn.lock().await;
+        let id = id.to_string();
+        self.run_db(move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, content, category, created_at, updated_at, tags, importance FROM memory_entries WHERE id = ?1")
+                .map_err(|e| OdinError::Database(format!("Failed to prepare get statement: {e}")))?;
 
-        let mut stmt = conn
-            .prepare("SELECT id, content, category, created_at, updated_at, tags, importance FROM memory_entries WHERE id = ?1")
-            .map_err(|e| OdinError::Database(format!("Failed to prepare get statement: {e}")))?;
-
-        let result = stmt
-            .query_row(params![id], |row| {
+            let result = stmt.query_row(params![id], |row| {
                 Ok(MemoryRow {
                     id: row.get(0)?,
                     content: row.get(1)?,
@@ -129,61 +143,68 @@ impl MemoryStore for SqliteMemoryStore {
                     tags: row.get(5)?,
                     importance: row.get(6)?,
                 })
-            })
-            .ok();
+            });
 
-        match result {
-            Some(row) => {
-                let entry: MemoryEntry =
-                    row.try_into().map_err(|e: String| OdinError::Database(e))?;
-                Ok(Some(entry))
+            match result {
+                Ok(row) => {
+                    let entry: MemoryEntry =
+                        row.try_into().map_err(|e: String| OdinError::Database(e))?;
+                    Ok(Some(entry))
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(OdinError::Database(format!(
+                    "Failed to read memory entry: {error}"
+                ))),
             }
-            None => Ok(None),
-        }
+        })
+        .await
     }
 
     #[instrument(skip(self))]
     async fn search(&self, query: &str, limit: usize) -> OdinResult<Vec<MemoryEntry>> {
-        let conn = self.conn.lock().await;
+        let query = query.to_string();
+        self.run_db(move |conn| {
+            let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+            let limit = limit as i64;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, category, created_at, updated_at, tags, importance
+                     FROM memory_entries
+                     WHERE content LIKE ?1 ESCAPE '\\'
+                     ORDER BY updated_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| {
+                    OdinError::Database(format!("Failed to prepare search statement: {e}"))
+                })?;
 
-        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-        let limit = limit as i64;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, category, created_at, updated_at, tags, importance
-                 FROM memory_entries
-                 WHERE content LIKE ?1 ESCAPE '\\'
-                 ORDER BY updated_at DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| OdinError::Database(format!("Failed to prepare search statement: {e}")))?;
-
-        let rows = stmt
-            .query_map(params![pattern, limit], |row| {
-                Ok(MemoryRow {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    category: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    tags: row.get(5)?,
-                    importance: row.get(6)?,
+            let rows = stmt
+                .query_map(params![pattern, limit], |row| {
+                    Ok(MemoryRow {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        category: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        tags: row.get(5)?,
+                        importance: row.get(6)?,
+                    })
                 })
-            })
-            .map_err(|e| OdinError::Database(format!("Failed to execute search: {e}")))?;
+                .map_err(|e| OdinError::Database(format!("Failed to execute search: {e}")))?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let row =
-                row.map_err(|e| OdinError::Database(format!("Error reading search row: {e}")))?;
-            match MemoryEntry::try_from(row) {
-                Ok(entry) => results.push(entry),
-                Err(e) => tracing::warn!("Skipping malformed memory entry during search: {e}"),
+            let mut results = Vec::new();
+            for row in rows {
+                let row =
+                    row.map_err(|e| OdinError::Database(format!("Error reading search row: {e}")))?;
+                match MemoryEntry::try_from(row) {
+                    Ok(entry) => results.push(entry),
+                    Err(e) => tracing::warn!("Skipping malformed memory entry during search: {e}"),
+                }
             }
-        }
 
-        Ok(results)
+            Ok(results)
+        })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -192,76 +213,81 @@ impl MemoryStore for SqliteMemoryStore {
         category: MemoryCategory,
         limit: usize,
     ) -> OdinResult<Vec<MemoryEntry>> {
-        let conn = self.conn.lock().await;
-
         let category_str = serde_json::to_value(category)
             .map(|v| v.as_str().unwrap_or("fact").to_string())
             .unwrap_or_else(|_| "fact".to_string());
-        let limit = limit as i64;
+        self.run_db(move |conn| {
+            let limit = limit as i64;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, category, created_at, updated_at, tags, importance
+                     FROM memory_entries
+                     WHERE category = ?1
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| {
+                    OdinError::Database(format!("Failed to prepare category statement: {e}"))
+                })?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, category, created_at, updated_at, tags, importance
-                 FROM memory_entries
-                 WHERE category = ?1
-                 ORDER BY created_at DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| {
-                OdinError::Database(format!("Failed to prepare category statement: {e}"))
-            })?;
-
-        let rows = stmt
-            .query_map(params![category_str, limit], |row| {
-                Ok(MemoryRow {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    category: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    tags: row.get(5)?,
-                    importance: row.get(6)?,
+            let rows = stmt
+                .query_map(params![category_str, limit], |row| {
+                    Ok(MemoryRow {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        category: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        tags: row.get(5)?,
+                        importance: row.get(6)?,
+                    })
                 })
-            })
-            .map_err(|e| OdinError::Database(format!("Failed to execute category query: {e}")))?;
+                .map_err(|e| {
+                    OdinError::Database(format!("Failed to execute category query: {e}"))
+                })?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let row =
-                row.map_err(|e| OdinError::Database(format!("Error reading category row: {e}")))?;
-            match MemoryEntry::try_from(row) {
-                Ok(entry) => results.push(entry),
-                Err(e) => tracing::warn!("Skipping malformed memory entry: {e}"),
+            let mut results = Vec::new();
+            for row in rows {
+                let row = row
+                    .map_err(|e| OdinError::Database(format!("Error reading category row: {e}")))?;
+                match MemoryEntry::try_from(row) {
+                    Ok(entry) => results.push(entry),
+                    Err(e) => tracing::warn!("Skipping malformed memory entry: {e}"),
+                }
             }
-        }
 
-        Ok(results)
+            Ok(results)
+        })
+        .await
     }
 
     #[instrument(skip(self))]
     async fn delete(&self, id: &str) -> OdinResult<()> {
-        let conn = self.conn.lock().await;
+        let id = id.to_string();
+        self.run_db(move |conn| {
+            let affected = conn
+                .execute("DELETE FROM memory_entries WHERE id = ?1", params![id])
+                .map_err(|e| OdinError::Database(format!("Failed to delete memory entry: {e}")))?;
 
-        let affected = conn
-            .execute("DELETE FROM memory_entries WHERE id = ?1", params![id])
-            .map_err(|e| OdinError::Database(format!("Failed to delete memory entry: {e}")))?;
+            if affected == 0 {
+                tracing::warn!(entry_id = %id, "Attempted to delete non-existent memory entry");
+            }
 
-        if affected == 0 {
-            tracing::warn!(entry_id = %id, "Attempted to delete non-existent memory entry");
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     #[instrument(skip(self))]
     async fn count(&self) -> OdinResult<usize> {
-        let conn = self.conn.lock().await;
+        self.run_db(|conn| {
+            let total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_entries", [], |row| row.get(0))
+                .map_err(|e| OdinError::Database(format!("Failed to count entries: {e}")))?;
 
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_entries", [], |row| row.get(0))
-            .map_err(|e| OdinError::Database(format!("Failed to count entries: {e}")))?;
-
-        Ok(total as usize)
+            Ok(total as usize)
+        })
+        .await
     }
 }
 
@@ -304,6 +330,25 @@ mod tests {
         let store = SqliteMemoryStore::in_memory().unwrap();
         let result = store.get("nonexistent-id").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_propagates_malformed_rows() {
+        let store = SqliteMemoryStore::in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memory_entries
+                 (id, content, category, created_at, updated_at, tags, importance)
+                 VALUES ('bad', 'content', 'not-a-category', 'now', 'now', '[]', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        let result = store.get("bad").await;
+        assert!(result.is_err(), "malformed rows must not look like misses");
     }
 
     #[tokio::test]

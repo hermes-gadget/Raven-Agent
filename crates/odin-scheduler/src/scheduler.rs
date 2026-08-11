@@ -20,6 +20,68 @@ use tokio::time::{Duration, interval};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
+async fn reserve_due_job(
+    jobs: &Arc<RwLock<HashMap<JobId, Job>>>,
+    job_id: JobId,
+    now: chrono::DateTime<Utc>,
+) -> Option<(Job, Uuid)> {
+    let mut jobs = jobs.write().await;
+    let job = jobs.get_mut(&job_id)?;
+    if !job.is_due(&now) || (job.max_concurrent > 0 && job.running_count >= job.max_concurrent) {
+        return None;
+    }
+
+    let task_id = Uuid::new_v4();
+    job.mark_run(task_id);
+    job.running_count += 1;
+    Some((job.clone(), task_id))
+}
+
+struct RunningCountGuard {
+    jobs: Arc<RwLock<HashMap<JobId, Job>>>,
+    job_id: JobId,
+    released: bool,
+}
+
+impl RunningCountGuard {
+    fn new(jobs: Arc<RwLock<HashMap<JobId, Job>>>, job_id: JobId) -> Self {
+        Self {
+            jobs,
+            job_id,
+            released: false,
+        }
+    }
+
+    async fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.get_mut(&self.job_id) {
+            job.running_count = job.running_count.saturating_sub(1);
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for RunningCountGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let jobs = self.jobs.clone();
+        let job_id = self.job_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut jobs = jobs.write().await;
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.running_count = job.running_count.saturating_sub(1);
+                }
+            });
+        }
+    }
+}
+
 /// A cron-like job scheduler with optional persistence and runtime execution.
 ///
 /// Manages a set of [`Job`]s, periodically checks for due jobs,
@@ -229,29 +291,48 @@ impl Scheduler {
     /// Returns the number of jobs that were run.
     pub async fn run_pending(&self) -> OdinResult<usize> {
         let now = Utc::now();
-        let due_jobs: Vec<(JobId, Job)> = {
+        let due_ids: Vec<JobId> = {
             let jobs = self.jobs.read().await;
             jobs.iter()
                 .filter(|(_, job)| job.is_due(&now))
-                .map(|(id, job)| (*id, job.clone()))
+                .map(|(id, _)| *id)
                 .collect()
         };
 
-        let count = due_jobs.len();
-        for (job_id, job) in due_jobs {
-            // Check concurrency limit
-            if job.max_concurrent > 0 && job.running_count >= job.max_concurrent {
-                trace!(
-                    job_id = %job_id,
-                    name = %job.name,
-                    running = job.running_count,
-                    max = job.max_concurrent,
-                    "Skipping job due to concurrency limit"
-                );
-                continue;
+        let mut count = 0;
+        for job_id in due_ids {
+            let job_snapshot = match self.jobs.read().await.get(&job_id).cloned() {
+                Some(job) => job,
+                None => continue,
+            };
+            // Resolve a real runtime agent before recording the run. A configured
+            // runtime with no agent is an actionable error, not a successful no-op.
+            if job_snapshot.task_goal.is_some() && self.runtime.is_none() {
+                return Err(OdinError::Config(format!(
+                    "Scheduled job '{}' requires a runtime, but none is configured",
+                    job_snapshot.name
+                )));
+            }
+            let runtime_agent =
+                if let (Some(runtime), Some(_)) = (&self.runtime, &job_snapshot.task_goal) {
+                    runtime.list_agents().first().map(|agent| agent.id)
+                } else {
+                    None
+                };
+            if self.runtime.is_some() && job_snapshot.task_goal.is_some() && runtime_agent.is_none()
+            {
+                return Err(OdinError::Internal(format!(
+                    "Scheduled job '{}' cannot run because the runtime has no registered agent",
+                    job_snapshot.name
+                )));
             }
 
-            let task_id = Uuid::new_v4();
+            // Recheck due state and reserve the execution under one write lock.
+            let Some((job, task_id)) = reserve_due_job(&self.jobs, job_id, Utc::now()).await else {
+                trace!(job_id = %job_id, "Skipping job: no longer due or at concurrency limit");
+                continue;
+            };
+            count += 1;
             info!(
                 job_id = %job_id,
                 name = %job.name,
@@ -259,50 +340,17 @@ impl Scheduler {
                 "Running scheduled job"
             );
 
-            // Resolve a real runtime agent before recording the run. A configured
-            // runtime with no agent is an actionable error, not a successful no-op.
-            if job.task_goal.is_some() && self.runtime.is_none() {
-                return Err(OdinError::Config(format!(
-                    "Scheduled job '{}' requires a runtime, but none is configured",
-                    job.name
-                )));
-            }
-            let runtime_agent = if let (Some(runtime), Some(_)) = (&self.runtime, &job.task_goal) {
-                runtime.list_agents().first().map(|agent| agent.id)
-            } else {
-                None
-            };
-            if self.runtime.is_some() && job.task_goal.is_some() && runtime_agent.is_none() {
-                return Err(OdinError::Internal(format!(
-                    "Scheduled job '{}' cannot run because the runtime has no registered agent",
-                    job.name
-                )));
-            }
-
-            // Update job state in memory
-            {
-                let mut jobs = self.jobs.write().await;
-                if let Some(active) = jobs.get_mut(&job_id) {
-                    active.mark_run(task_id);
-                    active.running_count += 1;
-                }
-            }
-
             // Persist updated state
             if let Some(ref store) = self.store {
-                let jobs_guard = self.jobs.read().await;
-                if let Some(active) = jobs_guard.get(&job_id) {
-                    let _ = store
-                        .update_job_state(
-                            &job_id,
-                            active.enabled,
-                            active.last_run,
-                            active.next_run,
-                            active.run_count,
-                        )
-                        .await;
-                }
-                drop(jobs_guard);
+                let _ = store
+                    .update_job_state(
+                        &job_id,
+                        job.enabled,
+                        job.last_run,
+                        job.next_run,
+                        job.run_count,
+                    )
+                    .await;
             }
 
             if let Some(agent_id) = runtime_agent {
@@ -310,7 +358,7 @@ impl Scheduler {
                 let runtime = self.runtime.clone().unwrap();
                 let task_goal = job.task_goal.clone().unwrap();
                 let max_iterations = job.max_iterations;
-                let jobs_clone = self.jobs.clone();
+                let mut guard = RunningCountGuard::new(self.jobs.clone(), job_id);
 
                 tokio::spawn(async move {
                     debug!(task_id = %task_id, "Job task starting via runtime");
@@ -329,20 +377,14 @@ impl Scheduler {
                     if let Err(error) = runtime.submit_task(&agent_id, &agent_task, None).await {
                         warn!(task_id = %task_id, "Scheduled runtime task failed: {error}");
                     }
-
-                    // Decrement running count
-                    let mut jobs_guard = jobs_clone.write().await;
-                    if let Some(active) = jobs_guard.get_mut(&job_id) {
-                        active.running_count = active.running_count.saturating_sub(1);
-                    }
-                    drop(jobs_guard);
+                    guard.release().await;
 
                     debug!(task_id = %task_id, "Job task completed (runtime)");
                 });
             } else {
                 // Closure-based execution path (original behaviour)
-                let jobs_clone = self.jobs.clone();
                 let task_fn = job.task.clone();
+                let mut guard = RunningCountGuard::new(self.jobs.clone(), job_id);
 
                 tokio::spawn(async move {
                     debug!(task_id = %task_id, "Job task started");
@@ -350,13 +392,7 @@ impl Scheduler {
                     (task_fn)().await;
                     let duration = start.elapsed();
                     debug!(task_id = %task_id, duration_ms = duration.as_millis() as u64, "Job task completed");
-
-                    // Decrement running count
-                    let mut jobs_guard = jobs_clone.write().await;
-                    if let Some(active) = jobs_guard.get_mut(&job_id) {
-                        active.running_count = active.running_count.saturating_sub(1);
-                    }
-                    drop(jobs_guard);
+                    guard.release().await;
                 });
             }
         }
@@ -451,28 +487,13 @@ impl Scheduler {
                             continue;
                         }
                     };
-                    // Read job details under read lock
-                    let (task_fn, name, task_goal, max_iterations) = {
-                        let jobs_guard = jobs.read().await;
-                        let job = match jobs_guard.get(&job_id) {
-                            Some(j) => j,
-                            None => continue,
-                        };
-                        if job.max_concurrent > 0 && job.running_count >= job.max_concurrent {
-                            trace!(
-                                job_id = %job_id,
-                                name = %job.name,
-                                "Skipping job due to concurrency limit (loop)"
-                            );
-                            continue;
-                        }
-                        (
-                            job.task.clone(),
-                            job.name.clone(),
-                            job.task_goal.clone(),
-                            job.max_iterations,
-                        )
+                    // Read a snapshot for runtime validation. Eligibility and
+                    // reservation are rechecked atomically below.
+                    let job_snapshot = match jobs.read().await.get(&job_id).cloned() {
+                        Some(job) => job,
+                        None => continue,
                     };
+                    let task_goal = job_snapshot.task_goal.clone();
 
                     let runtime_dispatch = match (runtime.as_ref(), task_goal.as_ref()) {
                         (Some(runtime), Some(goal)) => match runtime.list_agents().first() {
@@ -489,7 +510,14 @@ impl Scheduler {
                         _ => None,
                     };
 
-                    let task_id = Uuid::new_v4();
+                    let Some((job, task_id)) = reserve_due_job(&jobs, job_id, Utc::now()).await
+                    else {
+                        trace!(job_id = %job_id, "Skipping job: no longer due or at concurrency limit");
+                        continue;
+                    };
+                    let task_fn = job.task.clone();
+                    let name = job.name.clone();
+                    let max_iterations = job.max_iterations;
                     info!(
                         job_id = %job_id,
                         name = %name,
@@ -497,29 +525,17 @@ impl Scheduler {
                         "Running scheduled job (loop)"
                     );
 
-                    // Update job state in memory
-                    {
-                        let mut jobs_guard = jobs.write().await;
-                        if let Some(active) = jobs_guard.get_mut(&job_id) {
-                            active.mark_run(task_id);
-                            active.running_count += 1;
-                        }
-                    }
-
                     // Persist updated state
                     if let Some(ref store) = store {
-                        let state = jobs.read().await.get(&job_id).map(|active| {
-                            (
-                                active.enabled,
-                                active.last_run,
-                                active.next_run,
-                                active.run_count,
+                        if let Err(error) = store
+                            .update_job_state(
+                                &job_id,
+                                job.enabled,
+                                job.last_run,
+                                job.next_run,
+                                job.run_count,
                             )
-                        });
-                        if let Some((enabled, last_run, next_run, run_count)) = state
-                            && let Err(error) = store
-                                .update_job_state(&job_id, enabled, last_run, next_run, run_count)
-                                .await
+                            .await
                         {
                             warn!(job_id = %job_id, "Failed to persist scheduler state: {error}");
                         }
@@ -560,9 +576,17 @@ impl Scheduler {
 
                     let handle = if let Some((runtime, agent_id, goal)) = runtime_dispatch {
                         // Runtime-driven execution path in the loop
-                        let jobs_clone = jobs.clone();
                         let store = store.clone();
                         let audit_logger = audit_logger.clone();
+                        let completion = ExecutionCompletion {
+                            store,
+                            audit_logger,
+                            running_guard: RunningCountGuard::new(jobs.clone(), job_id),
+                            job_id,
+                            job_name: name,
+                            task_id,
+                            agent_id,
+                        };
                         tokio::spawn(async move {
                             let _permit = permit;
                             debug!(task_id = %task_id, "Job task started (loop, runtime)");
@@ -582,38 +606,26 @@ impl Scheduler {
                                 .await
                                 .map(|result| result.success)
                                 .map_err(|error| error.to_string());
-                            ExecutionCompletion {
-                                store,
-                                audit_logger,
-                                jobs: jobs_clone,
-                                job_id,
-                                job_name: name,
-                                task_id,
-                                agent_id,
-                            }
-                            .finish(outcome)
-                            .await;
+                            completion.finish(outcome).await;
                         })
                     } else {
                         // Standard closure-based execution
-                        let jobs_clone = jobs.clone();
                         let store = store.clone();
                         let audit_logger = audit_logger.clone();
+                        let completion = ExecutionCompletion {
+                            store,
+                            audit_logger,
+                            running_guard: RunningCountGuard::new(jobs.clone(), job_id),
+                            job_id,
+                            job_name: name,
+                            task_id,
+                            agent_id: Uuid::nil(),
+                        };
                         tokio::spawn(async move {
                             let _permit = permit;
                             debug!(task_id = %task_id, "Job task started (loop)");
                             (task_fn)().await;
-                            ExecutionCompletion {
-                                store,
-                                audit_logger,
-                                jobs: jobs_clone,
-                                job_id,
-                                job_name: name,
-                                task_id,
-                                agent_id: Uuid::nil(),
-                            }
-                            .finish(Ok(true))
-                            .await;
+                            completion.finish(Ok(true)).await;
                         })
                     };
 
@@ -677,7 +689,7 @@ impl Scheduler {
 struct ExecutionCompletion {
     store: Option<Arc<dyn SchedulerStore>>,
     audit_logger: Option<Arc<dyn AuditLogger>>,
-    jobs: Arc<RwLock<HashMap<JobId, Job>>>,
+    running_guard: RunningCountGuard,
     job_id: JobId,
     job_name: String,
     task_id: Uuid,
@@ -685,7 +697,7 @@ struct ExecutionCompletion {
 }
 
 impl ExecutionCompletion {
-    async fn finish(self, outcome: Result<bool, String>) {
+    async fn finish(mut self, outcome: Result<bool, String>) {
         let (status, error) = match outcome {
             Ok(true) => (JobRunStatus::Succeeded, None),
             Ok(false) => (
@@ -724,10 +736,7 @@ impl ExecutionCompletion {
                 })
                 .await;
         }
-        let mut jobs = self.jobs.write().await;
-        if let Some(active) = jobs.get_mut(&self.job_id) {
-            active.running_count = active.running_count.saturating_sub(1);
-        }
+        self.running_guard.release().await;
     }
 }
 
@@ -799,6 +808,44 @@ mod tests {
         // Give the spawned task time to run
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_pending_reserves_a_due_job_once() {
+        let sched = Arc::new(Scheduler::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let task: JobTask = {
+            let counter = counter.clone();
+            Arc::new(move || {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                })
+            })
+        };
+        let id = sched.add_job("once", "* * * * *", task).await.unwrap();
+        sched.jobs.write().await.get_mut(&id).unwrap().next_run =
+            Some(Utc::now() - chrono::TimeDelta::minutes(1));
+
+        let (first, second) = tokio::join!(sched.run_pending(), sched.run_pending());
+        assert_eq!(first.unwrap() + second.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(sched.get_job(id).await.unwrap().running_count, 0);
+    }
+
+    #[tokio::test]
+    async fn panicking_job_releases_running_count() {
+        let sched = Scheduler::default();
+        let task: JobTask = Arc::new(|| Box::pin(async { panic!("job failed") }));
+        let id = sched.add_job("panic", "* * * * *", task).await.unwrap();
+        sched.jobs.write().await.get_mut(&id).unwrap().next_run =
+            Some(Utc::now() - chrono::TimeDelta::minutes(1));
+
+        assert_eq!(sched.run_pending().await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sched.get_job(id).await.unwrap().running_count, 0);
     }
 
     #[tokio::test]
