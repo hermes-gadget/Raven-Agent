@@ -192,8 +192,9 @@ impl Default for Engine {
 impl LoopEngineTrait for Engine {
     async fn execute_task(&self, task: &AgentTask) -> OdinResult<TaskResult> {
         let start = std::time::Instant::now();
+        let max_iterations = self.max_iterations.min(task.max_iterations);
 
-        tracing::info!(task_id = %task.id, max_iterations = task.max_iterations, "Starting agent loop");
+        tracing::info!(task_id = %task.id, max_iterations, "Starting agent loop");
 
         // Initialize loop state
         let mut state = LoopState {
@@ -240,12 +241,12 @@ impl LoopEngineTrait for Engine {
 
         // Main loop
         loop {
-            state.iteration += 1;
-
-            if state.iteration > task.max_iterations {
+            if state.iteration >= max_iterations {
                 tracing::warn!("[LOOP] Max iterations reached");
                 break;
             }
+
+            state.iteration += 1;
 
             // ── PLAN ── (only on first iteration — decomposition is done once)
             if state.iteration == 1 {
@@ -887,10 +888,9 @@ mod tests {
             .with_max_iterations(3);
 
         let mut task = make_task("Long task");
-        task.max_iterations = 3;
+        task.max_iterations = 10;
         let result = engine.execute_task(&task).await.unwrap();
-        // The loop increments, checks > max, then breaks — so iterations may be max+1
-        assert!(result.iterations <= 4, "iterations={}", result.iterations);
+        assert_eq!(result.iterations, 3);
     }
 
     #[tokio::test]
