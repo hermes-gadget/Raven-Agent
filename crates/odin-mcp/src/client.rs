@@ -70,9 +70,9 @@ impl McpClient {
         self.server_version = Some(result.server_info.version);
         self.initialized = true;
 
-        // Send initialized notification (no response expected)
+        // Send initialized notification (no response expected).
         let _ = self
-            .send_request_inner("notifications/initialized", None)
+            .send_notification_inner("notifications/initialized", None)
             .await;
 
         Ok(())
@@ -166,6 +166,11 @@ impl McpClient {
 
         Ok(response)
     }
+
+    async fn send_notification_inner(&self, method: &str, params: Option<Value>) -> McpResult<()> {
+        let transport = self.transport.lock().await;
+        transport.send_notification(method, params).await
+    }
 }
 
 /// Helper to flatten MCP tool results into a single string.
@@ -186,7 +191,7 @@ pub fn flatten_result(result: &McpToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
+    use crate::transport::{MockTransport, StdioTransport};
     use crate::types::{JsonRpcError, JsonRpcResponse};
 
     fn make_response(id: u64, result: Option<Value>) -> JsonRpcResponse {
@@ -429,6 +434,46 @@ mod tests {
             _ => panic!("Expected Protocol error, got: {err}"),
         }
 
+        client.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_transport_handles_notifications_batches_and_stderr() {
+        let server = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *notifications/initialized*)
+      :
+      ;;
+    *initialize*)
+      i=0
+      while [ "$i" -lt 10000 ]; do
+        printf 'stderr-noise\n' >&2
+        i=$((i + 1))
+      done
+      printf '%s\n' '{"jsonrpc":"2.0","method":"server/notification"}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":99,"result":{"ignored":true}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"1"}}}'
+      ;;
+    *tools/list*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":98,"result":{"tools":[]}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}'
+      ;;
+  esac
+done
+"#;
+        let transport = Arc::new(Mutex::new(StdioTransport::new(
+            "sh",
+            vec!["-c".into(), server.into()],
+        )));
+        transport.lock().await.connect().await.unwrap();
+
+        let mut client = McpClient::new(transport);
+        client.connect().await.unwrap();
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools[0].name, "echo");
         client.close().await.unwrap();
     }
 }

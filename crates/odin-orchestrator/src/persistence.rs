@@ -14,7 +14,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::control::{RunControlCommand, RunControlKind, RunControlStatus};
-use crate::lifecycle::AgentLifecycle;
+use crate::lifecycle::{AgentLifecycle, AgentPhase};
 use crate::task_graph::{TaskGraph, TaskGraphStatus};
 
 /// Error type for orchestration storage operations.
@@ -43,7 +43,11 @@ pub trait OrchestrationStore: Send + Sync {
     async fn find_unfinished_graphs(&self) -> Result<Vec<TaskGraphSummary>, StoreError>;
 
     /// Save an agent lifecycle.
-    async fn save_agent_lifecycle(&self, lifecycle: &AgentLifecycle) -> Result<(), StoreError>;
+    async fn save_agent_lifecycle(
+        &self,
+        graph_root_id: &str,
+        lifecycle: &AgentLifecycle,
+    ) -> Result<(), StoreError>;
     /// Load an agent lifecycle.
     async fn load_agent_lifecycle(&self, agent_id: Uuid) -> Result<AgentLifecycle, StoreError>;
     /// List all stored lifecycles.
@@ -96,6 +100,7 @@ pub struct TaskGraphSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLifecycleSummary {
     pub agent_id: String,
+    pub graph_root_id: Option<String>,
     pub phase: String,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -163,6 +168,26 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 finished_at TEXT
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let lifecycle_columns =
+            query_as::<_, (String,)>("SELECT name FROM pragma_table_info('agent_lifecycles')")
+                .fetch_all(&self.pool)
+                .await?;
+        if !lifecycle_columns
+            .iter()
+            .any(|(name,)| name == "graph_root_id")
+        {
+            query("ALTER TABLE agent_lifecycles ADD COLUMN graph_root_id TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_lifecycles_graph_root
+             ON agent_lifecycles(graph_root_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -308,7 +333,11 @@ impl OrchestrationStore for SqliteOrchestrationStore {
             .collect())
     }
 
-    async fn save_agent_lifecycle(&self, lifecycle: &AgentLifecycle) -> Result<(), StoreError> {
+    async fn save_agent_lifecycle(
+        &self,
+        graph_root_id: &str,
+        lifecycle: &AgentLifecycle,
+    ) -> Result<(), StoreError> {
         let agent_id = lifecycle.agent_id.to_string();
         let lifecycle_json = serde_json::to_string(&lifecycle)?;
         let phase = lifecycle.phase.label().to_string();
@@ -317,15 +346,18 @@ impl OrchestrationStore for SqliteOrchestrationStore {
 
         query(
             r#"
-            INSERT INTO agent_lifecycles (agent_id, phase, lifecycle_json, created_at, finished_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO agent_lifecycles
+                (agent_id, graph_root_id, phase, lifecycle_json, created_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id) DO UPDATE SET
+                graph_root_id = excluded.graph_root_id,
                 phase = excluded.phase,
                 lifecycle_json = excluded.lifecycle_json,
                 finished_at = excluded.finished_at
             "#,
         )
         .bind(&agent_id)
+        .bind(graph_root_id)
         .bind(&phase)
         .bind(&lifecycle_json)
         .bind(&now)
@@ -350,26 +382,29 @@ impl OrchestrationStore for SqliteOrchestrationStore {
     }
 
     async fn list_agent_lifecycles(&self) -> Result<Vec<AgentLifecycleSummary>, StoreError> {
-        let rows = query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT agent_id, phase, created_at, finished_at FROM agent_lifecycles ORDER BY created_at DESC",
+        let rows = query_as::<_, (String, Option<String>, String, String, Option<String>)>(
+            "SELECT agent_id, graph_root_id, phase, created_at, finished_at FROM agent_lifecycles ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows
             .into_iter()
-            .map(|(id, phase, created, finished)| AgentLifecycleSummary {
-                agent_id: id,
-                phase,
-                created_at: DateTime::parse_from_rfc3339(&created)
-                    .unwrap_or_default()
-                    .with_timezone(&Utc),
-                finished_at: finished.map(|f| {
-                    DateTime::parse_from_rfc3339(&f)
+            .map(
+                |(id, graph_root_id, phase, created, finished)| AgentLifecycleSummary {
+                    agent_id: id,
+                    graph_root_id,
+                    phase,
+                    created_at: DateTime::parse_from_rfc3339(&created)
                         .unwrap_or_default()
-                        .with_timezone(&Utc)
-                }),
-            })
+                        .with_timezone(&Utc),
+                    finished_at: finished.map(|f| {
+                        DateTime::parse_from_rfc3339(&f)
+                            .unwrap_or_default()
+                            .with_timezone(&Utc)
+                    }),
+                },
+            )
             .collect())
     }
 
@@ -408,11 +443,31 @@ impl OrchestrationStore for SqliteOrchestrationStore {
     }
 
     async fn update_lifecycle_phase(&self, agent_id: &str, phase: &str) -> Result<(), StoreError> {
-        let rows = query("UPDATE agent_lifecycles SET phase = ? WHERE agent_id = ?")
-            .bind(phase)
-            .bind(agent_id)
-            .execute(&self.pool)
-            .await?;
+        let target = parse_agent_phase(phase)?;
+        let mut tx = self.pool.begin().await?;
+        let row = query_as::<_, (String,)>(
+            "SELECT lifecycle_json FROM agent_lifecycles WHERE agent_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("Agent lifecycle '{}' not found", agent_id)))?;
+
+        let mut lifecycle: AgentLifecycle = serde_json::from_str(&row.0)?;
+        lifecycle.transition(target, Some("Updated by persistence API".into()));
+        let lifecycle_json = serde_json::to_string(&lifecycle)?;
+        let finished = lifecycle.finished_at.map(|value| value.to_rfc3339());
+        let rows = query(
+            "UPDATE agent_lifecycles
+             SET phase = ?, lifecycle_json = ?, finished_at = ?
+             WHERE agent_id = ?",
+        )
+        .bind(target.label())
+        .bind(lifecycle_json)
+        .bind(finished)
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
 
         if rows.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!(
@@ -420,6 +475,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 agent_id
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -653,6 +709,20 @@ fn graph_status_label(status: TaskGraphStatus) -> &'static str {
     }
 }
 
+fn parse_agent_phase(phase: &str) -> Result<AgentPhase, StoreError> {
+    match phase.to_ascii_lowercase().as_str() {
+        "queued" => Ok(AgentPhase::Queued),
+        "running" => Ok(AgentPhase::Running),
+        "blocked" => Ok(AgentPhase::Blocked),
+        "waiting_for_lock" => Ok(AgentPhase::WaitingForLock),
+        "reviewing" => Ok(AgentPhase::Reviewing),
+        "done" => Ok(AgentPhase::Done),
+        "failed" => Ok(AgentPhase::Failed),
+        "cancelled" | "canceled" => Ok(AgentPhase::Cancelled),
+        _ => Err(StoreError::InvalidStatus(phase.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,12 +766,17 @@ mod tests {
     #[tokio::test]
     async fn test_save_and_load_agent_lifecycle() {
         let store = setup_store().await;
+        let graph = TaskGraph::new("lifecycle-graph");
+        store.save_task_graph(&graph).await.unwrap();
         let agent_id = Uuid::new_v4();
         let mut lifecycle = AgentLifecycle::new(agent_id);
         lifecycle.start();
         lifecycle.complete();
 
-        store.save_agent_lifecycle(&lifecycle).await.unwrap();
+        store
+            .save_agent_lifecycle(&graph.id.to_string(), &lifecycle)
+            .await
+            .unwrap();
 
         let loaded = store.load_agent_lifecycle(agent_id).await.unwrap();
         assert_eq!(loaded.phase, AgentPhase::Done);
@@ -722,11 +797,52 @@ mod tests {
     #[tokio::test]
     async fn test_list_agent_lifecycles() {
         let store = setup_store().await;
+        let graph = TaskGraph::new("lifecycle-list-graph");
+        store.save_task_graph(&graph).await.unwrap();
         let lifecycle = AgentLifecycle::new(Uuid::new_v4());
-        store.save_agent_lifecycle(&lifecycle).await.unwrap();
+        store
+            .save_agent_lifecycle(&graph.id.to_string(), &lifecycle)
+            .await
+            .unwrap();
 
         let lifecycles = store.list_agent_lifecycles().await.unwrap();
         assert!(!lifecycles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_graph_association_update_and_delete() {
+        let store = setup_store().await;
+        let graph_one = TaskGraph::new("graph-one");
+        let graph_two = TaskGraph::new("graph-two");
+        store.save_task_graph(&graph_one).await.unwrap();
+        store.save_task_graph(&graph_two).await.unwrap();
+
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        store
+            .save_agent_lifecycle(&graph_one.id.to_string(), &AgentLifecycle::new(first_id))
+            .await
+            .unwrap();
+        store
+            .save_agent_lifecycle(&graph_two.id.to_string(), &AgentLifecycle::new(second_id))
+            .await
+            .unwrap();
+
+        store
+            .update_lifecycle_phase(&first_id.to_string(), "running")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_agent_lifecycle(first_id).await.unwrap().phase,
+            AgentPhase::Running
+        );
+
+        store
+            .delete_task_graph(&graph_one.id.to_string())
+            .await
+            .unwrap();
+        assert!(store.load_agent_lifecycle(first_id).await.is_err());
+        assert!(store.load_agent_lifecycle(second_id).await.is_ok());
     }
 
     #[tokio::test]

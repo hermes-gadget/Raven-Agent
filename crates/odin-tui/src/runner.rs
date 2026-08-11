@@ -292,6 +292,7 @@ pub async fn spawn_run(db_path: PathBuf, goal: String, max_iterations: u32) -> R
     persist_agent_lifecycles(
         &store,
         &composer,
+        &goal,
         exec_agents.iter().map(|agent| agent.agent_id),
     )
     .await?;
@@ -765,6 +766,10 @@ async fn start_ready_agents(
     join_set: &mut JoinSet<AgentExecution>,
     event_tx: &mpsc::UnboundedSender<RunnerEvent>,
 ) -> Result<()> {
+    let graph_root_id = composer
+        .get_graph(goal_key)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{goal_key}' not found"))?;
     let mut ordered: Vec<_> = exec_agents
         .iter()
         .filter(|agent| !spawned.contains(&agent.agent_id))
@@ -795,7 +800,9 @@ async fn start_ready_agents(
                             event_tx.clone(),
                         );
                         if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                            store.save_agent_lifecycle(lifecycle).await?;
+                            store
+                                .save_agent_lifecycle(&graph_root_id, lifecycle)
+                                .await?;
                         }
                         persist_graph(store, composer, goal_key, Some(TaskGraphStatus::Running))
                             .await?;
@@ -818,7 +825,9 @@ async fn start_ready_agents(
                             .unwrap_or(false);
                         if phase != AgentPhase::WaitingForLock || lifecycle_changed {
                             if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                                store.save_agent_lifecycle(lifecycle).await?;
+                                store
+                                    .save_agent_lifecycle(&graph_root_id, lifecycle)
+                                    .await?;
                             }
                             persist_graph(
                                 store,
@@ -1251,6 +1260,10 @@ async fn finish_agent_execution(
     terminal: &mut HashSet<Uuid>,
     event_tx: &mpsc::UnboundedSender<RunnerEvent>,
 ) -> Result<()> {
+    let graph_root_id = composer
+        .get_graph(goal_key)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{goal_key}' not found"))?;
     match &execution.result {
         Ok(task_result) => {
             composer.complete_agent(
@@ -1286,7 +1299,9 @@ async fn finish_agent_execution(
     }
     terminal.insert(execution.agent_id);
     if let Some((_, lifecycle)) = composer.get_agent(&execution.agent_id) {
-        store.save_agent_lifecycle(lifecycle).await?;
+        store
+            .save_agent_lifecycle(&graph_root_id, lifecycle)
+            .await?;
     }
     persist_graph(store, composer, goal_key, None).await?;
     persist_locks(store, composer).await?;
@@ -1301,7 +1316,7 @@ async fn persist_all(
     agent_ids: impl Iterator<Item = Uuid>,
 ) -> Result<()> {
     persist_graph(store, composer, goal_key, status_override).await?;
-    persist_agent_lifecycles(store, composer, agent_ids).await?;
+    persist_agent_lifecycles(store, composer, goal_key, agent_ids).await?;
     persist_locks(store, composer).await?;
     Ok(())
 }
@@ -1330,11 +1345,18 @@ async fn persist_graph(
 async fn persist_agent_lifecycles(
     store: &SqliteOrchestrationStore,
     composer: &Composer,
+    goal_key: &str,
     agent_ids: impl Iterator<Item = Uuid>,
 ) -> Result<()> {
+    let graph_root_id = composer
+        .get_graph(goal_key)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{goal_key}' not found"))?;
     for agent_id in agent_ids {
         if let Some((_, lifecycle)) = composer.get_agent(&agent_id) {
-            store.save_agent_lifecycle(lifecycle).await?;
+            store
+                .save_agent_lifecycle(&graph_root_id, lifecycle)
+                .await?;
         }
     }
     Ok(())

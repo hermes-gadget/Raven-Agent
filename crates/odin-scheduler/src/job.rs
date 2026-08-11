@@ -243,8 +243,8 @@ pub enum CronField {
     List(Vec<i32>),
     /// Matches a range (`1-5`)
     Range(i32, i32),
-    /// Matches with a step (`*/5`, `1-10/2`)
-    Step(i32, i32),
+    /// Matches with a bounded step (`*/5`, `1-10/2`).
+    Step(i32, i32, i32),
 }
 
 impl CronField {
@@ -265,23 +265,35 @@ impl CronField {
                 return Err(format!("Step must be positive in field '{}'", input));
             }
             if base == "*" {
-                return Ok(CronField::Step(min, step_val));
+                return Ok(CronField::Step(min, max, step_val));
             }
             // Range with step: 1-10/2
             if let Some((start, end)) = base.split_once('-') {
                 let start_val = start
                     .parse::<i32>()
                     .map_err(|_| format!("Invalid range start '{}' in field '{}'", start, input))?;
-                let _end_val = end
+                let end_val = end
                     .parse::<i32>()
                     .map_err(|_| format!("Invalid range end '{}' in field '{}'", end, input))?;
-                return Ok(CronField::Step(start_val, step_val));
+                if start_val < min || end_val > max || start_val > end_val {
+                    return Err(format!(
+                        "Range {}-{} out of range [{}, {}] in field '{}'",
+                        start_val, end_val, min, max, input
+                    ));
+                }
+                return Ok(CronField::Step(start_val, end_val, step_val));
             }
             // Single value with step (unusual but supported)
             let val = base
                 .parse::<i32>()
                 .map_err(|_| format!("Invalid value '{}' in field '{}'", base, input))?;
-            return Ok(CronField::Step(val, step_val));
+            if val < min || val > max {
+                return Err(format!(
+                    "Value {} out of range [{}, {}] in field '{}'",
+                    val, min, max, input
+                ));
+            }
+            return Ok(CronField::Step(val, max, step_val));
         }
 
         // Check for list: 1,3,5
@@ -309,6 +321,12 @@ impl CronField {
             let end_val = end
                 .parse::<i32>()
                 .map_err(|_| format!("Invalid range end '{}' in field '{}'", end, input))?;
+            if start_val < min || end_val > max || start_val > end_val {
+                return Err(format!(
+                    "Range {}-{} out of range [{}, {}] in field '{}'",
+                    start_val, end_val, min, max, input
+                ));
+            }
             return Ok(CronField::Range(start_val, end_val));
         }
 
@@ -332,12 +350,8 @@ impl CronField {
             CronField::Value(v) => *v == value,
             CronField::List(values) => values.contains(&value),
             CronField::Range(start, end) => value >= *start && value <= *end,
-            CronField::Step(start, step) => {
-                if value >= *start {
-                    (value - start) % step == 0
-                } else {
-                    false
-                }
+            CronField::Step(start, end, step) => {
+                value >= *start && value <= *end && (value - start) % step == 0
             }
         }
     }
@@ -378,7 +392,28 @@ mod tests {
     #[test]
     fn test_parse_step() {
         let sched = Schedule::parse("*/5 * * * *").unwrap();
-        assert!(matches!(sched.minute, CronField::Step(0, 5)));
+        assert!(matches!(sched.minute, CronField::Step(0, 59, 5)));
+    }
+
+    #[test]
+    fn test_ranged_step_respects_end_boundary() {
+        let sched = Schedule::parse("1-10/2 * * * *").unwrap();
+        assert!(matches!(sched.minute, CronField::Step(1, 10, 2)));
+        assert!(
+            sched.matches(
+                &DateTime::parse_from_rfc3339("2025-01-01T00:09:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(
+            !sched.matches(
+                &DateTime::parse_from_rfc3339("2025-01-01T00:11:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(Schedule::parse("1-60/2 * * * *").is_err());
     }
 
     #[test]

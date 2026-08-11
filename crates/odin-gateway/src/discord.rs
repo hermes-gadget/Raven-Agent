@@ -434,7 +434,7 @@ impl DiscordEventHandler {
         };
         let task_id = task.id;
         let task_goal_display = if task_goal.len() > 80 {
-            format!("{}...", &task_goal[..80])
+            format!("{}...", task_goal.chars().take(80).collect::<String>())
         } else {
             task_goal.clone()
         };
@@ -832,8 +832,13 @@ impl DiscordEventHandler {
         }
 
         if response.len() > 1900 {
-            response.truncate(1900);
-            response.push_str("\n... *(truncated)*");
+            let suffix = "\n... *(truncated)*";
+            let keep = 1900usize.saturating_sub(suffix.len());
+            response = format!(
+                "{}{}",
+                response.chars().take(keep).collect::<String>(),
+                suffix
+            );
         }
 
         let _ = ctx

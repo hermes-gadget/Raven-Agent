@@ -15,6 +15,7 @@ use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
 use crate::Sandbox;
+use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Deserialize)]
@@ -27,7 +28,7 @@ struct ShellArgs {
     /// If true, validate the command without executing it.
     #[serde(default)]
     dry_run: bool,
-    /// Maximum output bytes before truncation (default: 1MB). Set to 0 to disable.
+    /// Maximum output bytes retained per stream (default: 1MB). Zero uses the default.
     #[serde(default = "default_max_output_bytes")]
     max_output_bytes: usize,
 }
@@ -37,7 +38,7 @@ fn default_timeout() -> u64 {
 }
 
 fn default_max_output_bytes() -> usize {
-    1024 * 1024 // 1MB
+    DEFAULT_MAX_OUTPUT_BYTES
 }
 
 /// Tool that executes shell commands.
@@ -249,21 +250,24 @@ impl Tool for Shell {
         // Set timeout
         let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
 
-        // Spawn and wait with timeout
-        let output = tokio::time::timeout(timeout, cmd.output())
+        let max_bytes = if parsed.max_output_bytes == 0 {
+            DEFAULT_MAX_OUTPUT_BYTES
+        } else {
+            parsed.max_output_bytes
+        };
+        let output = process::run_command(cmd, timeout, max_bytes)
             .await
-            .map_err(|_| {
-                OdinError::Timeout(format!(
+            .map_err(|error| match error {
+                ProcessError::Timeout => OdinError::Timeout(format!(
                     "Shell command timed out after {}s: {command_str}",
                     parsed.timeout_secs
-                ))
+                )),
+                ProcessError::Io(error) => OdinError::Tool {
+                    tool: self.name.clone(),
+                    message: format!("Failed to execute command: {error}"),
+                    source: Some(Box::new(error)),
+                },
             })?;
-
-        let output = output.map_err(|e| OdinError::Tool {
-            tool: self.name.clone(),
-            message: format!("Failed to execute command: {e}"),
-            source: Some(Box::new(e)),
-        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -280,12 +284,9 @@ impl Tool for Shell {
             result_output.push_str(&String::from_utf8_lossy(&output.stderr));
         }
 
-        // Apply output size cap if configured
-        let max_bytes = parsed.max_output_bytes;
-        if max_bytes > 0 && result_output.len() > max_bytes {
-            result_output.truncate(max_bytes);
+        if output.stdout_truncated || output.stderr_truncated {
             result_output.push_str(&format!(
-                "\n\n[TRUNCATED: output exceeded {max_bytes} bytes]"
+                "\n\n[TRUNCATED: output exceeded {max_bytes} bytes per stream]"
             ));
         }
 
@@ -407,6 +408,23 @@ mod tests {
         });
         let result = shell.execute(args, &test_context()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_timeout_kills_delayed_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("should-not-exist");
+        let command = format!("sleep 3; touch '{}'", marker.display());
+        let shell = Shell::new();
+        let args = serde_json::json!({
+            "command": command,
+            "timeout_secs": 1
+        });
+
+        assert!(shell.execute(args, &test_context()).await.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!marker.exists());
     }
 
     #[tokio::test]

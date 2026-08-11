@@ -417,16 +417,14 @@ impl FallbackProvider {
     }
 
     /// Get information about all providers in the chain.
-    pub fn provider_info(&self) -> Vec<ProviderInfo> {
+    pub async fn provider_info(&self) -> Vec<ProviderInfo> {
         let mut info = Vec::new();
 
         // Primary
-        let health = self
-            .inner
-            .health_status
-            .get(&self.inner.primary.0)
-            .map(|s| futures::executor::block_on(s.lock()).clone())
-            .unwrap_or(HealthStatus::Unknown);
+        let health = match self.inner.health_status.get(&self.inner.primary.0) {
+            Some(status) => status.lock().await.clone(),
+            None => HealthStatus::Unknown,
+        };
         info.push(ProviderInfo {
             name: self.inner.primary.0.clone(),
             provider_type: "primary".into(),
@@ -436,12 +434,10 @@ impl FallbackProvider {
 
         // Fallbacks
         for (f_name, _) in &self.inner.fallbacks {
-            let health = self
-                .inner
-                .health_status
-                .get(f_name)
-                .map(|s| futures::executor::block_on(s.lock()).clone())
-                .unwrap_or(HealthStatus::Unknown);
+            let health = match self.inner.health_status.get(f_name) {
+                Some(status) => status.lock().await.clone(),
+                None => HealthStatus::Unknown,
+            };
             info.push(ProviderInfo {
                 name: f_name.clone(),
                 provider_type: "fallback".into(),
@@ -454,10 +450,10 @@ impl FallbackProvider {
     }
 
     /// Get all circuit breaker states for diagnostics.
-    pub fn circuit_breaker_states(&self) -> HashMap<String, (u32, bool)> {
+    pub async fn circuit_breaker_states(&self) -> HashMap<String, (u32, bool)> {
         let mut result = HashMap::new();
         for (name, cb) in &self.inner.circuit_breakers {
-            let state = futures::executor::block_on(cb.lock());
+            let state = cb.lock().await;
             result.insert(name.clone(), (state.failure_count, state.circuit_open));
         }
         result
@@ -869,7 +865,7 @@ mod tests {
             0,
         );
 
-        let info = fp.provider_info();
+        let info = fp.provider_info().await;
         assert_eq!(info.len(), 2);
         assert_eq!(info[0].name, "primary");
         assert!(matches!(info[0].health, HealthStatus::Unknown));

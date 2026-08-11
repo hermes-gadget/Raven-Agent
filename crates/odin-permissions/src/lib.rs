@@ -14,4 +14,4 @@ pub mod secrets;
 pub use approval::{ApprovalGate, ApprovalRequest, ApprovalStatus};
 pub use policy::PolicyEngine;
 pub use redact::SecretRedactor;
-pub use secrets::{Secret, SecretManager};
+pub use secrets::{Secret, SecretManager, SecretMetadata};

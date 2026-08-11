@@ -8,6 +8,7 @@
 pub mod builtins;
 pub mod catalog;
 pub mod dry_run;
+pub(crate) mod process;
 pub mod reliability;
 pub mod sandbox;
 pub mod tool;

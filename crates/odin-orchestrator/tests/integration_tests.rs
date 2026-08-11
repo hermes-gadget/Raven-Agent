@@ -529,7 +529,11 @@ async fn test_persist_agent_lifecycle_survives_restart() {
     lifecycle.complete();
 
     // Save
-    store.save_agent_lifecycle(&lifecycle).await.unwrap();
+    let graph_root_id = Uuid::new_v4().to_string();
+    store
+        .save_agent_lifecycle(&graph_root_id, &lifecycle)
+        .await
+        .unwrap();
 
     // Simulate restart
     let loaded = store.load_agent_lifecycle(agent_id).await.unwrap();

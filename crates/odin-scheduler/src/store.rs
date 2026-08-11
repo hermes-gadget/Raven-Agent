@@ -144,16 +144,30 @@ impl PersistedJob {
     /// Runtime-backed jobs are dispatched from `task_goal`; the inert closure
     /// is never executed for those jobs.
     pub fn into_job(self) -> Job {
-        let schedule = Schedule::parse(&self.cron_expr)
-            .unwrap_or_else(|_| Schedule::parse("* * * * *").unwrap());
+        let (schedule, schedule_valid) = match Schedule::parse(&self.cron_expr) {
+            Ok(schedule) => (schedule, true),
+            Err(error) => {
+                tracing::error!(
+                    job_id = %self.id,
+                    cron = %self.cron_expr,
+                    %error,
+                    "Disabling persisted job with invalid cron expression"
+                );
+                (
+                    Schedule::parse("* * * * *")
+                        .expect("the scheduler wildcard expression is valid"),
+                    false,
+                )
+            }
+        };
         let mut job = Job {
             id: self.id,
             name: self.name,
             schedule,
             task: crate::job::noop_task(),
-            enabled: self.enabled,
+            enabled: self.enabled && schedule_valid,
             last_run: self.last_run,
-            next_run: self.next_run,
+            next_run: schedule_valid.then_some(self.next_run).flatten(),
             last_task_id: None,
             run_count: self.run_count,
             max_concurrent: 1,
@@ -163,7 +177,7 @@ impl PersistedJob {
             created_at: self.created_at,
         };
         // Ensure next_run is recalculated if missing
-        if job.next_run.is_none() {
+        if schedule_valid && job.next_run.is_none() {
             job.calculate_next_run();
         }
         job
@@ -674,6 +688,16 @@ mod tests {
         assert_eq!(restored.max_iterations, original.max_iterations);
         assert_eq!(restored.enabled, original.enabled);
         assert_eq!(restored.run_count, original.run_count);
+    }
+
+    #[test]
+    fn invalid_persisted_cron_is_disabled() {
+        let mut persisted = make_persisted_job("corrupt", "not-a-cron");
+        persisted.next_run = Some(Utc::now());
+
+        let restored = persisted.into_job();
+        assert!(!restored.enabled);
+        assert!(restored.next_run.is_none());
     }
 
     #[tokio::test]

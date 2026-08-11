@@ -6,6 +6,7 @@ use odin_core::traits::{ChatStream, Provider};
 use odin_core::types::*;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
 
 pub struct AnthropicProvider {
     client: Client,
@@ -16,7 +17,10 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("Anthropic HTTP client configuration is valid"),
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".into(),
         }
@@ -140,29 +144,57 @@ impl AnthropicProvider {
         Ok(body)
     }
 
-    fn parse_response(json: &Value, requested_model: &str) -> ChatResponse {
+    fn parse_response(json: &Value, requested_model: &str) -> OdinResult<ChatResponse> {
+        let blocks = json
+            .get("content")
+            .and_then(Value::as_array)
+            .filter(|blocks| !blocks.is_empty())
+            .ok_or_else(|| {
+                OdinError::provider("anthropic", "Response is missing a non-empty content array")
+            })?;
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
-        if let Some(blocks) = json["content"].as_array() {
-            for block in blocks {
-                match block["type"].as_str() {
-                    Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            text_parts.push(text.to_string());
-                        }
-                    }
-                    Some("tool_use") => tool_calls.push(ToolCall {
-                        id: block["id"].as_str().unwrap_or_default().to_string(),
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => {
+                    let text = block["text"].as_str().ok_or_else(|| {
+                        OdinError::provider("anthropic", "Text content block is malformed")
+                    })?;
+                    text_parts.push(text.to_string());
+                }
+                Some("tool_use") => {
+                    let id = block["id"].as_str().ok_or_else(|| {
+                        OdinError::provider("anthropic", "Tool-use block is missing its id")
+                    })?;
+                    let name = block["name"].as_str().ok_or_else(|| {
+                        OdinError::provider("anthropic", "Tool-use block is missing its name")
+                    })?;
+                    let input = block.get("input").ok_or_else(|| {
+                        OdinError::provider("anthropic", "Tool-use block is missing its input")
+                    })?;
+                    tool_calls.push(ToolCall {
+                        id: id.to_string(),
                         call_type: "function".into(),
                         function: FunctionCall {
-                            name: block["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: serde_json::to_string(&block["input"])
-                                .unwrap_or_else(|_| "{}".into()),
+                            name: name.to_string(),
+                            arguments: serde_json::to_string(input).map_err(|error| {
+                                OdinError::provider(
+                                    "anthropic",
+                                    format!("Tool-use input could not be serialized: {error}"),
+                                )
+                            })?,
                         },
-                    }),
-                    _ => {}
+                    });
                 }
+                _ => {}
             }
+        }
+
+        if text_parts.is_empty() && tool_calls.is_empty() {
+            return Err(OdinError::provider(
+                "anthropic",
+                "Response content contains no usable text or tool-use blocks",
+            ));
         }
 
         let text = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
@@ -182,7 +214,7 @@ impl AnthropicProvider {
         let prompt_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
         let completion_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
 
-        ChatResponse {
+        Ok(ChatResponse {
             message,
             usage: TokenUsage {
                 prompt_tokens,
@@ -194,7 +226,7 @@ impl AnthropicProvider {
                 .as_str()
                 .unwrap_or(requested_model)
                 .to_string(),
-        }
+        })
     }
 }
 
@@ -256,7 +288,7 @@ impl Provider for AnthropicProvider {
             .await
             .map_err(|e| OdinError::provider("anthropic", format!("Invalid response: {}", e)))?;
 
-        Ok(Self::parse_response(&json, model))
+        Self::parse_response(&json, model)
     }
 
     async fn chat_stream(
@@ -273,13 +305,26 @@ impl Provider for AnthropicProvider {
     }
 
     async fn health_check(&self) -> OdinResult<bool> {
-        Ok(true)
+        let response = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|error| {
+                OdinError::provider("anthropic", format!("Health check failed: {error}"))
+            })?;
+
+        Ok(response.status().is_success())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn weather_tool() -> ToolSchema {
         ToolSchema {
@@ -364,7 +409,7 @@ mod tests {
             ]
         });
 
-        let parsed = AnthropicProvider::parse_response(&response, "fallback");
+        let parsed = AnthropicProvider::parse_response(&response, "fallback").unwrap();
         assert_eq!(parsed.model, "claude-test");
         assert_eq!(parsed.usage.prompt_tokens, 12);
         assert_eq!(parsed.usage.completion_tokens, 7);
@@ -377,5 +422,46 @@ mod tests {
             parsed.message.tool_calls()[0].function.arguments,
             r#"{"city":"London"}"#
         );
+    }
+
+    #[test]
+    fn response_without_content_is_rejected() {
+        let error = AnthropicProvider::parse_response(
+            &serde_json::json!({"error": {"type": "authentication_error"}}),
+            "fallback",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content"));
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_http_errors_and_health_checks_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {"type": "rate_limit_error", "message": "slow down"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let mut provider = AnthropicProvider::new("test-key");
+        provider.base_url = server.uri();
+        let error = provider
+            .chat(
+                "claude-test",
+                &[Message::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("429"));
+        assert!(!provider.health_check().await.unwrap());
     }
 }
