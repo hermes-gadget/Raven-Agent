@@ -1798,6 +1798,7 @@ dependencies = [
  "serde_json",
  "serenity",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "uuid",
