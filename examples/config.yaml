@@ -124,6 +124,11 @@ gateway:
   discord_enabled: false
   # discord_token: direct-value-is-discouraged
   discord_token_env: DISCORD_BOT_TOKEN
+  # Enabling Discord requires a role and/or explicit user allowlist.
+  # discord_admin_role: Raven Admin
+  discord_admin_user_ids: []
+  # discord_guild_id: 123456789012345678
+  discord_allow_dms: false
 
 # `raven schedule host` runs continuously only when enabled.
 scheduler:

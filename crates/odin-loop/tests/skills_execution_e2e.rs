@@ -67,6 +67,7 @@ async fn test_skills_injected_via_loop_engine() {
     };
 
     let context = PhaseContext {
+        principal_id: uuid::Uuid::new_v4(),
         confidence_scorer: ConfidenceScorer::default(),
         decomposer: GoalDecomposer::default(),
         summarizer: StateSummarizer::default(),

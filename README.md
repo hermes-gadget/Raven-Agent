@@ -211,7 +211,7 @@ More detail: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Live run owners poll durable controls, allowing a second CLI process, HTTP client, or authorized WebSocket client to pause, resume, or cancel by graph UUID.
 - The HTTP and Discord orchestration submission endpoints create persisted plans. Task execution is available through **raven run**, HTTP **/chat**, and Discord **/raven run**.
-- **raven serve** also starts Discord when **gateway.discord_enabled** is true and a token is available from the configured value or environment variable.
+- **raven serve** also starts Discord when **gateway.discord_enabled** is true, a token is available from the configured value or environment variable, and at least one of **gateway.discord_admin_role** or **gateway.discord_admin_user_ids** is configured. Direct messages are disabled unless **gateway.discord_allow_dms** is enabled and the sender is explicitly allowlisted.
 - The TUI currently approval-gates dangerous TUI actions such as cancellation,
   but model-driven tool-call approval is connected only for **raven run** and
   **raven serve**.

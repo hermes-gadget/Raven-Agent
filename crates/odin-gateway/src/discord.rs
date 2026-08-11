@@ -27,8 +27,14 @@ pub struct DiscordConfig {
     /// Discord bot token.
     pub token: Option<String>,
     /// Role name required for privileged commands (e.g., "Raven Admin").
-    /// If `None`, all users can use all commands.
+    /// At least this role or an explicit admin user ID must be configured.
     pub admin_role: Option<String>,
+    /// User IDs explicitly allowed to invoke commands.
+    pub admin_user_ids: Vec<u64>,
+    /// Restrict commands to one Discord guild when set.
+    pub guild_id: Option<u64>,
+    /// Permit DMs from explicitly allowlisted user IDs. Disabled by default.
+    pub allow_dms: bool,
     /// Command prefix for slash commands (default: "raven").
     /// Existing configurations can keep `odin` as a compatibility prefix.
     pub command_prefix: Option<String>,
@@ -41,6 +47,52 @@ impl DiscordConfig {
     /// The effective command prefix, falling back to "raven".
     pub fn prefix(&self) -> &str {
         self.command_prefix.as_deref().unwrap_or("raven")
+    }
+
+    fn validate_authorization(&self) -> OdinResult<()> {
+        let has_admin_role = self
+            .admin_role
+            .as_deref()
+            .is_some_and(|role| !role.trim().is_empty());
+        if !has_admin_role && self.admin_user_ids.is_empty() {
+            return Err(OdinError::Config(
+                "Discord requires gateway.discord_admin_role or at least one gateway.discord_admin_user_ids entry"
+                    .into(),
+            ));
+        }
+        if self.allow_dms && self.admin_user_ids.is_empty() {
+            return Err(OdinError::Config(
+                "Discord DMs require at least one explicit gateway.discord_admin_user_ids entry"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn principal_is_authorized(
+        &self,
+        user_id: u64,
+        guild_id: Option<u64>,
+        has_admin_role: bool,
+    ) -> bool {
+        match guild_id {
+            None => self.allow_dms && self.admin_user_ids.contains(&user_id),
+            Some(actual_guild)
+                if self
+                    .guild_id
+                    .is_some_and(|expected| expected != actual_guild) =>
+            {
+                false
+            }
+            Some(_) => {
+                self.admin_user_ids.contains(&user_id)
+                    || (self
+                        .admin_role
+                        .as_deref()
+                        .is_some_and(|role| !role.trim().is_empty())
+                        && has_admin_role)
+            }
+        }
     }
 }
 
@@ -200,6 +252,22 @@ impl EventHandler for DiscordEventHandler {
             return;
         }
 
+        // Every Raven command exposes runtime state or can mutate it. Enforce
+        // authorization before dispatching any subcommand or group.
+        if let Err(msg) = self.check_admin_permission(&ctx, &command).await {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(msg)
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
         // Extract the subcommand (or subcommand group) from options
         let first_opt = command.data.options.first();
 
@@ -239,21 +307,6 @@ impl EventHandler for DiscordEventHandler {
 
         match subcommand.as_str() {
             "run" => {
-                // Permission check: only users with the configured admin role can run tasks
-                if let Err(msg) = self.check_admin_permission(&ctx, &command).await {
-                    let _ = command
-                        .create_response(
-                            &ctx.http,
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(msg)
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await;
-                    return;
-                }
-
                 // Extract the "task" argument from subcommand options
                 let task_goal = extract_subcommand_string(&command.data.options, "task")
                     .unwrap_or_else(|| "No task provided".to_string());
@@ -282,22 +335,45 @@ impl EventHandler for DiscordEventHandler {
 // ── Command Handlers ─────────────────────────────────────────────────
 
 impl DiscordEventHandler {
-    /// Check whether the invoking user has the configured admin role (if any).
+    /// Check whether the invoking user has an explicitly configured identity or role.
     /// Returns `Ok(())` if allowed, or `Err(message)` if denied.
     async fn check_admin_permission(
         &self,
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<(), String> {
-        // If no admin role is configured, everyone can use commands.
-        let Some(ref admin_role_name) = self.config.admin_role else {
-            return Ok(());
-        };
+        let user_id = command.user.id.get();
 
-        // Need a guild context for role checks
+        // DMs never have roles, so they require both the explicit DM opt-in and
+        // a concrete user-ID allowlist match.
         let guild_id = match command.guild_id {
             Some(gid) => gid,
-            None => return Err("This command can only be used in a server (guild).".into()),
+            None => {
+                return if self.config.principal_is_authorized(user_id, None, false) {
+                    Ok(())
+                } else {
+                    Err("Discord direct-message commands are not authorized.".into())
+                };
+            }
+        };
+
+        if let Some(expected_guild) = self.config.guild_id
+            && guild_id.get() != expected_guild
+        {
+            return Err("This Raven bot is not authorized for this server.".into());
+        }
+
+        if self.config.admin_user_ids.contains(&user_id) {
+            return Ok(());
+        }
+
+        let Some(admin_role_name) = self
+            .config
+            .admin_role
+            .as_deref()
+            .filter(|role| !role.trim().is_empty())
+        else {
+            return Err("You are not authorized to use Raven commands.".into());
         };
 
         let member = match command.member.as_ref() {
@@ -321,7 +397,11 @@ impl DiscordEventHandler {
             .map(|role| role.name.as_str())
             .collect();
 
-        if member_role_names.contains(admin_role_name.as_str()) {
+        if self.config.principal_is_authorized(
+            user_id,
+            Some(guild_id.get()),
+            member_role_names.contains(admin_role_name),
+        ) {
             Ok(())
         } else {
             Err(format!(
@@ -607,21 +687,6 @@ impl DiscordEventHandler {
                 return;
             }
         };
-
-        // Require admin for all orchestration commands
-        if let Err(msg) = self.check_admin_permission(&ctx, command).await {
-            let _ = command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(msg)
-                            .ephemeral(true),
-                    ),
-                )
-                .await;
-            return;
-        }
 
         match sub_opt.name.as_str() {
             "submit" => {
@@ -1075,6 +1140,7 @@ impl DiscordGateway {
             .token
             .clone()
             .ok_or_else(|| OdinError::Config("Discord token is required but not set".into()))?;
+        self.config.validate_authorization()?;
 
         tracing::info!("[DISCORD] Starting Discord gateway...");
 
@@ -1233,7 +1299,53 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.token.is_none());
         assert!(config.admin_role.is_none());
+        assert!(config.admin_user_ids.is_empty());
+        assert!(!config.allow_dms);
         assert!(config.command_prefix.is_none());
+    }
+
+    #[test]
+    fn discord_authorization_fails_closed_without_an_allowlist() {
+        let config = DiscordConfig::default();
+        assert!(config.validate_authorization().is_err());
+
+        let role_config = DiscordConfig {
+            admin_role: Some("Raven Admin".into()),
+            ..Default::default()
+        };
+        assert!(role_config.validate_authorization().is_ok());
+
+        let user_config = DiscordConfig {
+            admin_user_ids: vec![42],
+            allow_dms: true,
+            ..Default::default()
+        };
+        assert!(user_config.validate_authorization().is_ok());
+    }
+
+    #[test]
+    fn ordinary_discord_principals_are_denied_by_default() {
+        let default = DiscordConfig::default();
+        assert!(!default.principal_is_authorized(7, Some(100), false));
+        assert!(!default.principal_is_authorized(7, None, false));
+
+        let role_config = DiscordConfig {
+            admin_role: Some("Raven Admin".into()),
+            guild_id: Some(100),
+            ..Default::default()
+        };
+        assert!(!role_config.principal_is_authorized(7, Some(100), false));
+        assert!(role_config.principal_is_authorized(7, Some(100), true));
+        assert!(!role_config.principal_is_authorized(7, Some(101), true));
+
+        let user_config = DiscordConfig {
+            admin_user_ids: vec![7],
+            allow_dms: true,
+            ..Default::default()
+        };
+        assert!(user_config.principal_is_authorized(7, Some(100), false));
+        assert!(user_config.principal_is_authorized(7, None, false));
+        assert!(!user_config.principal_is_authorized(8, Some(100), false));
     }
 
     #[test]
@@ -1279,6 +1391,9 @@ mod tests {
             enabled: true,
             token: None,
             admin_role: None,
+            admin_user_ids: Vec::new(),
+            guild_id: None,
+            allow_dms: false,
             command_prefix: None,
             orchestration_db_path: None,
         };
@@ -1296,7 +1411,10 @@ mod tests {
         let config = DiscordConfig {
             enabled: true,
             token: Some("fake.token.here".into()),
-            admin_role: None,
+            admin_role: Some("Raven Admin".into()),
+            admin_user_ids: Vec::new(),
+            guild_id: None,
+            allow_dms: false,
             command_prefix: None,
             orchestration_db_path: None,
         };

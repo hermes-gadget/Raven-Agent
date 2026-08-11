@@ -1,8 +1,4 @@
-//! Utility built-in tools — safe, self-contained operations.
-//!
-//! These tools require no sandbox, no network (except ping), and no mutable
-//! side effects beyond reading system state. They are ideal for agent workflows
-//! that need quick access to file listings, env vars, timestamps, etc.
+//! Utility built-in tools.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -11,12 +7,24 @@ use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::ToolResult;
 use rand::Rng;
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
+
+use crate::Sandbox;
 
 // ── file_list ─────────────────────────────────────────────────────────
 
-pub struct FileList;
+pub struct FileList {
+    sandbox: Arc<Sandbox>,
+}
+
+impl FileList {
+    pub fn new(sandbox: Arc<Sandbox>) -> Self {
+        Self { sandbox }
+    }
+}
 
 #[derive(Deserialize)]
 struct FileListArgs {
@@ -61,19 +69,31 @@ impl Tool for FileList {
         &["filesystem", "read", "safe"]
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
         let args: FileListArgs = serde_json::from_value(args)
             .map_err(|e| OdinError::tool("file_list", format!("args: {e}")))?;
 
-        let dir = args.path.as_deref().unwrap_or(".");
+        let requested = args
+            .path
+            .as_deref()
+            .map(Path::new)
+            .map(|path| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    ctx.working_dir.join(path)
+                }
+            })
+            .unwrap_or_else(|| ctx.working_dir.clone());
+        let dir = self.sandbox.check_read(&requested)?;
         let mut cmd = Command::new("ls");
         cmd.arg("-1A"); // one per line, include dotfiles
         if let Some(ref pat) = args.pattern {
             // Filter by pattern — ls doesn't do globs natively, so we fall back
             // to using the pattern as a shell glob via find
             let mut find = Command::new("find");
-            find.arg(dir)
+            find.arg(&dir)
                 .arg("-maxdepth")
                 .arg("1")
                 .arg("-name")
@@ -94,7 +114,7 @@ impl Tool for FileList {
                 timestamp: Utc::now(),
             });
         } else {
-            cmd.current_dir(dir);
+            cmd.current_dir(&dir);
         }
 
         let output = cmd.output().map_err(OdinError::Io)?;
@@ -116,7 +136,15 @@ impl Tool for FileList {
 
 // ── file_delete ────────────────────────────────────────────────────────
 
-pub struct FileDelete;
+pub struct FileDelete {
+    sandbox: Arc<Sandbox>,
+}
+
+impl FileDelete {
+    pub fn new(sandbox: Arc<Sandbox>) -> Self {
+        Self { sandbox }
+    }
+}
 
 #[derive(Deserialize)]
 struct FileDeleteArgs {
@@ -160,12 +188,18 @@ impl Tool for FileDelete {
         &["filesystem", "write", "dangerous"]
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
         let args: FileDeleteArgs = serde_json::from_value(args)
             .map_err(|e| OdinError::tool("file_delete", format!("args: {e}")))?;
 
-        let path = std::path::Path::new(&args.path);
+        let requested = PathBuf::from(&args.path);
+        let requested = if requested.is_absolute() {
+            requested
+        } else {
+            ctx.working_dir.join(requested)
+        };
+        let path = self.sandbox.check_write(&requested)?;
         if !path.exists() {
             return Ok(ToolResult {
                 call_id: String::new(),
@@ -179,9 +213,9 @@ impl Tool for FileDelete {
         }
 
         let result = if path.is_dir() {
-            std::fs::remove_dir(&args.path)
+            std::fs::remove_dir(&path)
         } else {
-            std::fs::remove_file(&args.path)
+            std::fs::remove_file(&path)
         };
 
         match result {
@@ -209,7 +243,15 @@ impl Tool for FileDelete {
 
 // ── file_exists ────────────────────────────────────────────────────────
 
-pub struct FileExists;
+pub struct FileExists {
+    sandbox: Arc<Sandbox>,
+}
+
+impl FileExists {
+    pub fn new(sandbox: Arc<Sandbox>) -> Self {
+        Self { sandbox }
+    }
+}
 
 #[derive(Deserialize)]
 struct FileExistsArgs {
@@ -253,12 +295,18 @@ impl Tool for FileExists {
         &["filesystem", "read", "safe"]
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
         let args: FileExistsArgs = serde_json::from_value(args)
             .map_err(|e| OdinError::tool("file_exists", format!("args: {e}")))?;
 
-        let path = std::path::Path::new(&args.path);
+        let requested = PathBuf::from(&args.path);
+        let requested = if requested.is_absolute() {
+            requested
+        } else {
+            ctx.working_dir.join(requested)
+        };
+        let path = self.sandbox.check_read(&requested)?;
         let exists = path.exists();
         let kind = if exists {
             if path.is_dir() { "directory" } else { "file" }
@@ -317,39 +365,39 @@ impl Tool for EnvVar {
         }
     }
     fn is_dangerous(&self) -> bool {
-        false
-    }
-    fn is_safe(&self) -> bool {
         true
     }
-    fn requires_approval(&self) -> bool {
+    fn is_safe(&self) -> bool {
         false
     }
+    fn requires_approval(&self) -> bool {
+        true
+    }
     fn capability_tags(&self) -> &[&str] {
-        &["system", "read", "safe"]
+        &["system", "environment", "sensitive", "dangerous"]
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
         let args: EnvVarArgs = serde_json::from_value(args)
             .map_err(|e| OdinError::tool("env_var", format!("args: {e}")))?;
 
-        match std::env::var(&args.name) {
-            Ok(val) => Ok(ToolResult {
+        match ctx.env.get(&args.name) {
+            Some(val) => Ok(ToolResult {
                 call_id: String::new(),
                 tool_name: self.name().to_string(),
                 success: true,
-                output: val,
+                output: val.clone(),
                 error: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 timestamp: Utc::now(),
             }),
-            Err(_) => Ok(ToolResult {
+            None => Ok(ToolResult {
                 call_id: String::new(),
                 tool_name: self.name().to_string(),
                 success: true,
                 output: String::new(),
-                error: Some(format!("ENV_NOT_SET: {}", args.name)),
+                error: Some(format!("ENV_NOT_ALLOWED: {}", args.name)),
                 duration_ms: start.elapsed().as_millis() as u64,
                 timestamp: Utc::now(),
             }),
@@ -872,13 +920,20 @@ mod tests {
             agent_id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::env::current_dir().unwrap_or_default(),
-            env: std::env::vars().collect(),
+            env: std::collections::HashMap::from([(
+                "RAVEN_SAFE_TEST_VALUE".to_string(),
+                "allowlisted-value".to_string(),
+            )]),
         }
+    }
+
+    fn test_sandbox() -> Arc<Sandbox> {
+        Arc::new(Sandbox::default())
     }
 
     #[tokio::test]
     async fn test_file_list_current_dir() {
-        let tool = FileList;
+        let tool = FileList::new(test_sandbox());
         let result = tool
             .execute(serde_json::json!({}), &test_ctx())
             .await
@@ -889,7 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_exists_true() {
-        let tool = FileExists;
+        let tool = FileExists::new(test_sandbox());
         let result = tool
             .execute(serde_json::json!({"path": "Cargo.toml"}), &test_ctx())
             .await
@@ -900,12 +955,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_exists_false() {
-        let tool = FileExists;
+        let tool = FileExists::new(test_sandbox());
+        let missing = std::env::current_dir()
+            .unwrap()
+            .join("nonexistent-path-xyzzy");
         let result = tool
-            .execute(
-                serde_json::json!({"path": "/nonexistent/path/xyzzy"}),
-                &test_ctx(),
-            )
+            .execute(serde_json::json!({"path": missing}), &test_ctx())
             .await
             .unwrap();
         assert!(result.success);
@@ -913,14 +968,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_env_var_home() {
+    async fn test_env_var_allowlisted_value() {
         let tool = EnvVar;
         let result = tool
-            .execute(serde_json::json!({"name": "HOME"}), &test_ctx())
+            .execute(
+                serde_json::json!({"name": "RAVEN_SAFE_TEST_VALUE"}),
+                &test_ctx(),
+            )
             .await
             .unwrap();
         assert!(result.success);
-        assert!(!result.output.is_empty());
+        assert_eq!(result.output, "allowlisted-value");
     }
 
     #[tokio::test]
@@ -934,7 +992,56 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.error.unwrap().contains("ENV_NOT_SET"));
+        assert!(result.error.unwrap().contains("ENV_NOT_ALLOWED"));
+    }
+
+    #[tokio::test]
+    async fn test_env_var_does_not_fall_back_to_process_environment() {
+        let tool = EnvVar;
+        let mut context = test_ctx();
+        context.env.clear();
+        let result = tool
+            .execute(serde_json::json!({"name": "HOME"}), &context)
+            .await
+            .unwrap();
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("ENV_NOT_ALLOWED"));
+        assert!(tool.requires_approval());
+        assert!(!tool.is_safe());
+    }
+
+    #[tokio::test]
+    async fn filesystem_utilities_reject_paths_outside_the_shared_sandbox() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "synthetic secret").unwrap();
+        let sandbox = Arc::new(Sandbox::new(odin_core::types::PathBoundary {
+            allowed_read: vec![allowed.path().display().to_string()],
+            allowed_write: vec![allowed.path().display().to_string()],
+            denied: vec![],
+        }));
+        let context = test_ctx();
+
+        assert!(
+            FileList::new(sandbox.clone())
+                .execute(serde_json::json!({"path": outside.path()}), &context)
+                .await
+                .is_err()
+        );
+        assert!(
+            FileExists::new(sandbox.clone())
+                .execute(serde_json::json!({"path": outside_file}), &context)
+                .await
+                .is_err()
+        );
+        assert!(
+            FileDelete::new(sandbox)
+                .execute(serde_json::json!({"path": outside_file}), &context)
+                .await
+                .is_err()
+        );
+        assert!(outside_file.exists());
     }
 
     #[tokio::test]

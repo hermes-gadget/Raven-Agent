@@ -35,6 +35,8 @@ pub trait Phase: Send + Sync {
 
 /// Shared context passed to all phases.
 pub struct PhaseContext {
+    /// Stable principal for authorization, approvals, auditing, and rate limits.
+    pub principal_id: AgentId,
     pub confidence_scorer: ConfidenceScorer,
     pub decomposer: GoalDecomposer,
     pub summarizer: StateSummarizer,
@@ -394,8 +396,8 @@ impl Phase for ActPhase {
                                 };
 
                                 let tool_context = ToolContext {
-                                    agent_id: uuid::Uuid::default(),
-                                    session_id: uuid::Uuid::default(),
+                                    agent_id: context.principal_id,
+                                    session_id: state.task.id,
                                     working_dir: std::env::current_dir().unwrap_or_default(),
                                     env: std::collections::HashMap::new(),
                                 };
@@ -447,7 +449,7 @@ impl Phase for ActPhase {
                                     let needs_approval =
                                         matches!(action, Some(PermissionAction::AskUser))
                                             || (matches!(action, Some(PermissionAction::Allow))
-                                                && tool.requires_approval()
+                                                && tool.requires_approval_for(&args)
                                                 && policy.requires_approval());
                                     if error.is_none() && needs_approval {
                                         match policy
@@ -502,7 +504,7 @@ impl Phase for ActPhase {
                                     }
 
                                     error
-                                } else if tool.requires_approval() {
+                                } else if tool.requires_approval_for(&args) {
                                     Some(format!(
                                         "Tool '{tool_name}' requires approval, but no permission engine is configured"
                                     ))

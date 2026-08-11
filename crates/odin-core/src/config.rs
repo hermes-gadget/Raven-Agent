@@ -593,6 +593,22 @@ pub struct GatewayConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord_token_env: Option<String>,
 
+    /// Discord role allowed to invoke Raven commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_admin_role: Option<String>,
+
+    /// Discord user IDs explicitly allowed to invoke Raven commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discord_admin_user_ids: Vec<u64>,
+
+    /// Restrict Discord commands to this guild ID when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_guild_id: Option<u64>,
+
+    /// Permit direct-message commands from explicitly allowed user IDs.
+    #[serde(default)]
+    pub discord_allow_dms: bool,
+
     /// Optional shared operator credential for the management API and
     /// WebSocket pause/resume/cancel commands. When unset, `raven serve`
     /// generates an ephemeral credential and prints it once at startup.
@@ -621,6 +637,10 @@ impl Default for GatewayConfig {
             discord_enabled: false,
             discord_token: None,
             discord_token_env: None,
+            discord_admin_role: None,
+            discord_admin_user_ids: Vec::new(),
+            discord_guild_id: None,
+            discord_allow_dms: false,
             control_token: None,
             control_token_env: None,
         }

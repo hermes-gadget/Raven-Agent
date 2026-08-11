@@ -1,6 +1,7 @@
 //! Shell command execution tool with dangerous-command detection.
 
 use std::time::Instant;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -12,6 +13,8 @@ use tracing::instrument;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
+
+use crate::Sandbox;
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Deserialize)]
@@ -46,6 +49,7 @@ pub struct Shell {
     name: String,
     description: String,
     dangerous_patterns: Vec<Regex>,
+    sandbox: Arc<Sandbox>,
 }
 
 impl Shell {
@@ -80,6 +84,15 @@ impl Shell {
             name: "shell".into(),
             description: "Execute a shell command and return its stdout and stderr. Use for running terminal commands, scripts, or any system interaction.".into(),
             dangerous_patterns: re_patterns,
+            sandbox: Arc::new(Sandbox::default()),
+        }
+    }
+
+    /// Create a shell tool constrained by the supplied filesystem boundary.
+    pub fn with_sandbox(sandbox: Arc<Sandbox>) -> Self {
+        Self {
+            sandbox,
+            ..Self::new()
         }
     }
 
@@ -89,6 +102,7 @@ impl Shell {
             name: "shell".into(),
             description: "Execute a shell command and return its stdout and stderr.".into(),
             dangerous_patterns: patterns,
+            sandbox: Arc::new(Sandbox::default()),
         }
     }
 
@@ -166,11 +180,11 @@ impl Tool for Shell {
         true
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
 
@@ -197,6 +211,18 @@ impl Tool for Shell {
             });
         }
 
+        let requested_workdir = parsed
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| context.working_dir.clone());
+        let requested_workdir = if requested_workdir.is_absolute() {
+            requested_workdir
+        } else {
+            context.working_dir.join(requested_workdir)
+        };
+        let workdir = self.sandbox.check_write(&requested_workdir)?;
+
         // Dry-run mode: validate without executing
         if parsed.dry_run {
             return Ok(ToolResult {
@@ -218,11 +244,7 @@ impl Tool for Shell {
         cmd.args(["-c", command_str]);
 
         // Set working directory if provided
-        if let Some(workdir) = &parsed.workdir {
-            cmd.current_dir(workdir);
-        } else {
-            cmd.current_dir(&_context.working_dir);
-        }
+        cmd.current_dir(workdir);
 
         // Set timeout
         let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
@@ -290,13 +312,12 @@ impl Tool for Shell {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn test_context() -> ToolContext {
         ToolContext {
             agent_id: Default::default(),
             session_id: Default::default(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: std::env::current_dir().unwrap(),
             env: HashMap::new(),
         }
     }
@@ -320,14 +341,38 @@ mod tests {
     #[tokio::test]
     async fn test_shell_pwd() {
         let shell = Shell::new();
+        let expected = std::env::current_dir().unwrap();
         let args = serde_json::json!({
             "command": "pwd",
-            "workdir": "/tmp",
+            "workdir": expected,
             "timeout_secs": 10
         });
         let result = shell.execute(args, &test_context()).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("/tmp"), "output: {}", result.output);
+        assert!(
+            result
+                .output
+                .contains(&std::env::current_dir().unwrap().display().to_string()),
+            "output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_workdir_outside_sandbox() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let shell = Shell::with_sandbox(Arc::new(Sandbox::new(odin_core::types::PathBoundary {
+            allowed_read: vec![allowed.path().display().to_string()],
+            allowed_write: vec![allowed.path().display().to_string()],
+            denied: vec![],
+        })));
+        let args = serde_json::json!({
+            "command": "pwd",
+            "workdir": outside.path(),
+            "timeout_secs": 10
+        });
+        assert!(shell.execute(args, &test_context()).await.is_err());
     }
 
     #[tokio::test]
