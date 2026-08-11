@@ -2014,6 +2014,36 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
 
     let config = load_config(config_path.as_deref())?;
     let addr = addr.unwrap_or_else(|| config.gateway.http_addr.clone());
+    let management_addr = config.gateway.management_addr.clone();
+    let (operator_token, generated_operator_token) = if let Some(token) = config
+        .gateway
+        .control_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    {
+        (token, false)
+    } else if let Some(env_name) = config.gateway.control_token_env.as_deref() {
+        let token = std::env::var(env_name).map_err(|_| {
+            anyhow::anyhow!(
+                "gateway.control_token_env names '{env_name}', but that environment variable is not set"
+            )
+        })?;
+        if token.trim().is_empty() {
+            anyhow::bail!(
+                "gateway.control_token_env names '{env_name}', but that environment variable is empty"
+            );
+        }
+        (token, false)
+    } else {
+        (
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            true,
+        )
+    };
     tracing::info!("[CLI] Starting HTTP server on {addr}");
 
     // Build the provider from config
@@ -2249,6 +2279,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     println!("║  Chat:     POST http://{addr:<15}/chat  ║", addr = addr);
     println!("║  WebSocket: ws://{addr:<15}/ws    ║", addr = addr);
     println!("╚══════════════════════════════════════════╝");
+    println!("Operator API: http://{management_addr}");
+    if generated_operator_token {
+        println!("Generated operator token (shown once): {operator_token}");
+    }
     println!();
 
     let orch_store = Arc::new(
@@ -2264,10 +2298,12 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
         .map_err(|error| anyhow::anyhow!("Failed to initialize orchestration store: {error}"))?;
     let ws_manager = Arc::new(
         odin_gateway::ws::WsConnectionManager::new(256)
-            .with_control(orch_store, config.gateway.control_token.clone()),
+            .with_control(orch_store, Some(operator_token.clone())),
     );
-    let server_result = odin_gateway::run_http_server_with_approvals(
+    let server_result = odin_gateway::run_http_server_with_management(
         &addr,
+        &management_addr,
+        operator_token,
         Some(handler),
         Some(ws_manager),
         Some(tool_registry),

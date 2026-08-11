@@ -118,6 +118,9 @@ audit:
 gateway:
   http_enabled: false
   http_addr: 127.0.0.1:9177
+  management_addr: 127.0.0.1:9178
+  # Operator credential for management HTTP and WebSocket control.
+  control_token_env: RAVEN_OPERATOR_TOKEN
   discord_enabled: false
   # discord_token: direct-value-is-discouraged
   discord_token_env: DISCORD_BOT_TOKEN
