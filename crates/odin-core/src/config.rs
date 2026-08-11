@@ -577,6 +577,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
 
+    /// Operator-only management API listen address.
+    #[serde(default = "default_management_addr")]
+    pub management_addr: String,
+
     /// Enable Discord integration
     #[serde(default)]
     pub discord_enabled: bool,
@@ -605,15 +609,23 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub discord_allow_dms: bool,
 
-    /// Optional shared secret required for remote orchestration control
-    /// (WebSocket pause/resume/cancel). When unset, local unauthenticated
-    /// control is allowed.
+    /// Optional shared operator credential for the management API and
+    /// WebSocket pause/resume/cancel commands. When unset, `raven serve`
+    /// generates an ephemeral credential and prints it once at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
+
+    /// Environment variable containing the shared operator credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token_env: Option<String>,
 }
 
 fn default_http_addr() -> String {
     "127.0.0.1:9177".to_string()
+}
+
+fn default_management_addr() -> String {
+    "127.0.0.1:9178".to_string()
 }
 
 impl Default for GatewayConfig {
@@ -621,6 +633,7 @@ impl Default for GatewayConfig {
         Self {
             http_enabled: false,
             http_addr: default_http_addr(),
+            management_addr: default_management_addr(),
             discord_enabled: false,
             discord_token: None,
             discord_token_env: None,
@@ -629,6 +642,7 @@ impl Default for GatewayConfig {
             discord_guild_id: None,
             discord_allow_dms: false,
             control_token: None,
+            control_token_env: None,
         }
     }
 }

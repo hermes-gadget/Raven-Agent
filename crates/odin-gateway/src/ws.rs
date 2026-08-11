@@ -339,7 +339,8 @@ pub struct WsConnectionManager {
     /// Optional orchestration store used to dispatch live control commands.
     control_store: Option<Arc<odin_orchestrator::persistence::SqliteOrchestrationStore>>,
 
-    /// Optional shared secret required for remote control commands.
+    /// Shared secret required for remote control commands. Control fails
+    /// closed when this is not configured.
     control_token: Option<String>,
 }
 
@@ -356,7 +357,7 @@ impl WsConnectionManager {
         }
     }
 
-    /// Attach an orchestration store and optional control token for live dispatch.
+    /// Attach an orchestration store and control token for live dispatch.
     pub fn with_control(
         mut self,
         store: Arc<odin_orchestrator::persistence::SqliteOrchestrationStore>,

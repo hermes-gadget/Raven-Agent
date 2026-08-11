@@ -60,7 +60,10 @@ async fn control_authorization_rejects_bad_token() {
         authorize_control(Some("secret"), Some("secret")),
         ControlAuth::Allowed
     );
-    assert_eq!(authorize_control(None, None), ControlAuth::Allowed);
+    assert_eq!(
+        authorize_control(None, None),
+        ControlAuth::Denied("missing or invalid control token")
+    );
 }
 
 #[tokio::test]
