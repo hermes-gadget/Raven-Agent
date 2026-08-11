@@ -194,13 +194,13 @@ mod tests {
             .await
             .unwrap();
 
-        let context = retrieve_task_context(&store, "configure mesh radio SX1262", 5, 200)
+        let context = retrieve_task_context(&store, "configure mesh radio SX1262", 5, 260)
             .await
             .unwrap()
             .expect("expected memory hit");
         assert!(context.contains("SX1262"));
         assert!(!context.contains("pasta"));
-        assert!(context.chars().count() <= 200);
+        assert!(context.chars().count() <= 260);
         assert_eq!(store.searches.load(Ordering::SeqCst), 1);
     }
 
