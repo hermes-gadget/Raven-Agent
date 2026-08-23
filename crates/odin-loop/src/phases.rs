@@ -1080,20 +1080,25 @@ impl Phase for VerifyPhase {
 
                     // Determine verification status from LLM response
                     let lower = text.to_lowercase();
-                    let verified = lower.contains("verified")
-                        && !lower.contains("not verified")
-                        && !lower.contains("not_verified");
+                    let not_verified =
+                        lower.contains("not verified") || lower.contains("not_verified");
+                    let verified = lower.contains("verified") && !not_verified;
 
-                    // Parse confidence or use heuristic
-                    let conf = parse_confidence_from_text(&text)
-                        .map(ConfidenceScore::new)
-                        .unwrap_or_else(|| {
-                            if verified {
-                                ConfidenceScore::new(0.85)
-                            } else {
-                                ConfidenceScore::new(0.5)
-                            }
-                        });
+                    // A negative verification conclusion must not be promoted by
+                    // an independently reported numeric score.
+                    let conf = if not_verified {
+                        ConfidenceScore::new(0.0)
+                    } else {
+                        parse_confidence_from_text(&text)
+                            .map(ConfidenceScore::new)
+                            .unwrap_or_else(|| {
+                                if verified {
+                                    ConfidenceScore::new(0.85)
+                                } else {
+                                    ConfidenceScore::new(0.5)
+                                }
+                            })
+                    };
 
                     (text, conf)
                 }
