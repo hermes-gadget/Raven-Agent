@@ -14,15 +14,6 @@ use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
-/// Shared HTTP client used by all web tools.
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("OdinTools/0.3 (Raven Agent)")
-        .build()
-        .expect("Failed to build HTTP client")
-}
-
 const MAX_REDIRECTS: usize = 5;
 const MAX_HTTP_BODY_BYTES: usize = 100_000;
 
