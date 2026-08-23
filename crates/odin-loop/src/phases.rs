@@ -534,9 +534,13 @@ impl Phase for ActPhase {
                                 }
 
                                 let start = std::time::Instant::now();
-                                // Capture input summary before moving args into execute
+                                // Capture a redacted input summary before moving args into
+                                // execute. Redact the complete value before truncating so a
+                                // credential cannot be split across the summary boundary.
+                                let redacted_args =
+                                    SecretRedactor::full().redact(&args.to_string());
                                 let input_summary: String =
-                                    args.to_string().chars().take(200).collect();
+                                    redacted_args.chars().take(200).collect();
                                 let (mut tr, outcome) =
                                     match tool.execute(args, &tool_context).await {
                                         Ok(tr) => {
