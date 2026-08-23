@@ -176,25 +176,31 @@ impl FileLockManager {
                 entry.retain(|l| l.agent_id != agent_id);
 
                 if entry.is_empty() {
-                    // All locks released — grant to next queued writer, if any
-                    drop(entry); // release the dashmap lock
-                    self.locks.remove(path);
-
-                    if let Some(mut queue) = self.write_queue.get_mut(path) {
-                        if let Some(next) = queue.pop_front() {
-                            // Grant write lock to next queued agent
-                            let mut new_entry = self.locks.entry(path.clone()).or_default();
-                            new_entry.push(FileLock {
-                                path: path.clone(),
-                                mode: LockMode::Write,
-                                agent_id: next.agent_id,
-                            });
-                            tracing::info!(agent_id = %next.agent_id, "Queued write lock granted");
-                        }
-                        if queue.is_empty() {
+                    // Keep the lock entry held while replacing the released
+                    // holder. Removing it before granting would let another
+                    // writer acquire the empty entry in between.
+                    let (next, queue_empty) =
+                        if let Some(mut queue) = self.write_queue.get_mut(path) {
+                            let next = queue.pop_front();
+                            let queue_empty = queue.is_empty();
                             drop(queue);
-                            self.write_queue.remove(path);
-                        }
+                            (next, queue_empty)
+                        } else {
+                            (None, false)
+                        };
+                    if queue_empty {
+                        self.write_queue.remove(path);
+                    }
+                    if let Some(next) = next {
+                        entry.push(FileLock {
+                            path: path.clone(),
+                            mode: LockMode::Write,
+                            agent_id: next.agent_id,
+                        });
+                        tracing::info!(agent_id = %next.agent_id, "Queued write lock granted");
+                    } else {
+                        drop(entry);
+                        self.locks.remove(path);
                     }
                 }
 
@@ -213,23 +219,29 @@ impl FileLockManager {
         if let Some(mut entry) = self.locks.get_mut(path) {
             entry.retain(|l| l.agent_id != agent_id);
             if entry.is_empty() {
-                drop(entry);
-                self.locks.remove(path);
-
-                // Grant to next queued writer
-                if let Some(mut queue) = self.write_queue.get_mut(path) {
-                    if let Some(next) = queue.pop_front() {
-                        let mut new_entry = self.locks.entry(path.to_string()).or_default();
-                        new_entry.push(FileLock {
-                            path: path.to_string(),
-                            mode: LockMode::Write,
-                            agent_id: next.agent_id,
-                        });
-                    }
-                    if queue.is_empty() {
-                        drop(queue);
-                        self.write_queue.remove(path);
-                    }
+                // Keep the lock entry held through the handoff so a new
+                // writer cannot observe an empty entry and acquire alongside
+                // the queued writer.
+                let (next, queue_empty) = if let Some(mut queue) = self.write_queue.get_mut(path) {
+                    let next = queue.pop_front();
+                    let queue_empty = queue.is_empty();
+                    drop(queue);
+                    (next, queue_empty)
+                } else {
+                    (None, false)
+                };
+                if queue_empty {
+                    self.write_queue.remove(path);
+                }
+                if let Some(next) = next {
+                    entry.push(FileLock {
+                        path: path.to_string(),
+                        mode: LockMode::Write,
+                        agent_id: next.agent_id,
+                    });
+                } else {
+                    drop(entry);
+                    self.locks.remove(path);
                 }
             }
         }
