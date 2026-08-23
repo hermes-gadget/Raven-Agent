@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use odin_core::types::TaskId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -139,7 +139,7 @@ pub fn noop_task() -> JobTask {
 /// Supports comma-separated lists: `1,3,5`
 /// Supports ranges: `1-5`
 /// Supports step values: `*/5`, `1-10/2`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Schedule {
     /// Raw cron expression string.
     pub expression: String,
@@ -153,6 +153,37 @@ pub struct Schedule {
     pub month: CronField,
     /// Parsed day of week field.
     pub day_of_week: CronField,
+}
+
+impl<'de> Deserialize<'de> for Schedule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedSchedule {
+            expression: String,
+            minute: CronField,
+            hour: CronField,
+            day_of_month: CronField,
+            month: CronField,
+            day_of_week: CronField,
+        }
+
+        let serialized = SerializedSchedule::deserialize(deserializer)?;
+        let parsed = Schedule::parse(&serialized.expression).map_err(de::Error::custom)?;
+        if parsed.minute != serialized.minute
+            || parsed.hour != serialized.hour
+            || parsed.day_of_month != serialized.day_of_month
+            || parsed.month != serialized.month
+            || parsed.day_of_week != serialized.day_of_week
+        {
+            return Err(de::Error::custom(
+                "serialized cron fields do not match the cron expression",
+            ));
+        }
+        Ok(parsed)
+    }
 }
 
 impl Schedule {
@@ -237,7 +268,7 @@ impl fmt::Display for Schedule {
 }
 
 /// A parsed cron field supporting wildcards, lists, ranges, and steps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum CronField {
     /// Matches any value (`*`)
     Wildcard,
@@ -249,6 +280,42 @@ pub enum CronField {
     Range(i32, i32),
     /// Matches with a bounded step (`*/5`, `1-10/2`).
     Step(i32, i32, i32),
+}
+
+impl<'de> Deserialize<'de> for CronField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum SerializedCronField {
+            Wildcard,
+            Value(i32),
+            List(Vec<i32>),
+            Range(i32, i32),
+            Step(i32, i32, i32),
+        }
+
+        match SerializedCronField::deserialize(deserializer)? {
+            SerializedCronField::Wildcard => Ok(Self::Wildcard),
+            SerializedCronField::Value(value) => Ok(Self::Value(value)),
+            SerializedCronField::List(values) if !values.is_empty() => Ok(Self::List(values)),
+            SerializedCronField::List(_) => Err(de::Error::custom("cron list cannot be empty")),
+            SerializedCronField::Range(start, end) if start <= end => Ok(Self::Range(start, end)),
+            SerializedCronField::Range(_, _) => Err(de::Error::custom(
+                "cron range start must not exceed its end",
+            )),
+            SerializedCronField::Step(start, end, step) if start <= end && step > 0 => {
+                Ok(Self::Step(start, end, step))
+            }
+            SerializedCronField::Step(_, _, step) if step <= 0 => {
+                Err(de::Error::custom("cron step must be positive"))
+            }
+            SerializedCronField::Step(_, _, _) => Err(de::Error::custom(
+                "cron step range start must not exceed its end",
+            )),
+        }
+    }
 }
 
 impl CronField {
@@ -355,7 +422,7 @@ impl CronField {
             CronField::List(values) => values.contains(&value),
             CronField::Range(start, end) => value >= *start && value <= *end,
             CronField::Step(start, end, step) => {
-                value >= *start && value <= *end && (value - start) % step == 0
+                *step > 0 && value >= *start && value <= *end && (value - start) % step == 0
             }
         }
     }
@@ -397,6 +464,25 @@ mod tests {
     fn test_parse_step() {
         let sched = Schedule::parse("*/5 * * * *").unwrap();
         assert!(matches!(sched.minute, CronField::Step(0, 59, 5)));
+    }
+
+    #[test]
+    fn deserialization_rejects_zero_step_without_panicking() {
+        let field = serde_json::from_value::<CronField>(serde_json::json!({
+            "Step": [0, 59, 0]
+        }));
+        assert!(field.is_err());
+
+        let mut value = serde_json::to_value(Schedule::parse("*/5 * * * *").unwrap()).unwrap();
+        value["minute"] = serde_json::json!({"Step": [0, 59, 0]});
+        assert!(serde_json::from_value::<Schedule>(value).is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_fields_that_disagree_with_expression() {
+        let mut value = serde_json::to_value(Schedule::parse("0 * * * *").unwrap()).unwrap();
+        value["minute"] = serde_json::json!({"Value": 1});
+        assert!(serde_json::from_value::<Schedule>(value).is_err());
     }
 
     #[test]
