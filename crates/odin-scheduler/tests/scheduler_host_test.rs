@@ -102,6 +102,7 @@ fn host_config(enabled: bool) -> SchedulerConfig {
         check_interval_secs: 1,
         max_concurrent: 2,
         db_path: None,
+        shutdown_grace_secs: 30,
     }
 }
 

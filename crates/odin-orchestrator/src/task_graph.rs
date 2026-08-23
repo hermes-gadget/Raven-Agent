@@ -263,6 +263,50 @@ impl TaskGraph {
         }
     }
 
+    /// Fail pending descendants whose dependencies can no longer succeed.
+    ///
+    /// The scan repeats so a failed node propagates through dependency chains
+    /// in one call. The returned IDs are the nodes transitioned by this call.
+    pub fn fail_blocked_descendants(&mut self) -> Vec<NodeId> {
+        let mut failed = Vec::new();
+        loop {
+            let blocked: Vec<_> = self
+                .nodes
+                .values()
+                .filter(|node| {
+                    matches!(
+                        node.status,
+                        TaskNodeStatus::Pending | TaskNodeStatus::Blocked
+                    ) && self
+                        .edges
+                        .iter()
+                        .filter(|edge| edge.to == node.id)
+                        .any(|edge| {
+                            self.nodes.get(&edge.from).is_some_and(|dependency| {
+                                matches!(
+                                    dependency.status,
+                                    TaskNodeStatus::Failed | TaskNodeStatus::Cancelled
+                                )
+                            })
+                        })
+                })
+                .map(|node| node.id)
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+
+            for node_id in blocked {
+                if let Some(node) = self.nodes.get_mut(&node_id) {
+                    node.status = TaskNodeStatus::Failed;
+                    node.result = Some("blocked by a failed or cancelled dependency".into());
+                    failed.push(node_id);
+                }
+            }
+        }
+        failed
+    }
+
     /// Check if the entire graph is complete.
     pub fn is_complete(&self) -> bool {
         self.nodes
@@ -387,6 +431,30 @@ mod tests {
         // b and c can be in any order
         assert!(sorted[1..3].contains(&b));
         assert!(sorted[1..3].contains(&c));
+    }
+
+    #[test]
+    fn failed_dependencies_propagate_through_chains_and_diamonds() {
+        let mut graph = TaskGraph::new("test");
+        let root = graph.add_node(make_node("root", "root"));
+        let left = graph.add_node(make_node("left", "left"));
+        let right = graph.add_node(make_node("right", "right"));
+        let leaf = graph.add_node(make_node("leaf", "leaf"));
+        graph
+            .add_edge(root, left)
+            .add_edge(root, right)
+            .add_edge(left, leaf)
+            .add_edge(right, leaf);
+        graph.update_node_status(root, TaskNodeStatus::Failed);
+
+        let failed = graph.fail_blocked_descendants();
+
+        assert_eq!(failed.len(), 3);
+        for node_id in [left, right, leaf] {
+            let node = &graph.nodes[&node_id];
+            assert_eq!(node.status, TaskNodeStatus::Failed);
+            assert!(node.result.as_deref().unwrap().contains("dependency"));
+        }
     }
 
     #[test]

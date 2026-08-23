@@ -393,6 +393,9 @@ enum ScheduleAction {
         schedule: String,
         /// Task goal to execute when the job fires.
         task: String,
+        /// Runtime agent UUID or exact name (required when the runtime has multiple agents).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// List all scheduled jobs.
     List,
@@ -742,7 +745,6 @@ async fn cmd_run(
     load_mcp_tools(&tool_registry, &config).await;
 
     let memory = Arc::new(build_memory_store(&config)?);
-    let audit_logger = Arc::new(build_audit_logger(&config));
     let reliability_tracker = build_reliability_tracker(&config)?;
     tracing::info!("[CLI] Memory store and audit logger initialized");
 
@@ -2118,8 +2120,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     let memory = Arc::new(build_memory_store(&config)?);
     tracing::info!("[CLI/serve] Memory store initialized");
 
-    // Wire audit logger
-    let audit_logger = Arc::new(build_audit_logger(&config));
+    // Reuse the policy engine's logger so the audit sink has one writer.
     let reliability_tracker = build_reliability_tracker(&config)?;
     tracing::info!("[CLI/serve] Audit logger initialized");
 
@@ -2164,6 +2165,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                 allow_dms: config.gateway.discord_allow_dms,
                 command_prefix: None,
                 orchestration_db_path: Some(dirs_state_path("orchestration.db")),
+                agent_selector: Some("discord-agent".into()),
             },
             runtime,
         );
@@ -2592,14 +2594,19 @@ async fn cmd_schedule(action: ScheduleAction, config_path: Option<PathBuf>) -> a
             name,
             schedule,
             task,
+            agent,
         } => {
             // Parse the schedule to validate it before adding
             if let Err(e) = odin_scheduler::Schedule::parse(&schedule) {
                 anyhow::bail!("Invalid cron expression '{}': {}", schedule, e);
             }
 
+            let mut job_config = SchedulerJobConfig::new(task);
+            if let Some(agent) = agent {
+                job_config = job_config.with_agent_selector(agent);
+            }
             let job_id = scheduler
-                .add_job_with_config(&name, &schedule, SchedulerJobConfig::new(task))
+                .add_job_with_config(&name, &schedule, job_config)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to add job: {}", e))?;
             println!("Job '{}' added with ID: {}", name, job_id);
@@ -3736,6 +3743,7 @@ fn build_audit_logger(config: &OdinConfig) -> odin_audit::AuditLoggerImpl {
         db_path: None,
         json_format: config.audit.json_format,
         buffer_size: 100,
+        history_size: 1_000,
         mask_secrets: true,
     })
 }

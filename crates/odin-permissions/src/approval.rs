@@ -191,7 +191,7 @@ impl ApprovalGate {
             return ApprovalStatus::Denied;
         }
 
-        let mut decision_rx = {
+        let (mut decision_rx, remaining) = {
             let pending = self
                 .inner
                 .pending
@@ -200,7 +200,19 @@ impl ApprovalGate {
             let Some(entry) = pending.get(request_id) else {
                 return ApprovalStatus::Denied;
             };
-            entry.decision_tx.subscribe()
+            (
+                entry.decision_tx.subscribe(),
+                entry
+                    .request
+                    .expires_at
+                    .signed_duration_since(Utc::now())
+                    .to_std(),
+            )
+        };
+
+        let Ok(remaining) = remaining else {
+            self.transition(request_id, ApprovalStatus::Expired);
+            return ApprovalStatus::Expired;
         };
 
         let wait = async {
@@ -215,7 +227,7 @@ impl ApprovalGate {
             }
         };
 
-        match tokio::time::timeout(self.inner.timeout, wait).await {
+        match tokio::time::timeout(remaining, wait).await {
             Ok(status) => status,
             Err(_) => {
                 warn!(request_id = %request_id, "Approval request timed out");
@@ -276,6 +288,7 @@ impl ApprovalGate {
 
     /// Get all pending requests.
     pub async fn pending_requests(&self) -> Vec<ApprovalRequest> {
+        self.expire_due_requests();
         self.inner
             .pending
             .lock()
@@ -288,6 +301,7 @@ impl ApprovalGate {
 
     /// Get a specific request by ID.
     pub async fn get_request(&self, request_id: &str) -> Option<ApprovalRequest> {
+        self.expire_due_requests();
         self.inner
             .pending
             .lock()
@@ -317,6 +331,7 @@ impl ApprovalGate {
 
     /// Remove completed requests.
     pub async fn cleanup_expired(&self) -> usize {
+        self.expire_due_requests();
         let mut pending = self
             .inner
             .pending
@@ -343,9 +358,32 @@ impl ApprovalGate {
         if entry.request.status != ApprovalStatus::Pending {
             return false;
         }
-        entry.request.status = status;
-        entry.decision_tx.send_replace(status);
-        true
+        let effective_status = if Utc::now() >= entry.request.expires_at {
+            ApprovalStatus::Expired
+        } else {
+            status
+        };
+        entry.request.status = effective_status;
+        entry.decision_tx.send_replace(effective_status);
+        effective_status == status
+    }
+
+    fn expire_due_requests(&self) -> usize {
+        let now = Utc::now();
+        let mut expired = 0;
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .expect("approval gate lock poisoned");
+        for entry in pending.values_mut().filter(|entry| {
+            entry.request.status == ApprovalStatus::Pending && now >= entry.request.expires_at
+        }) {
+            entry.request.status = ApprovalStatus::Expired;
+            entry.decision_tx.send_replace(ApprovalStatus::Expired);
+            expired += 1;
+        }
+        expired
     }
 }
 
@@ -424,6 +462,40 @@ mod tests {
             gate.await_decision(&request.id).await,
             ApprovalStatus::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn expired_request_cannot_be_approved_or_denied() {
+        let gate = ApprovalGate::with_timeout(false, Duration::from_millis(1));
+        let approval = request(&gate, "{}").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(
+            !gate
+                .approve(&approval.id, &approval.argument_fingerprint)
+                .await
+                .unwrap()
+        );
+        assert!(!gate.deny(&approval.id).await.unwrap());
+        assert_eq!(
+            gate.get_request(&approval.id).await.unwrap().status,
+            ApprovalStatus::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_requests_expire_and_are_pruned() {
+        let gate = ApprovalGate::with_timeout(false, Duration::from_millis(1));
+        let approval = request(&gate, "{}").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(gate.pending_requests().await.is_empty());
+        assert_eq!(
+            gate.get_request(&approval.id).await.unwrap().status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(gate.cleanup_expired().await, 1);
+        assert!(gate.get_request(&approval.id).await.is_none());
     }
 
     #[tokio::test]

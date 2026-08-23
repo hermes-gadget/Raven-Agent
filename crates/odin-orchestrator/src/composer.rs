@@ -942,6 +942,25 @@ impl Composer {
         }
     }
 
+    /// Fail agents whose task nodes depend on failed or cancelled work.
+    pub fn fail_blocked_dependents(&mut self, root_goal: &str) -> Vec<Uuid> {
+        let agent_ids = self
+            .graphs
+            .get_mut(root_goal)
+            .map_or_else(Vec::new, |graph| {
+                graph
+                    .fail_blocked_descendants()
+                    .into_iter()
+                    .filter_map(|node_id| graph.nodes.get(&node_id)?.agent_id)
+                    .collect()
+            });
+
+        for agent_id in &agent_ids {
+            self.fail_agent(*agent_id, "blocked by a failed or cancelled dependency");
+        }
+        agent_ids
+    }
+
     /// Update a node status in the task graph.
     pub fn update_node_status(&mut self, root_goal: &str, node_id: Uuid, status: TaskNodeStatus) {
         if let Some(graph) = self.graphs.get_mut(root_goal) {

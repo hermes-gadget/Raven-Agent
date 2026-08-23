@@ -16,6 +16,7 @@ fn make_persisted_job(name: &str, cron_expr: &str) -> PersistedJob {
         cron_expr: cron_expr.to_string(),
         task_goal: Some(format!("Run {}", name)),
         max_iterations: 100,
+        agent_selector: Some("scheduler-agent".into()),
         enabled: true,
         last_run: None,
         next_run: Some(Utc::now() + chrono::TimeDelta::hours(1)),

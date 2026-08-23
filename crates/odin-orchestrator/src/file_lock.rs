@@ -307,7 +307,7 @@ impl FileLockManager {
                 // Keep the lock entry held through the handoff so a new
                 // writer cannot observe an empty entry and acquire alongside
                 // the queued writer.
-                let (next, queue_empty) = if let Some(mut queue) = self.write_queue.get_mut(path) {
+                let (next, queue_empty) = if let Some(mut queue) = self.write_queue.get_mut(&path) {
                     let next = queue.pop_front();
                     let queue_empty = queue.is_empty();
                     drop(queue);
@@ -316,7 +316,7 @@ impl FileLockManager {
                     (None, false)
                 };
                 if queue_empty {
-                    self.write_queue.remove(path);
+                    self.write_queue.remove(&path);
                 }
                 if let Some(next) = next {
                     entry.push(FileLock {
@@ -326,7 +326,7 @@ impl FileLockManager {
                     });
                 } else {
                     drop(entry);
-                    self.locks.remove(path);
+                    self.locks.remove(&path);
                 }
             }
         }

@@ -16,7 +16,7 @@ use odin_runtime::Runtime;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant, interval, timeout_at};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
@@ -107,7 +107,7 @@ pub struct Scheduler {
     /// Optional structured audit sink for scheduler outcomes.
     audit_logger: Option<Arc<dyn AuditLogger>>,
     /// In-flight executions, drained during graceful shutdown.
-    execution_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    execution_handles: Arc<Mutex<Vec<ScheduledExecution>>>,
     /// Wakes the tick loop immediately during shutdown.
     shutdown: Arc<Notify>,
 }
@@ -218,6 +218,7 @@ impl Scheduler {
         let mut job = Job::new(name, sched.clone(), crate::job::noop_task());
         job.task_goal = Some(config.task_goal);
         job.max_iterations = config.max_iterations;
+        job.agent_selector = config.agent_selector;
         let id = job.id;
 
         // Persist to store if configured
@@ -315,17 +316,20 @@ impl Scheduler {
             }
             let runtime_agent =
                 if let (Some(runtime), Some(_)) = (&self.runtime, &job_snapshot.task_goal) {
-                    runtime.list_agents().first().map(|agent| agent.id)
+                    Some(
+                        runtime
+                            .resolve_agent(job_snapshot.agent_selector.as_deref())
+                            .map_err(|error| {
+                                OdinError::Config(format!(
+                                    "Scheduled job '{}' cannot resolve its agent: {error}",
+                                    job_snapshot.name
+                                ))
+                            })?
+                            .id,
+                    )
                 } else {
                     None
                 };
-            if self.runtime.is_some() && job_snapshot.task_goal.is_some() && runtime_agent.is_none()
-            {
-                return Err(OdinError::Internal(format!(
-                    "Scheduled job '{}' cannot run because the runtime has no registered agent",
-                    job_snapshot.name
-                )));
-            }
 
             // Recheck due state and reserve the execution under one write lock.
             let Some((job, task_id)) = reserve_due_job(&self.jobs, job_id, Utc::now()).await else {
@@ -496,13 +500,15 @@ impl Scheduler {
                     let task_goal = job_snapshot.task_goal.clone();
 
                     let runtime_dispatch = match (runtime.as_ref(), task_goal.as_ref()) {
-                        (Some(runtime), Some(goal)) => match runtime.list_agents().first() {
-                            Some(agent) => Some((runtime.clone(), agent.id, goal.clone())),
-                            None => {
-                                warn!(job_id = %job_id, "Scheduled job skipped: runtime has no registered agent");
-                                continue;
+                        (Some(runtime), Some(goal)) => {
+                            match runtime.resolve_agent(job_snapshot.agent_selector.as_deref()) {
+                                Ok(agent) => Some((runtime.clone(), agent.id, goal.clone())),
+                                Err(error) => {
+                                    warn!(job_id = %job_id, %error, "Scheduled job skipped: agent selector did not resolve");
+                                    continue;
+                                }
                             }
-                        },
+                        }
                         (None, Some(_)) => {
                             warn!(job_id = %job_id, "Scheduled job skipped: no runtime is configured");
                             continue;
@@ -574,6 +580,9 @@ impl Scheduler {
                             .await;
                     }
 
+                    let execution_agent_id = runtime_dispatch
+                        .as_ref()
+                        .map_or_else(Uuid::nil, |(_, agent_id, _)| *agent_id);
                     let handle = if let Some((runtime, agent_id, goal)) = runtime_dispatch {
                         // Runtime-driven execution path in the loop
                         let store = store.clone();
@@ -583,7 +592,7 @@ impl Scheduler {
                             audit_logger,
                             running_guard: RunningCountGuard::new(jobs.clone(), job_id),
                             job_id,
-                            job_name: name,
+                            job_name: name.clone(),
                             task_id,
                             agent_id,
                         };
@@ -617,7 +626,7 @@ impl Scheduler {
                             audit_logger,
                             running_guard: RunningCountGuard::new(jobs.clone(), job_id),
                             job_id,
-                            job_name: name,
+                            job_name: name.clone(),
                             task_id,
                             agent_id: Uuid::nil(),
                         };
@@ -630,8 +639,14 @@ impl Scheduler {
                     };
 
                     let mut handles = execution_handles.lock().await;
-                    handles.retain(|existing| !existing.is_finished());
-                    handles.push(handle);
+                    handles.retain(|existing| !existing.handle.is_finished());
+                    handles.push(ScheduledExecution {
+                        handle,
+                        job_id,
+                        job_name: name,
+                        task_id,
+                        agent_id: execution_agent_id,
+                    });
                 }
             }
         });
@@ -649,25 +664,78 @@ impl Scheduler {
         // `notified()` yet, so an immediate stop cannot miss the wake-up.
         self.shutdown.notify_one();
 
-        if let Some(handle) = self.tick_handle.write().await.take() {
+        let deadline = Instant::now() + Duration::from_secs(self.config.shutdown_grace_secs);
+        if let Some(mut handle) = self.tick_handle.write().await.take() {
             info!("Scheduler stop requested, waiting for loop to finish");
-            handle
-                .await
-                .map_err(|error| OdinError::Internal(format!("Scheduler loop failed: {error}")))?;
+            match timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(OdinError::Internal(format!(
+                        "Scheduler loop failed: {error}"
+                    )));
+                }
+                Err(_) => {
+                    warn!("Scheduler loop exceeded shutdown grace period; aborting it");
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
         }
 
         let handles = {
             let mut handles = self.execution_handles.lock().await;
             std::mem::take(&mut *handles)
         };
-        for handle in handles {
-            if let Err(error) = handle.await {
-                warn!("Scheduled execution task failed to join: {error}");
+        for mut execution in handles {
+            let failure = match timeout_at(deadline, &mut execution.handle).await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("scheduled execution terminated: {error}")),
+                Err(_) => {
+                    execution.handle.abort();
+                    let _ = (&mut execution.handle).await;
+                    Some(format!(
+                        "cancelled after scheduler shutdown grace period of {} seconds",
+                        self.config.shutdown_grace_secs
+                    ))
+                }
+            };
+            if let Some(error) = failure {
+                warn!(task_id = %execution.task_id, "{error}");
+                self.record_interrupted_execution(&execution, &error).await;
             }
         }
 
         info!("Scheduler stopped");
         Ok(())
+    }
+
+    async fn record_interrupted_execution(&self, execution: &ScheduledExecution, error: &str) {
+        if let Some(store) = &self.store
+            && let Err(persist_error) = store
+                .record_run_finished(&execution.task_id, JobRunStatus::Failed, Some(error))
+                .await
+        {
+            warn!(task_id = %execution.task_id, "Failed to persist cancelled scheduler run: {persist_error}");
+        }
+        if let Some(logger) = &self.audit_logger {
+            let _ = logger
+                .log(AuditEntry {
+                    id: Uuid::new_v4(),
+                    timestamp: Utc::now(),
+                    agent_id: execution.agent_id,
+                    session_id: execution.job_id,
+                    event_type: AuditEventType::SessionEnd,
+                    action: "scheduler_job_cancelled".into(),
+                    details: serde_json::json!({
+                        "job_id": execution.job_id,
+                        "job_name": execution.job_name,
+                        "task_id": execution.task_id,
+                        "error": error,
+                    }),
+                    result: AuditResult::Failure,
+                })
+                .await;
+        }
     }
 
     /// Check if the scheduler loop is running.
@@ -684,6 +752,14 @@ impl Scheduler {
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
     }
+}
+
+struct ScheduledExecution {
+    handle: tokio::task::JoinHandle<()>,
+    job_id: JobId,
+    job_name: String,
+    task_id: Uuid,
+    agent_id: Uuid,
 }
 
 struct ExecutionCompletion {
@@ -752,6 +828,7 @@ mod tests {
             check_interval_secs: 1,
             max_concurrent: 2,
             db_path: None,
+            shutdown_grace_secs: 30,
         }
     }
 
@@ -895,6 +972,7 @@ mod tests {
             check_interval_secs: 3_600,
             max_concurrent: 1,
             db_path: None,
+            shutdown_grace_secs: 1,
         });
 
         sched.start().await.unwrap();
@@ -902,6 +980,72 @@ mod tests {
             .await
             .expect("stop should not wait for the next scheduler tick")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_hung_execution_and_records_failure() {
+        let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
+        let mut config = enabled_config();
+        config.shutdown_grace_secs = 0;
+        let sched = Scheduler::new(config).with_store(store.clone());
+        let task: JobTask = Arc::new(|| Box::pin(async {}));
+        let job_id = sched.add_job("hung", "* * * * *", task).await.unwrap();
+        let task_id = Uuid::new_v4();
+        sched
+            .jobs
+            .write()
+            .await
+            .get_mut(&job_id)
+            .unwrap()
+            .running_count = 1;
+        store
+            .record_run_started(&JobRun {
+                task_id,
+                job_id,
+                job_name: "hung".into(),
+                started_at: Utc::now(),
+                finished_at: None,
+                status: JobRunStatus::Running,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let completion = ExecutionCompletion {
+            store: Some(store.clone()),
+            audit_logger: None,
+            running_guard: RunningCountGuard::new(sched.jobs.clone(), job_id),
+            job_id,
+            job_name: "hung".into(),
+            task_id,
+            agent_id: Uuid::nil(),
+        };
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            completion.finish(Ok(true)).await;
+        });
+        sched
+            .execution_handles
+            .lock()
+            .await
+            .push(ScheduledExecution {
+                handle,
+                job_id,
+                job_name: "hung".into(),
+                task_id,
+                agent_id: Uuid::nil(),
+            });
+
+        tokio::time::timeout(Duration::from_secs(1), sched.stop())
+            .await
+            .expect("shutdown must be bounded")
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let runs = store.recent_runs(1).await.unwrap();
+        assert_eq!(runs[0].status, JobRunStatus::Failed);
+        assert!(runs[0].error.as_deref().unwrap().contains("cancelled"));
+        assert_eq!(sched.get_job(job_id).await.unwrap().running_count, 0);
     }
 
     // ── Persistence Integration Tests ───────────────────────────────
@@ -927,7 +1071,9 @@ mod tests {
         let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
         let sched = Scheduler::new(enabled_config()).with_store(store.clone());
 
-        let config = SchedulerJobConfig::new("Run my task").with_max_iterations(50);
+        let config = SchedulerJobConfig::new("Run my task")
+            .with_max_iterations(50)
+            .with_agent_selector("scheduler-agent");
         let _id = sched
             .add_job_with_config("config-test", "0 */6 * * *", config)
             .await
@@ -938,6 +1084,7 @@ mod tests {
         assert_eq!(loaded[0].name, "config-test");
         assert_eq!(loaded[0].task_goal.as_deref(), Some("Run my task"));
         assert_eq!(loaded[0].max_iterations, 50);
+        assert_eq!(loaded[0].agent_selector.as_deref(), Some("scheduler-agent"));
     }
 
     #[tokio::test]
@@ -979,6 +1126,7 @@ mod tests {
             cron_expr: "0 * * * *".to_string(),
             task_goal: None,
             max_iterations: 100,
+            agent_selector: None,
             enabled: true,
             last_run: None,
             next_run: Some(Utc::now() + chrono::TimeDelta::hours(1)),

@@ -667,6 +667,10 @@ pub struct SchedulerConfig {
     /// Defaults to `~/.raven-agent/scheduler.db` if not set.
     #[serde(default)]
     pub db_path: Option<String>,
+
+    /// Time to wait for in-flight jobs during shutdown before cancelling them.
+    #[serde(default = "default_scheduler_shutdown_grace")]
+    pub shutdown_grace_secs: u64,
 }
 
 fn default_check_interval() -> u64 {
@@ -674,6 +678,9 @@ fn default_check_interval() -> u64 {
 }
 fn default_max_concurrent() -> u32 {
     5
+}
+fn default_scheduler_shutdown_grace() -> u64 {
+    30
 }
 
 impl Default for SchedulerConfig {
@@ -683,6 +690,7 @@ impl Default for SchedulerConfig {
             check_interval_secs: default_check_interval(),
             max_concurrent: default_max_concurrent(),
             db_path: None,
+            shutdown_grace_secs: default_scheduler_shutdown_grace(),
         }
     }
 }
