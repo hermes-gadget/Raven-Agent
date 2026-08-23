@@ -245,6 +245,23 @@ impl LoopEngineTrait for Engine {
             }
 
             // ── ACT ──
+            let plan_next = plan
+                .sub_tasks
+                .iter()
+                .find(|st| st.status == SubTaskStatus::Pending)
+                .map(|st| st.id.as_str());
+            let context_next = context.plan.as_ref().and_then(|current| {
+                current
+                    .sub_tasks
+                    .iter()
+                    .find(|st| st.status == SubTaskStatus::Pending)
+                    .map(|st| st.id.as_str())
+            });
+            if plan_next != context_next {
+                // The local plan is authoritative after a sub-task completes;
+                // do not execute against a stale context snapshot.
+                context.plan = Some(plan.clone());
+            }
             let result = act_phase.execute(&mut state, &context).await?;
             if !result.tool_results.is_empty() {
                 total_tool_calls += result.tool_results.len() as u32;
