@@ -8,6 +8,7 @@
 pub mod builtins;
 pub mod catalog;
 pub mod dry_run;
+pub(crate) mod process;
 pub mod reliability;
 pub mod sandbox;
 pub mod tool;
@@ -33,9 +34,9 @@ pub fn builtin_registry(
     let registry = ToolRegistry::new();
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(builtins::file::FileRead::new(sandbox.clone())),
-        Box::new(builtins::file::FileWrite::new(sandbox)),
-        Box::new(builtins::shell::Shell::new()),
-        Box::new(builtins::git::Git::new()),
+        Box::new(builtins::file::FileWrite::new(sandbox.clone())),
+        Box::new(builtins::shell::Shell::with_sandbox(sandbox.clone())),
+        Box::new(builtins::git::Git::with_sandbox(sandbox.clone())),
         Box::new(builtins::web::WebFetch::new()),
         Box::new(builtins::web::WebSearch::new()),
         Box::new(builtins::web::HttpRequest::new()),
@@ -47,9 +48,9 @@ pub fn builtin_registry(
         Box::new(builtins::github::GithubPrCreate::default()),
         Box::new(builtins::github::GithubPrStatus::default()),
         Box::new(builtins::github::GithubActionsStatus::default()),
-        Box::new(builtins::utility::FileList),
-        Box::new(builtins::utility::FileDelete),
-        Box::new(builtins::utility::FileExists),
+        Box::new(builtins::utility::FileList::new(sandbox.clone())),
+        Box::new(builtins::utility::FileDelete::new(sandbox.clone())),
+        Box::new(builtins::utility::FileExists::new(sandbox)),
         Box::new(builtins::utility::EnvVar),
         Box::new(builtins::utility::TimeNow),
         Box::new(builtins::utility::RandomNumber),

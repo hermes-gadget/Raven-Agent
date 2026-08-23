@@ -1,6 +1,7 @@
 //! Git tool — wraps git commands for repository management.
 
 use std::time::Instant;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -11,6 +12,9 @@ use tracing::instrument;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
+
+use crate::Sandbox;
+use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
 
 /// Arguments for the `git` tool.
 #[derive(Debug, Deserialize)]
@@ -36,6 +40,7 @@ fn default_timeout() -> u64 {
 pub struct Git {
     name: String,
     description: String,
+    sandbox: Arc<Sandbox>,
 }
 
 impl Git {
@@ -44,6 +49,15 @@ impl Git {
         Self {
             name: "git".into(),
             description: "Execute git commands in a repository. Use for cloning, committing, pushing, pulling, and other git operations.".into(),
+            sandbox: Arc::new(Sandbox::default()),
+        }
+    }
+
+    /// Create a Git tool constrained by the supplied filesystem boundary.
+    pub fn with_sandbox(sandbox: Arc<Sandbox>) -> Self {
+        Self {
+            sandbox,
+            ..Self::new()
         }
     }
 
@@ -126,11 +140,11 @@ impl Tool for Git {
         true
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
 
@@ -142,6 +156,18 @@ impl Tool for Git {
 
         let command_str = &parsed.command;
 
+        let requested_repo = parsed
+            .repo_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| context.working_dir.clone());
+        let requested_repo = if requested_repo.is_absolute() {
+            requested_repo
+        } else {
+            context.working_dir.join(requested_repo)
+        };
+        let repo_path = self.sandbox.check_write(&requested_repo)?;
+
         // Build git command
         let git_args = Self::build_args(command_str);
         let subcommand = git_args.first().cloned().unwrap_or_default();
@@ -150,30 +176,24 @@ impl Tool for Git {
         cmd.args(&git_args);
 
         // Set repository path
-        if let Some(repo_path) = &parsed.repo_path {
-            cmd.current_dir(repo_path);
-        } else {
-            cmd.current_dir(&_context.working_dir);
-        }
+        cmd.current_dir(repo_path);
 
         // Set timeout
         let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
 
-        // Spawn and wait with timeout
-        let output = tokio::time::timeout(timeout, cmd.output())
+        let output = process::run_command(cmd, timeout, DEFAULT_MAX_OUTPUT_BYTES)
             .await
-            .map_err(|_| {
-                OdinError::Timeout(format!(
+            .map_err(|error| match error {
+                ProcessError::Timeout => OdinError::Timeout(format!(
                     "Git command timed out after {}s: git {}",
                     parsed.timeout_secs, command_str
-                ))
+                )),
+                ProcessError::Io(error) => OdinError::Tool {
+                    tool: self.name.clone(),
+                    message: format!("Failed to execute git command: {error}"),
+                    source: Some(Box::new(error)),
+                },
             })?;
-
-        let output = output.map_err(|e| OdinError::Tool {
-            tool: self.name.clone(),
-            message: format!("Failed to execute git command: {e}"),
-            source: Some(Box::new(e)),
-        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -188,6 +208,11 @@ impl Tool for Git {
             }
             result_output.push_str("STDERR:\n");
             result_output.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            result_output.push_str(&format!(
+                "\n\n[TRUNCATED: output exceeded {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+            ));
         }
 
         let success = output.status.success();
@@ -269,13 +294,12 @@ fn shlex_split(input: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn test_context() -> ToolContext {
         ToolContext {
             agent_id: Default::default(),
             session_id: Default::default(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: std::env::current_dir().unwrap(),
             env: HashMap::new(),
         }
     }
@@ -319,7 +343,11 @@ mod tests {
         let repo_path = dir.path();
 
         // Initialize git repo
-        let git = Git::new();
+        let git = Git::with_sandbox(Arc::new(Sandbox::new(odin_core::types::PathBoundary {
+            allowed_read: vec![repo_path.display().to_string()],
+            allowed_write: vec![repo_path.display().to_string()],
+            denied: vec![],
+        })));
         let init_args = serde_json::json!({
             "command": "init",
             "repo_path": repo_path.to_string_lossy(),

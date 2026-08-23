@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use odin_core::ResolvedPathBoundary;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::types::PathBoundary;
 
@@ -15,12 +16,14 @@ use odin_core::types::PathBoundary;
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     boundary: PathBoundary,
+    resolved: Result<ResolvedPathBoundary, String>,
 }
 
 impl Sandbox {
     /// Create a new sandbox from a [`PathBoundary`].
     pub fn new(boundary: PathBoundary) -> Self {
-        Self { boundary }
+        let resolved = ResolvedPathBoundary::new(&boundary).map_err(|error| error.to_string());
+        Self { boundary, resolved }
     }
 
     /// Borrow the underlying boundary configuration.
@@ -33,8 +36,7 @@ impl Sandbox {
     /// Returns the canonicalised path on success, or an error if the path
     /// is outside the allowed boundaries or falls in the denied list.
     pub fn check_read(&self, path: &Path) -> OdinResult<PathBuf> {
-        let canonical = self.resolve(path)?;
-        self.check_allowed(&canonical, false)
+        self.resolved()?.check_read(path)
     }
 
     /// Check whether `path` is allowed for writing.
@@ -42,88 +44,15 @@ impl Sandbox {
     /// For paths that don't exist yet, the parent directory is used for
     /// boundary checking.
     pub fn check_write(&self, path: &Path) -> OdinResult<PathBuf> {
-        let canonical = self.resolve(path)?;
-        self.check_allowed(&canonical, true)
+        self.resolved()?.check_write(path)
     }
 
-    /// Try to resolve a path to its canonical (absolute) form.
-    ///
-    /// If the path does not exist yet, the parent chain is resolved instead
-    /// and the final component is appended.
-    fn resolve(&self, path: &Path) -> OdinResult<PathBuf> {
-        if path.exists() {
-            return path.canonicalize().map_err(OdinError::Io);
-        }
-
-        // Path doesn't exist — try resolving the parent chain
-        if let Some(parent) = path.parent()
-            && parent.exists()
-        {
-            let mut canonical = parent.canonicalize().map_err(OdinError::Io)?;
-            if let Some(filename) = path.file_name() {
-                canonical.push(filename);
-            }
-            return Ok(canonical);
-        }
-
-        // Fall back to an absolute path constructed from working-dir assumptions
-        // If the path is relative, we can't resolve it without a base directory.
-        // Return it as-is and let the caller handle it.
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
-        } else {
-            Err(OdinError::Validation(format!(
-                "Cannot resolve path '{}': does not exist and no parent exists to anchor it",
-                path.display()
-            )))
-        }
-    }
-
-    /// Check whether a canonical path is within the allowed boundaries.
-    fn check_allowed(&self, path: &Path, write: bool) -> OdinResult<PathBuf> {
-        let path_str = path.to_string_lossy();
-
-        // Check denied list first
-        for denied in &self.boundary.denied {
-            if path_str.starts_with(denied) || path_str == *denied {
-                return Err(OdinError::PermissionDenied(format!(
-                    "Path '{}' is denied by rule '{}'",
-                    path.display(),
-                    denied,
-                )));
-            }
-        }
-
-        // Check allowed list
-        let allowed_list = if write {
-            &self.boundary.allowed_write
-        } else {
-            &self.boundary.allowed_read
-        };
-
-        for allowed in allowed_list {
-            let allowed_path = Path::new(allowed);
-            // If the allowed path is relative, treat it as relative to cwd
-            let allowed_canonical = if allowed_path.is_relative() {
-                std::env::current_dir()
-                    .ok()
-                    .map(|cwd| cwd.join(allowed_path))
-                    .unwrap_or_else(|| allowed_path.to_path_buf())
-            } else {
-                allowed_path.to_path_buf()
-            };
-
-            let allowed_str = allowed_canonical.to_string_lossy();
-            if path_str.starts_with(allowed_str.as_ref()) || path_str == allowed_str.as_ref() {
-                return Ok(path.to_path_buf());
-            }
-        }
-
-        Err(OdinError::PermissionDenied(format!(
-            "Path '{}' is not within allowed {} boundaries",
-            path.display(),
-            if write { "write" } else { "read" },
-        )))
+    fn resolved(&self) -> OdinResult<&ResolvedPathBoundary> {
+        self.resolved.as_ref().map_err(|error| {
+            OdinError::Validation(format!(
+                "Invalid filesystem boundary configuration: {error}"
+            ))
+        })
     }
 }
 
@@ -202,5 +131,22 @@ mod tests {
         let sandbox = Sandbox::new(boundary);
         let result = sandbox.check_write(&new_file);
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn test_sibling_prefix_is_denied() {
+        let parent = tempfile::tempdir().unwrap();
+        let allowed = parent.path().join("repo");
+        let sibling = parent.path().join("repo-private");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let sandbox = Sandbox::new(PathBoundary {
+            allowed_read: vec![allowed.display().to_string()],
+            allowed_write: vec![allowed.display().to_string()],
+            denied: vec![],
+        });
+
+        assert!(sandbox.check_read(&allowed).is_ok());
+        assert!(sandbox.check_read(&sibling).is_err());
     }
 }

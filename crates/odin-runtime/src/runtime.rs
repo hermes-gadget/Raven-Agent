@@ -157,9 +157,13 @@ impl Runtime {
         task: &AgentTask,
         session_id: Option<SessionId>,
     ) -> OdinResult<TaskResult> {
-        let agent = self.agents.get(agent_id).ok_or_else(|| {
-            odin_core::error::OdinError::Internal(format!("Agent {agent_id} not found"))
-        })?;
+        let agent = self
+            .agents
+            .get(agent_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                odin_core::error::OdinError::Internal(format!("Agent {agent_id} not found"))
+            })?;
 
         tracing::info!(task_id = %task.id, agent_id = %agent.id, "Submitting task to agent");
 

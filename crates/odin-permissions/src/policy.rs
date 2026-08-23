@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use odin_core::ResolvedPathBoundary;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::AuditLogger;
 use odin_core::types::{
@@ -15,7 +16,7 @@ use odin_core::types::{
     PermissionRule,
 };
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -24,16 +25,19 @@ use tracing::{debug, trace, warn};
 #[derive(Debug, Clone)]
 struct RateTracker {
     /// Timestamps of recent calls within the window.
-    timestamps: Vec<DateTime<Utc>>,
+    timestamps: VecDeque<DateTime<Utc>>,
     /// Maximum calls allowed per minute.
     max_per_minute: u32,
+    /// Last time this principal/tool bucket was consulted.
+    last_seen: DateTime<Utc>,
 }
 
 impl RateTracker {
     fn new(max_per_minute: u32) -> Self {
         Self {
-            timestamps: Vec::new(),
+            timestamps: VecDeque::new(),
             max_per_minute,
+            last_seen: Utc::now(),
         }
     }
 
@@ -41,10 +45,13 @@ impl RateTracker {
     fn check_and_record(&mut self, now: &DateTime<Utc>) -> bool {
         // Remove timestamps older than 1 minute
         let cutoff = *now - chrono::TimeDelta::minutes(1);
-        self.timestamps.retain(|t| *t > cutoff);
+        self.last_seen = *now;
+        while self.timestamps.front().is_some_and(|time| *time <= cutoff) {
+            self.timestamps.pop_front();
+        }
 
         if self.timestamps.len() < self.max_per_minute as usize {
-            self.timestamps.push(*now);
+            self.timestamps.push_back(*now);
             true
         } else {
             false
@@ -62,7 +69,7 @@ pub struct PolicyEngine {
     /// Dangerous command patterns (regex).
     dangerous_patterns: Vec<Regex>,
     /// Path boundaries for filesystem operations.
-    path_boundary: PathBoundary,
+    path_boundary: Result<ResolvedPathBoundary, String>,
     /// Rate limit trackers: key = "agent_id:tool_name"
     rate_trackers: Arc<RwLock<HashMap<String, RateTracker>>>,
     /// Default max rate per minute.
@@ -74,6 +81,9 @@ pub struct PolicyEngine {
     /// Optional audit sink for approval lifecycle decisions.
     audit_logger: Option<Arc<dyn AuditLogger>>,
 }
+
+const MAX_RATE_TRACKERS: usize = 4_096;
+const RATE_TRACKER_IDLE_MINUTES: i64 = 10;
 
 impl PolicyEngine {
     /// Create a new policy engine.
@@ -103,6 +113,9 @@ impl PolicyEngine {
                     .ok()
             })
             .collect();
+
+        let path_boundary =
+            ResolvedPathBoundary::new(&path_boundary).map_err(|error| error.to_string());
 
         Self {
             rules: rules_map,
@@ -142,44 +155,51 @@ impl PolicyEngine {
 
     /// Validate that a path is within the allowed boundaries.
     pub fn check_path_boundary(&self, path: &std::path::Path, write: bool) -> OdinResult<()> {
-        let path_str = path.to_string_lossy();
-
-        // Check denied paths first
-        for denied in &self.path_boundary.denied {
-            if path_str.contains(denied) {
-                return Err(OdinError::PermissionDenied(format!(
-                    "Path '{}' is in the denied list (matches '{}')",
-                    path_str, denied
-                )));
-            }
-        }
-
-        // Check allowed paths
-        let allowed = if write {
-            &self.path_boundary.allowed_write
+        let boundary = self.path_boundary.as_ref().map_err(|error| {
+            OdinError::Validation(format!(
+                "Invalid filesystem boundary configuration: {error}"
+            ))
+        })?;
+        if write {
+            boundary.check_write(path)?;
         } else {
-            &self.path_boundary.allowed_read
-        };
-
-        let is_allowed = allowed.iter().any(|allowed_prefix| {
-            if allowed_prefix == "." {
-                // "." means current directory and subdirectories
-                // We accept any path that doesn't escape (no "../")
-                !path_str.contains("..")
-            } else {
-                path_str.starts_with(allowed_prefix)
-            }
-        });
-
-        if !is_allowed {
-            return Err(OdinError::PermissionDenied(format!(
-                "Path '{}' is outside allowed boundaries",
-                path_str
-            )));
+            boundary.check_read(path)?;
         }
-
         Ok(())
     }
+}
+
+fn http_request_requires_approval(args: &serde_json::Value) -> bool {
+    let method = args
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    ) {
+        return true;
+    }
+
+    args.get("headers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|headers| {
+            headers.iter().any(|header| {
+                let name = header
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "proxy-authorization"
+                        | "cookie"
+                        | "x-api-key"
+                        | "x-auth-token"
+                )
+            })
+        })
 }
 
 impl Default for PolicyEngine {
@@ -231,17 +251,37 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
         &self,
         agent_id: AgentId,
         tool_name: &str,
-        _args: &serde_json::Value,
+        args: &serde_json::Value,
     ) -> OdinResult<PermissionAction> {
         // Check for explicit rules
         if let Some(rule) = self.rules.get(tool_name) {
+            let action = if rule.action == PermissionAction::Deny {
+                PermissionAction::Deny
+            } else if rule.action == PermissionAction::AskUser
+                || rule.require_approval
+                || (tool_name == "http_request" && http_request_requires_approval(args))
+            {
+                PermissionAction::AskUser
+            } else {
+                PermissionAction::Allow
+            };
             debug!(
                 agent_id = %agent_id,
                 tool = %tool_name,
-                action = %rule.action,
+                action = %action,
+                rule_requires_approval = rule.require_approval,
                 "Tool permission check via explicit rule"
             );
-            return Ok(rule.action);
+            return Ok(action);
+        }
+
+        if tool_name == "http_request" && http_request_requires_approval(args) {
+            debug!(
+                agent_id = %agent_id,
+                tool = %tool_name,
+                "State-changing or credential-bearing HTTP request requires approval"
+            );
+            return Ok(PermissionAction::AskUser);
         }
 
         // Tool metadata determines whether the default path needs approval.
@@ -284,12 +324,24 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
             .and_then(|r| r.max_rate_per_minute)
             .unwrap_or(self.default_max_rate);
 
+        let now = Utc::now();
         let mut trackers = self.rate_trackers.write().await;
+        let idle_cutoff = now - chrono::TimeDelta::minutes(RATE_TRACKER_IDLE_MINUTES);
+        trackers.retain(|_, tracker| tracker.last_seen > idle_cutoff);
+        if !trackers.contains_key(&key) && trackers.len() >= MAX_RATE_TRACKERS {
+            warn!(
+                agent_id = %agent_id,
+                tool = %tool_name,
+                max_trackers = MAX_RATE_TRACKERS,
+                "Rate-limit tracker capacity reached; denying new principal bucket"
+            );
+            return Ok(false);
+        }
         let tracker = trackers
             .entry(key.clone())
             .or_insert_with(|| RateTracker::new(max_rate));
 
-        let allowed = tracker.check_and_record(&Utc::now());
+        let allowed = tracker.check_and_record(&now);
         if allowed {
             trace!(
                 agent_id = %agent_id,
@@ -458,6 +510,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_rule_approval_is_enforced_regardless_of_global_default() {
+        for global_require_approval in [false, true] {
+            let engine = PolicyEngine::new(
+                vec![PermissionRule {
+                    tool_name: "shell".to_string(),
+                    action: PermissionAction::Allow,
+                    require_approval: true,
+                    max_rate_per_minute: None,
+                }],
+                &[],
+                PathBoundary::default(),
+                60,
+                global_require_approval,
+            );
+            let result = engine
+                .check_tool(test_agent(), "shell", &serde_json::json!({}))
+                .await
+                .unwrap();
+            assert_eq!(result, PermissionAction::AskUser);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_deny_wins_over_approval_requirement() {
+        let engine = PolicyEngine::new(
+            vec![PermissionRule {
+                tool_name: "shell".to_string(),
+                action: PermissionAction::Deny,
+                require_approval: true,
+                max_rate_per_minute: None,
+            }],
+            &[],
+            PathBoundary::default(),
+            60,
+            false,
+        );
+        let result = engine
+            .check_tool(test_agent(), "shell", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result, PermissionAction::Deny);
+    }
+
+    #[tokio::test]
+    async fn mutating_and_credential_bearing_http_requests_require_approval() {
+        let engine = PolicyEngine::new(vec![], &[], PathBoundary::default(), 60, false);
+        let agent = test_agent();
+
+        let get = engine
+            .check_tool(
+                agent,
+                "http_request",
+                &serde_json::json!({"method": "GET", "url": "https://example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get, PermissionAction::Allow);
+
+        let post = engine
+            .check_tool(
+                agent,
+                "http_request",
+                &serde_json::json!({"method": "POST", "url": "https://example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post, PermissionAction::AskUser);
+
+        let authorized_get = engine
+            .check_tool(
+                agent,
+                "http_request",
+                &serde_json::json!({
+                    "method": "GET",
+                    "url": "https://example.com",
+                    "headers": [{"name": "Authorization", "value": "synthetic"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized_get, PermissionAction::AskUser);
+    }
+
+    #[tokio::test]
     async fn test_dangerous_command_detection() {
         let engine = PolicyEngine::default();
         assert!(engine.is_dangerous_command("rm -rf /"));
@@ -615,6 +751,53 @@ mod tests {
         assert!(
             engine
                 .check_path_boundary(std::path::Path::new("../outside"), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_path_boundary_rejects_sibling_prefix() {
+        let parent = tempfile::tempdir().unwrap();
+        let allowed = parent.path().join("repo");
+        let sibling = parent.path().join("repo-private");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let engine = PolicyEngine::new(
+            vec![],
+            &[],
+            PathBoundary {
+                allowed_read: vec![allowed.display().to_string()],
+                allowed_write: vec![allowed.display().to_string()],
+                denied: vec![],
+            },
+            60,
+            true,
+        );
+
+        assert!(engine.check_path_boundary(&allowed, false).is_ok());
+        assert!(engine.check_path_boundary(&sibling, false).is_err());
+    }
+
+    #[test]
+    fn test_home_denial_is_expanded() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = std::path::PathBuf::from(home);
+        let engine = PolicyEngine::new(
+            vec![],
+            &[],
+            PathBoundary {
+                allowed_read: vec![home.display().to_string()],
+                allowed_write: vec![home.display().to_string()],
+                denied: vec!["~/.ssh".to_string()],
+            },
+            60,
+            true,
+        );
+        assert!(
+            engine
+                .check_path_boundary(&home.join(".ssh/id_synthetic"), false)
                 .is_err()
         );
     }

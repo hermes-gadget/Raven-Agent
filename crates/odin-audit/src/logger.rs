@@ -12,7 +12,7 @@ use odin_core::traits::AuditLogger;
 use odin_core::types::{AgentId, AuditEntry, AuditEventType, AuditResult, SessionId};
 use odin_permissions::redact::SecretRedactor;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -67,8 +67,12 @@ pub struct AuditLoggerImpl {
     config: AuditLoggerConfig,
     /// In-memory buffer of recent entries.
     buffer: Arc<RwLock<Vec<BufferedEntry>>>,
+    /// Entries retained for queries during this logger's lifetime.
+    history: Arc<RwLock<Vec<AuditEntry>>>,
     /// File handle (opened lazily).
     file: Arc<Mutex<Option<std::fs::File>>>,
+    /// Serializes flushes so a failed write can be retried without overlap.
+    flush_lock: Arc<Mutex<()>>,
     /// Secret/PII redactor applied to every audit entry.
     redactor: SecretRedactor,
 }
@@ -104,7 +108,9 @@ impl AuditLoggerImpl {
         Self {
             config,
             buffer: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(Vec::new())),
             file: Arc::new(Mutex::new(file)),
+            flush_lock: Arc::new(Mutex::new(())),
             redactor,
         }
     }
@@ -152,34 +158,73 @@ impl AuditLoggerImpl {
 
     /// Flush buffered entries to the file.
     async fn flush_to_file(&self) -> OdinResult<()> {
-        let entries: Vec<BufferedEntry> = {
+        let _flush_guard = self.flush_lock.lock().await;
+
+        let mut file_guard = self.file.lock().await;
+        let file = match file_guard.as_mut() {
+            Some(file) => file,
+            None => return Ok(()),
+        };
+
+        let original_len = file
+            .metadata()
+            .map_err(|error| {
+                OdinError::Io(std::io::Error::other(format!(
+                    "Failed to inspect audit log before flush: {error}"
+                )))
+            })?
+            .len();
+
+        // Serialize while the entries are still in the queue. If this fails,
+        // the queue is untouched and the caller can retry safely.
+        let (entries, encoded) = {
             let mut buffer = self.buffer.write().await;
             if buffer.is_empty() {
                 return Ok(());
             }
-            // Drain only entries that haven't been flushed yet
-            // We simply take all and re-add those that fail
-            buffer.drain(..).collect()
-        };
 
-        let mut file_guard = self.file.lock().await;
-        let file = match file_guard.as_mut() {
-            Some(f) => f,
-            None => {
-                // File not available; re-buffer
-                let mut buffer = self.buffer.write().await;
-                buffer.extend(entries);
-                return Ok(());
-            }
+            let encoded = self.serialize_entries(&buffer)?;
+            let entries = buffer.drain(..).collect::<Vec<_>>();
+            (entries, encoded)
         };
-
         let count = entries.len();
-        for buffered in &entries {
-            let line = if self.config.json_format {
-                serde_json::to_string(&buffered.entry).map_err(OdinError::Serialization)?
+
+        let write_result = file
+            .write_all(&encoded)
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_data());
+
+        if let Err(error) = write_result {
+            let rollback_result = file
+                .set_len(original_len)
+                .and_then(|_| file.seek(SeekFrom::Start(original_len)))
+                .and_then(|_| file.flush());
+
+            let message = match rollback_result {
+                Ok(()) => format!("Failed to write audit log: {error}"),
+                Err(rollback_error) => format!(
+                    "Failed to write audit log: {error}; rollback also failed: {rollback_error}"
+                ),
+            };
+            let mut buffer = self.buffer.write().await;
+            buffer.splice(0..0, entries);
+            return Err(OdinError::Io(std::io::Error::other(message)));
+        }
+
+        debug!(count, "Flushed audit entries to file");
+        Ok(())
+    }
+
+    fn serialize_entries(&self, entries: &[BufferedEntry]) -> OdinResult<Vec<u8>> {
+        let mut encoded = Vec::new();
+        for buffered in entries {
+            if self.config.json_format {
+                serde_json::to_writer(&mut encoded, &buffered.entry)
+                    .map_err(OdinError::Serialization)?;
             } else {
-                format!(
-                    "[{}] [{}] [{}] [{}] {}: {}\n",
+                write!(
+                    encoded,
+                    "[{}] [{}] [{}] [{}] {}: {}",
                     buffered.entry.timestamp.to_rfc3339(),
                     buffered.entry.event_type,
                     buffered.entry.agent_id,
@@ -187,29 +232,42 @@ impl AuditLoggerImpl {
                     buffered.entry.action,
                     serde_json::to_string(&buffered.entry.details).unwrap_or_default(),
                 )
-            };
-
-            writeln!(file, "{}", line).map_err(|e| {
-                OdinError::Io(std::io::Error::other(format!(
-                    "Failed to write audit log entry: {}",
-                    e
-                )))
-            })?;
+                .map_err(|error| OdinError::Io(std::io::Error::other(error.to_string())))?;
+            }
+            encoded.push(b'\n');
         }
+        Ok(encoded)
+    }
 
-        file.flush().map_err(|e| {
-            OdinError::Io(std::io::Error::other(format!(
-                "Failed to flush audit log: {}",
-                e
-            )))
-        })?;
+    async fn persisted_entries(&self) -> OdinResult<Vec<AuditEntry>> {
+        if !self.config.json_format {
+            return Ok(Vec::new());
+        }
+        let Some(path) = self.config.file_path.as_ref() else {
+            return Ok(Vec::new());
+        };
 
-        debug!(count = count, "Flushed audit entries to file");
-        Ok(())
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(OdinError::Io(std::io::Error::other(format!(
+                    "Failed to read audit log '{}': {error}",
+                    path.display()
+                ))));
+            }
+        };
+
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(OdinError::Serialization))
+            .collect()
     }
 
     /// Add an audit entry to the in-memory buffer.
     async fn buffer_entry(&self, entry: AuditEntry) -> OdinResult<()> {
+        self.history.write().await.push(entry.clone());
         let buffered = BufferedEntry { entry };
 
         {
@@ -264,26 +322,36 @@ impl AuditLogger for AuditLoggerImpl {
         event_type: Option<AuditEventType>,
         limit: usize,
     ) -> OdinResult<Vec<AuditEntry>> {
-        let buffer = self.buffer.read().await;
+        let _file_guard = self.file.lock().await;
+        let mut entries = self.persisted_entries().await?;
+        let history = self.history.read().await;
+        let persisted_ids: std::collections::HashSet<_> =
+            entries.iter().map(|entry| entry.id).collect();
+        entries.extend(
+            history
+                .iter()
+                .filter(|entry| !persisted_ids.contains(&entry.id))
+                .cloned(),
+        );
 
-        let results: Vec<AuditEntry> = buffer
+        let results: Vec<AuditEntry> = entries
             .iter()
-            .filter(|b| {
+            .filter(|entry| {
                 let mut matches = true;
                 if let Some(ref aid) = agent_id {
-                    matches = matches && b.entry.agent_id == *aid;
+                    matches = matches && entry.agent_id == *aid;
                 }
                 if let Some(ref sid) = session_id {
-                    matches = matches && b.entry.session_id == *sid;
+                    matches = matches && entry.session_id == *sid;
                 }
                 if let Some(ref et) = event_type {
-                    matches = matches && b.entry.event_type == *et;
+                    matches = matches && entry.event_type == *et;
                 }
                 matches
             })
             .rev()
             .take(limit)
-            .map(|b| b.entry.clone())
+            .cloned()
             .collect();
 
         Ok(results)
@@ -291,13 +359,18 @@ impl AuditLogger for AuditLoggerImpl {
 
     /// Get the most recent entries.
     async fn recent(&self, limit: usize) -> OdinResult<Vec<AuditEntry>> {
-        let buffer = self.buffer.read().await;
-        let results: Vec<AuditEntry> = buffer
-            .iter()
-            .rev()
-            .take(limit)
-            .map(|b| b.entry.clone())
-            .collect();
+        let _file_guard = self.file.lock().await;
+        let mut entries = self.persisted_entries().await?;
+        let history = self.history.read().await;
+        let persisted_ids: std::collections::HashSet<_> =
+            entries.iter().map(|entry| entry.id).collect();
+        entries.extend(
+            history
+                .iter()
+                .filter(|entry| !persisted_ids.contains(&entry.id))
+                .cloned(),
+        );
+        let results: Vec<AuditEntry> = entries.iter().rev().take(limit).cloned().collect();
 
         Ok(results)
     }
@@ -504,6 +577,12 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("\"event_type\":\"session_start\""));
         assert!(content.contains(&agent_id.to_string()));
+
+        let recent = logger.recent(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].agent_id, agent_id);
+        let queried = logger.query(Some(agent_id), None, None, 10).await.unwrap();
+        assert_eq!(queried.len(), 1);
 
         // Cleanup
         let _ = std::fs::remove_file(&log_path);

@@ -108,18 +108,25 @@ Approval-required model tool calls in **raven run** display the redacted tool
 name and arguments in the terminal and accept `y`/`yes`; every other response
 denies the call. EOF/disconnect and the 30-second timeout also deny it.
 
-When using **raven serve**, a remote operator can list redacted pending calls
-with **GET /approvals** and decide one with **POST /approvals/&lt;request-id&gt;**:
+When using **raven serve**, public task submission and operator control use
+separate listeners. The public API defaults to `127.0.0.1:9177`; the management
+API defaults to loopback-only `127.0.0.1:9178`. Every management request needs
+the shared operator credential as `Authorization: Bearer <token>`.
+
+Configure `gateway.control_token` or `gateway.control_token_env`. If neither is
+set, `raven serve` generates an ephemeral token and prints it once at startup.
+An authenticated operator can list redacted pending calls with **GET
+/approvals** and decide one with **POST /approvals/&lt;request-id&gt;**:
 
 ~~~json
 {
-  "approved": true,
-  "argument_fingerprint": "<fingerprint returned by GET /approvals>"
+  "approved": true
 }
 ~~~
 
-The fingerprint binds approval to the exact original tool name and arguments.
-A mismatched fingerprint invalidates and denies the pending call.
+Approval fingerprints stay server-side and are never returned through HTTP.
+The API does not enable wildcard CORS; browser clients must be same-origin or
+use an explicitly controlled reverse proxy.
 
 ## Terminal UI
 
@@ -204,7 +211,7 @@ More detail: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Live run owners poll durable controls, allowing a second CLI process, HTTP client, or authorized WebSocket client to pause, resume, or cancel by graph UUID.
 - The HTTP and Discord orchestration submission endpoints create persisted plans. Task execution is available through **raven run**, HTTP **/chat**, and Discord **/raven run**.
-- **raven serve** also starts Discord when **gateway.discord_enabled** is true and a token is available from the configured value or environment variable.
+- **raven serve** also starts Discord when **gateway.discord_enabled** is true, a token is available from the configured value or environment variable, and at least one of **gateway.discord_admin_role** or **gateway.discord_admin_user_ids** is configured. Direct messages are disabled unless **gateway.discord_allow_dms** is enabled and the sender is explicitly allowlisted.
 - The TUI currently approval-gates dangerous TUI actions such as cancellation,
   but model-driven tool-call approval is connected only for **raven run** and
   **raven serve**.

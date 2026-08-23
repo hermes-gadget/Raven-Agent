@@ -247,7 +247,17 @@ impl SecretRedactor {
             ),
             // ── Secrets: Private Keys ───────────────────────────────────────
             compile(
-                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+                r"(?s)-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----",
+                "Private key block",
+                PatternCategory::Secret,
+            ),
+            compile(
+                r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?-----END PGP PRIVATE KEY BLOCK-----",
+                "PGP private key block",
+                PatternCategory::Secret,
+            ),
+            compile(
+                r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
                 "Private key header",
                 PatternCategory::Secret,
             ),
@@ -325,6 +335,23 @@ impl SecretRedactor {
     ///
     /// The patterns are applied in order; earlier patterns take precedence.
     pub fn redact(&self, input: &str) -> String {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(input)
+            && matches!(
+                value,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            )
+        {
+            let redacted = self.redact_json_value(&value);
+            return if redacted == value {
+                input.to_string()
+            } else {
+                redacted.to_string()
+            };
+        }
+        self.redact_text(input)
+    }
+
+    fn redact_text(&self, input: &str) -> String {
         let mut result = input.to_string();
         for pattern in &self.patterns {
             // Skip credit-card check for strings that are clearly not numbers
@@ -341,15 +368,24 @@ impl SecretRedactor {
 
     /// Redact a `serde_json::Value` recursively — walks objects, arrays, and strings.
     pub fn redact_json(&self, value: &serde_json::Value) -> serde_json::Value {
+        self.redact_json_value(value)
+    }
+
+    fn redact_json_value(&self, value: &serde_json::Value) -> serde_json::Value {
         match value {
-            serde_json::Value::String(s) => serde_json::Value::String(self.redact(s)),
+            serde_json::Value::String(s) => serde_json::Value::String(self.redact_text(s)),
             serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(|v| self.redact_json(v)).collect())
+                serde_json::Value::Array(arr.iter().map(|v| self.redact_json_value(v)).collect())
             }
             serde_json::Value::Object(obj) => {
                 let mut new_obj = serde_json::Map::new();
                 for (k, v) in obj {
-                    new_obj.insert(k.clone(), self.redact_json(v));
+                    let value = if self.config.enable_secrets && Self::is_sensitive_json_key(k) {
+                        serde_json::Value::String("[REDACTED:Sensitive JSON field]".into())
+                    } else {
+                        self.redact_json_value(v)
+                    };
+                    new_obj.insert(k.clone(), value);
                 }
                 serde_json::Value::Object(new_obj)
             }
@@ -406,6 +442,45 @@ impl SecretRedactor {
     fn could_be_credit_card(input: &str) -> bool {
         let digit_count = input.chars().filter(|c| c.is_ascii_digit()).count();
         digit_count >= 13
+    }
+
+    fn is_sensitive_json_key(key: &str) -> bool {
+        let normalized: String = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        matches!(
+            normalized.as_str(),
+            "password"
+                | "passwd"
+                | "token"
+                | "accesstoken"
+                | "refreshtoken"
+                | "secret"
+                | "clientsecret"
+                | "webhooksecret"
+                | "apikey"
+                | "apisecret"
+                | "authorization"
+                | "proxyauthorization"
+                | "auth"
+                | "privatekey"
+                | "credential"
+                | "credentials"
+        ) || [
+            "password",
+            "passwd",
+            "accesstoken",
+            "refreshtoken",
+            "clientsecret",
+            "webhooksecret",
+            "apikey",
+            "apisecret",
+            "privatekey",
+        ]
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
     }
 }
 
@@ -585,6 +660,28 @@ mod tests {
         let r = SecretRedactor::secrets_only();
         let redacted = r.redact("-----BEGIN PGP PRIVATE KEY BLOCK-----");
         assert!(redacted.contains("[REDACTED:PGP private key]"));
+    }
+
+    #[test]
+    fn redact_entire_multiline_private_key_blocks() {
+        let r = SecretRedactor::secrets_only();
+        let pem_body = "synthetic-base64-body-line-1\nsynthetic-base64-body-line-2";
+        let pem = format!(
+            "before\n-----BEGIN PRIVATE KEY-----\n{pem_body}\n-----END PRIVATE KEY-----\nafter"
+        );
+        let redacted = r.redact(&pem);
+        assert!(!redacted.contains(pem_body));
+        assert!(!redacted.contains("END PRIVATE KEY"));
+        assert!(redacted.contains("[REDACTED:Private key block]"));
+
+        let pgp_body = "synthetic-pgp-body\nmore-synthetic-pgp-body";
+        let pgp = format!(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n{pgp_body}\n-----END PGP PRIVATE KEY BLOCK-----"
+        );
+        let redacted = r.redact(&pgp);
+        assert!(!redacted.contains(pgp_body));
+        assert!(!redacted.contains("END PGP PRIVATE KEY"));
+        assert!(redacted.contains("[REDACTED:PGP private key block]"));
     }
 
     // ── PII redaction ────────────────────────────────────────────────────
@@ -784,6 +881,41 @@ mod tests {
         assert!(!s.contains("@"));
         assert!(!s.contains("192.168"));
         assert!(s.contains("clean"));
+    }
+
+    #[test]
+    fn redact_json_uses_sensitive_key_names_for_entire_values() {
+        let r = SecretRedactor::secrets_only();
+        let password = "correct horse battery staple";
+        let authorization = "Basic short-but-sensitive";
+        let input = serde_json::json!({
+            "password": password,
+            "nested": {
+                "Authorization": authorization,
+                "service_api_key": "punctuation and whitespace !@#$%",
+            },
+            "array": [{"client-secret": {"deep": "must disappear"}}],
+            "safe": "preserved",
+        });
+
+        let redacted = r.redact_json(&input);
+        let serialized = redacted.to_string();
+        assert!(!serialized.contains(password));
+        assert!(!serialized.contains(authorization));
+        assert!(!serialized.contains("punctuation and whitespace"));
+        assert!(!serialized.contains("must disappear"));
+        assert!(serialized.contains("[REDACTED:Sensitive JSON field]"));
+        assert!(serialized.contains("preserved"));
+    }
+
+    #[test]
+    fn redact_string_recognizes_quoted_json_keys() {
+        let r = SecretRedactor::secrets_only();
+        let input = r#"{"password":"long secret with spaces","safe":"visible"}"#;
+        let redacted = r.redact(input);
+        assert!(!redacted.contains("long secret with spaces"));
+        assert!(redacted.contains("[REDACTED:Sensitive JSON field]"));
+        assert!(redacted.contains("visible"));
     }
 
     // ── helper functions ─────────────────────────────────────────────────

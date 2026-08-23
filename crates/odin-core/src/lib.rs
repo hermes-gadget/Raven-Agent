@@ -6,10 +6,12 @@
 
 pub mod config;
 pub mod error;
+pub mod path_security;
 pub mod traits;
 pub mod types;
 
 // Re-export commonly used items
 pub use config::OdinConfig;
 pub use error::OdinError;
+pub use path_security::ResolvedPathBoundary;
 pub use types::*;

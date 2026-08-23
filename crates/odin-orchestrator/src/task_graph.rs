@@ -168,7 +168,7 @@ impl TaskGraph {
 
     /// Get all nodes that are independent (no dependencies between them) and can run in parallel.
     pub fn independent_groups(&self) -> Vec<Vec<NodeId>> {
-        let finished: HashSet<NodeId> = self
+        let mut finished: HashSet<NodeId> = self
             .nodes
             .values()
             .filter(|n| n.status == TaskNodeStatus::Done)
@@ -204,6 +204,7 @@ impl TaskGraph {
             for id in &group {
                 remaining.remove(id);
             }
+            finished.extend(group.iter().copied());
             groups.push(group);
         }
 
@@ -427,6 +428,18 @@ mod tests {
         assert_eq!(groups[0].len(), 2); // both c and b are ready
         assert!(groups[0].contains(&b));
         assert!(groups[0].contains(&c));
+    }
+
+    #[test]
+    fn test_independent_groups_progress_through_chain() {
+        let mut graph = TaskGraph::new("chain");
+        let a = graph.add_node(make_node("a", "a"));
+        let b = graph.add_node(make_node("b", "b"));
+        let c = graph.add_node(make_node("c", "c"));
+        graph.add_edge(a, b).add_edge(b, c);
+
+        let groups = graph.independent_groups();
+        assert_eq!(groups, vec![vec![a], vec![b], vec![c]]);
     }
 
     #[test]

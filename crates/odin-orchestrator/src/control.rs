@@ -109,18 +109,34 @@ pub enum ControlAuth {
 
 /// Authorize a remote control client.
 ///
-/// - When `expected_token` is `None`, local/unauthenticated clients are allowed
-///   (matches the default single-operator local deployment).
-/// - When configured, the caller must supply the exact token.
+/// Remote control fails closed unless a non-empty expected token is configured
+/// and the caller supplies the exact token.
 pub fn authorize_control(
     expected_token: Option<&str>,
     provided_token: Option<&str>,
 ) -> ControlAuth {
-    match expected_token {
-        None => ControlAuth::Allowed,
-        Some(expected) if provided_token == Some(expected) => ControlAuth::Allowed,
-        Some(_) => ControlAuth::Denied("missing or invalid control token"),
+    match (expected_token, provided_token) {
+        (Some(expected), Some(provided))
+            if !expected.is_empty()
+                && constant_time_eq(expected.as_bytes(), provided.as_bytes()) =>
+        {
+            ControlAuth::Allowed
+        }
+        _ => ControlAuth::Denied("missing or invalid control token"),
     }
+}
+
+fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(provided)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 #[cfg(test)]
@@ -139,10 +155,21 @@ mod tests {
     }
 
     #[test]
-    fn authorize_without_token_allows_local() {
-        assert_eq!(authorize_control(None, None), ControlAuth::Allowed);
+    fn authorize_control_fails_closed_without_token() {
+        assert_eq!(
+            authorize_control(None, None),
+            ControlAuth::Denied("missing or invalid control token")
+        );
+        assert_eq!(
+            authorize_control(Some(""), Some("")),
+            ControlAuth::Denied("missing or invalid control token")
+        );
         assert_eq!(
             authorize_control(Some("secret"), None),
+            ControlAuth::Denied("missing or invalid control token")
+        );
+        assert_eq!(
+            authorize_control(Some("secret"), Some("wrong")),
             ControlAuth::Denied("missing or invalid control token")
         );
         assert_eq!(

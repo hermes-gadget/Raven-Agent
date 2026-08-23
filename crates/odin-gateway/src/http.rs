@@ -9,9 +9,11 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query},
-    http::StatusCode,
-    response::IntoResponse,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use odin_core::config::ToolsConfig;
@@ -209,8 +211,33 @@ pub struct DoctorReportResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalDecisionRequest {
     pub approved: bool,
-    /// Must match the fingerprint returned with the pending request.
-    pub argument_fingerprint: String,
+}
+
+/// An operator-visible pending approval. The internal argument fingerprint is
+/// intentionally omitted so it can never become a client-held capability.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingApprovalResponse {
+    pub id: String,
+    pub agent_id: odin_core::types::AgentId,
+    pub action: String,
+    pub details: String,
+    pub status: odin_permissions::ApprovalStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<odin_permissions::ApprovalRequest> for PendingApprovalResponse {
+    fn from(request: odin_permissions::ApprovalRequest) -> Self {
+        Self {
+            id: request.id,
+            agent_id: request.agent_id,
+            action: request.action,
+            details: request.details,
+            status: request.status,
+            created_at: request.created_at,
+            expires_at: request.expires_at,
+        }
+    }
 }
 
 /// Result of applying an approval decision.
@@ -218,6 +245,51 @@ pub struct ApprovalDecisionRequest {
 pub struct ApprovalDecisionResponse {
     pub request_id: String,
     pub status: odin_permissions::ApprovalStatus,
+}
+
+#[derive(Clone)]
+struct OperatorAuth {
+    token: Arc<str>,
+}
+
+async fn require_operator(
+    State(auth): State<OperatorAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    let authorized = matches!(
+        odin_orchestrator::authorize_control(Some(auth.token.as_ref()), provided),
+        odin_orchestrator::ControlAuth::Allowed
+    );
+
+    if authorized {
+        next.run(request).await
+    } else {
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "operator authentication required"})),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        );
+        response
+    }
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.contains(' ') {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 // ── Route Handlers ───────────────────────────────────────────────────
@@ -328,7 +400,9 @@ async fn chat_handler(
 fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry {
     let registry = odin_tools::ToolRegistry::new();
     let sandbox = Arc::new(odin_tools::Sandbox::new(
-        odin_core::types::PathBoundary::default(),
+        config
+            .map(|tools| tools.path_boundary.clone())
+            .unwrap_or_default(),
     ));
 
     // Helper to check whether a tool should be registered
@@ -368,7 +442,9 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
     if tool_enabled("shell") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::shell::Shell::new())
+            Box::new(odin_tools::builtins::shell::Shell::with_sandbox(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("web_fetch") {
@@ -390,7 +466,12 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
         );
     }
     if tool_enabled("git") {
-        try_reg!(registry, Box::new(odin_tools::builtins::git::Git::new()));
+        try_reg!(
+            registry,
+            Box::new(odin_tools::builtins::git::Git::with_sandbox(
+                sandbox.clone()
+            ))
+        );
     }
     if tool_enabled("system_info") {
         try_reg!(
@@ -412,18 +493,27 @@ fn build_tool_registry(config: Option<&ToolsConfig>) -> odin_tools::ToolRegistry
     }
     // Utility tools (Phase 4.0 expansion — 10 new tools)
     if tool_enabled("file_list") {
-        try_reg!(registry, Box::new(odin_tools::builtins::utility::FileList));
+        try_reg!(
+            registry,
+            Box::new(odin_tools::builtins::utility::FileList::new(
+                sandbox.clone()
+            ))
+        );
     }
     if tool_enabled("file_delete") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::utility::FileDelete)
+            Box::new(odin_tools::builtins::utility::FileDelete::new(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("file_exists") {
         try_reg!(
             registry,
-            Box::new(odin_tools::builtins::utility::FileExists)
+            Box::new(odin_tools::builtins::utility::FileExists::new(
+                sandbox.clone()
+            ))
         );
     }
     if tool_enabled("env_var") {
@@ -625,11 +715,15 @@ async fn tools_doctor_handler(state: Arc<GatewayState>) -> Json<DoctorReportResp
 }
 
 /// GET /approvals — list redacted pending tool-call approvals.
-async fn approvals_list_handler(
-    state: Arc<GatewayState>,
-) -> Json<Vec<odin_permissions::ApprovalRequest>> {
+async fn approvals_list_handler(state: Arc<GatewayState>) -> Json<Vec<PendingApprovalResponse>> {
     match state.approval_gate.as_ref() {
-        Some(gate) => Json(gate.pending_requests().await),
+        Some(gate) => Json(
+            gate.pending_requests()
+                .await
+                .into_iter()
+                .map(PendingApprovalResponse::from)
+                .collect(),
+        ),
         None => Json(Vec::new()),
     }
 }
@@ -663,7 +757,10 @@ async fn approval_decision_handler(
     }
 
     let accepted = if decision.approved {
-        gate.approve(&request_id, &decision.argument_fingerprint)
+        // The immutable request ID identifies the exact pending call. Keep the
+        // fingerprint server-side instead of handing that capability to HTTP
+        // clients and asking them to send it back.
+        gate.approve(&request_id, &request.argument_fingerprint)
             .await
             .unwrap_or(false)
     } else {
@@ -697,17 +794,55 @@ pub async fn run_http_server(
     ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
 ) -> OdinResult<()> {
-    run_http_server_with_approvals(addr, task_handler, ws_manager, tool_registry, None).await
+    let state: Arc<GatewayState> = Arc::new(GatewayState {
+        task_handler,
+        ws_manager,
+        tool_registry: tool_registry.unwrap_or_else(|| Arc::new(build_tool_registry(None))),
+        ..Default::default()
+    });
+    let start_time = Arc::new(std::time::Instant::now());
+    state.mark_ready();
+    let app = build_router(state.clone(), start_time.clone());
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        odin_core::error::OdinError::Network(format!("Failed to bind to {addr}: {e}"))
+    })?;
+    tracing::info!("[GATEWAY] HTTP server listening on {addr}");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(graceful_shutdown_signal(state))
+        .await
+        .map_err(|e| odin_core::error::OdinError::Network(format!("Server error: {e}")))?;
+
+    Ok(())
 }
 
-/// Run the HTTP server with a responder for correlated tool-call approvals.
-pub async fn run_http_server_with_approvals(
-    addr: &str,
+/// Run separate public and operator-only management listeners.
+///
+/// Task submission stays on `public_addr`. Approval and orchestration APIs are
+/// mounted only on `management_addr` and require the supplied bearer token.
+pub async fn run_http_server_with_management(
+    public_addr: &str,
+    management_addr: &str,
+    operator_token: String,
     task_handler: Option<TaskHandlerFn>,
     ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
 ) -> OdinResult<()> {
+    if operator_token.is_empty() || !operator_token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(odin_core::error::OdinError::Config(
+            "the management API requires a non-empty visible-ASCII operator token".into(),
+        ));
+    }
+
+    if let Ok(addr) = management_addr.parse::<std::net::SocketAddr>()
+        && !addr.ip().is_loopback()
+    {
+        tracing::warn!(
+            "[GATEWAY] Management API is bound to non-loopback address {management_addr}"
+        );
+    }
+
     let state: Arc<GatewayState> = Arc::new(GatewayState {
         task_handler,
         ws_manager,
@@ -716,34 +851,61 @@ pub async fn run_http_server_with_approvals(
         ..Default::default()
     });
     let start_time = Arc::new(std::time::Instant::now());
+    let public_app = build_router(state.clone(), start_time.clone());
+    let management_app =
+        build_management_router(state.clone(), start_time, Arc::<str>::from(operator_token));
 
-    // Mark server as ready after startup
-    state.mark_ready();
-    tracing::info!("[GATEWAY] Server ready — all dependencies loaded");
-
-    let app = build_router(state.clone(), start_time.clone());
-
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
-        odin_core::error::OdinError::Network(format!("Failed to bind to {addr}: {e}"))
+    // Bind both sockets before announcing readiness, so a management bind
+    // failure cannot leave only the public task surface running.
+    let public_listener = TcpListener::bind(public_addr).await.map_err(|error| {
+        odin_core::error::OdinError::Network(format!(
+            "Failed to bind public HTTP listener to {public_addr}: {error}"
+        ))
+    })?;
+    let management_listener = TcpListener::bind(management_addr).await.map_err(|error| {
+        odin_core::error::OdinError::Network(format!(
+            "Failed to bind management HTTP listener to {management_addr}: {error}"
+        ))
     })?;
 
-    tracing::info!("[GATEWAY] HTTP server listening on {addr}");
+    state.mark_ready();
+    tracing::info!("[GATEWAY] Public HTTP server listening on {public_addr}");
+    tracing::info!("[GATEWAY] Authenticated management server listening on {management_addr}");
 
-    // Graceful shutdown: drain active tasks on SIGTERM/SIGINT
-    let shutdown_signal = graceful_shutdown_signal(state.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_state = state.clone();
+    let shutdown_task = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("[GATEWAY] Shutdown signal received");
+        let _ = shutdown_tx.send(true);
+        drain_active_tasks(shutdown_state).await;
+    });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
-        .map_err(|e| odin_core::error::OdinError::Network(format!("Server error: {e}")))?;
+    let public_server = axum::serve(public_listener, public_app)
+        .with_graceful_shutdown(shutdown_requested(shutdown_rx.clone()));
+    let management_server = axum::serve(management_listener, management_app)
+        .with_graceful_shutdown(shutdown_requested(shutdown_rx));
+    let (public_result, management_result) = tokio::join!(public_server, management_server);
+    let _ = shutdown_task.await;
 
+    public_result.map_err(|error| {
+        odin_core::error::OdinError::Network(format!("Public server error: {error}"))
+    })?;
+    management_result.map_err(|error| {
+        odin_core::error::OdinError::Network(format!("Management server error: {error}"))
+    })?;
     Ok(())
 }
 
 /// Signal handler for graceful shutdown: waits for SIGTERM/SIGINT, then
 /// drains active tasks before returning.
 async fn graceful_shutdown_signal(state: Arc<GatewayState>) {
-    // Wait for shutdown signal
+    wait_for_shutdown_signal().await;
+    tracing::info!("[GATEWAY] Shutdown signal received");
+    drain_active_tasks(state).await;
+}
+
+async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -765,10 +927,16 @@ async fn graceful_shutdown_signal(state: Arc<GatewayState>) {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
 
-    tracing::info!("[GATEWAY] Shutdown signal received, draining active tasks...");
+async fn shutdown_requested(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    if !*shutdown_rx.borrow() {
+        let _ = shutdown_rx.changed().await;
+    }
+}
 
-    // Wait for active tasks to complete (with 30s timeout)
+async fn drain_active_tasks(state: Arc<GatewayState>) {
+    tracing::info!("[GATEWAY] Draining active tasks...");
     let drain_start = std::time::Instant::now();
     loop {
         let active = state
@@ -1242,7 +1410,10 @@ async fn orchestrate_cancel_handler(
     }
 }
 
-/// Build the Axum router, useful for embedding in larger apps.
+/// Build the public Axum router, useful for embedding in larger apps.
+///
+/// This surface intentionally contains no approval or orchestration routes and
+/// does not grant cross-origin browser access.
 pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant>) -> Router {
     let mut router = Router::new()
         .route(
@@ -1251,14 +1422,6 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
                 let st = state.clone();
                 let t0 = start_time.clone();
                 move || health_handler(st.clone(), t0.clone())
-            }),
-        )
-        .route(
-            "/metrics",
-            get({
-                let st = state.clone();
-                let t0 = start_time.clone();
-                move || metrics_handler(st.clone(), t0.clone())
             }),
         )
         .route(
@@ -1295,6 +1458,36 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
             post({
                 let st = state.clone();
                 move || tools_doctor_handler(st.clone())
+            }),
+        );
+
+    if let Some(manager) = state.ws_manager.clone() {
+        let config = Arc::new(crate::ws::WsConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        router = router.route(
+            "/ws",
+            get(move |ws| crate::ws::ws_handler(ws, manager.clone(), config.clone())),
+        );
+    }
+
+    router.layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+/// Build the authenticated operator-only management router.
+pub fn build_management_router(
+    state: Arc<GatewayState>,
+    start_time: Arc<std::time::Instant>,
+    operator_token: Arc<str>,
+) -> Router {
+    Router::new()
+        .route(
+            "/metrics",
+            get({
+                let st = state.clone();
+                let t0 = start_time;
+                move || metrics_handler(st.clone(), t0.clone())
             }),
         )
         .route(
@@ -1345,22 +1538,14 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
                 let st = state.clone();
                 move |path| orchestrate_cancel_handler(axum::extract::State(st.clone()), path)
             }),
-        );
-
-    if let Some(manager) = state.ws_manager.clone() {
-        let config = Arc::new(crate::ws::WsConfig {
-            enabled: true,
-            ..Default::default()
-        });
-        router = router.route(
-            "/ws",
-            get(move |ws| crate::ws::ws_handler(ws, manager.clone(), config.clone())),
-        );
-    }
-
-    router
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(
+            OperatorAuth {
+                token: operator_token,
+            },
+            require_operator,
+        ))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1368,6 +1553,7 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[test]
     fn test_chat_request_serde() {
@@ -1432,6 +1618,13 @@ mod tests {
         let state = Arc::new(GatewayState::default());
         let start_time = Arc::new(std::time::Instant::now());
         let _router = build_router(state, start_time);
+    }
+
+    #[test]
+    fn management_listener_defaults_to_loopback() {
+        let config = odin_core::config::GatewayConfig::default();
+        let addr: std::net::SocketAddr = config.management_addr.parse().unwrap();
+        assert!(addr.ip().is_loopback());
     }
 
     #[tokio::test]
@@ -1552,10 +1745,7 @@ mod tests {
         let response = approval_decision_handler(
             state,
             Path(request.id.clone()),
-            Json(ApprovalDecisionRequest {
-                approved: true,
-                argument_fingerprint: request.argument_fingerprint,
-            }),
+            Json(ApprovalDecisionRequest { approved: true }),
         )
         .await
         .into_response();
@@ -1581,10 +1771,7 @@ mod tests {
         let response = approval_decision_handler(
             state,
             Path(request.id.clone()),
-            Json(ApprovalDecisionRequest {
-                approved: false,
-                argument_fingerprint: request.argument_fingerprint,
-            }),
+            Json(ApprovalDecisionRequest { approved: false }),
         )
         .await
         .into_response();
@@ -1593,6 +1780,236 @@ mod tests {
         assert_eq!(
             gate.get_request(&request.id).await.unwrap().status,
             odin_permissions::ApprovalStatus::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_client_cannot_obtain_or_use_operator_capabilities() {
+        const OPERATOR_TOKEN: &str = "test-operator-token";
+
+        let gate = Arc::new(odin_permissions::ApprovalGate::new(false, 30));
+        let handler_gate = gate.clone();
+        let handler: TaskHandlerFn = Arc::new(move |_request: ChatRequest| {
+            let gate = handler_gate.clone();
+            Box::pin(async move {
+                let request = gate
+                    .submit_request(
+                        uuid::Uuid::new_v4(),
+                        "shell".into(),
+                        r#"{"command":"touch /tmp/owned"}"#.into(),
+                    )
+                    .await;
+                Ok(ChatResponse {
+                    success: true,
+                    summary: format!("approval {} pending", request.id),
+                    iterations: 1,
+                    tool_calls: 1,
+                    duration_ms: 1,
+                    confidence: 1.0,
+                    error: None,
+                })
+            })
+        });
+        let state = Arc::new(GatewayState {
+            task_handler: Some(handler),
+            approval_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        state.mark_ready();
+        let start_time = Arc::new(std::time::Instant::now());
+        let public = build_router(state.clone(), start_time.clone());
+        let management =
+            build_management_router(state, start_time, Arc::<str>::from(OPERATOR_TOKEN));
+
+        let chat_response = public
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"task":"run a dangerous command"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+        let chat_body = axum::body::to_bytes(chat_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let pending = gate.pending_requests().await;
+        assert_eq!(pending.len(), 1);
+        let request = &pending[0];
+        assert!(
+            !chat_body
+                .as_ref()
+                .windows(OPERATOR_TOKEN.len())
+                .any(|part| part == OPERATOR_TOKEN.as_bytes())
+        );
+        assert!(
+            !chat_body
+                .as_ref()
+                .windows(request.argument_fingerprint.len())
+                .any(|part| part == request.argument_fingerprint.as_bytes())
+        );
+
+        let public_approval_response = public
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_approval_response.status(), StatusCode::NOT_FOUND);
+
+        let public_orchestration_response = public
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/orchestrate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"goal":"take control"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            public_orchestration_response.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let anonymous_list = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_list.status(), StatusCode::UNAUTHORIZED);
+        let anonymous_body = axum::body::to_bytes(anonymous_list.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !anonymous_body
+                .as_ref()
+                .windows(request.argument_fingerprint.len())
+                .any(|part| part == request.argument_fingerprint.as_bytes())
+        );
+
+        let anonymous_orchestration = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/orchestrate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"goal":"take control"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_orchestration.status(), StatusCode::UNAUTHORIZED);
+
+        let anonymous_decision = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/approvals/{}", request.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"approved":true,"argument_fingerprint":"{}"}}"#,
+                        request.argument_fingerprint
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_decision.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            gate.get_request(&request.id).await.unwrap().status,
+            odin_permissions::ApprovalStatus::Pending
+        );
+
+        let operator_list = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator_list.status(), StatusCode::OK);
+        let operator_body = axum::body::to_bytes(operator_list.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let operator_json: serde_json::Value = serde_json::from_slice(&operator_body).unwrap();
+        assert_eq!(operator_json[0]["id"], request.id);
+        assert!(operator_json[0].get("argument_fingerprint").is_none());
+
+        let operator_decision = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/approvals/{}", request.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+                    .body(Body::from(r#"{"approved":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator_decision.status(), StatusCode::OK);
+        assert_eq!(
+            gate.get_request(&request.id).await.unwrap().status,
+            odin_permissions::ApprovalStatus::Approved
+        );
+
+        let hostile_preflight = public
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/chat")
+                    .header(header::ORIGIN, "https://attacker.invalid")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !hostile_preflight
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+
+        let hostile_management_preflight = management
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/approvals")
+                    .header(header::ORIGIN, "https://attacker.invalid")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !hostile_management_preflight
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
         );
     }
 }

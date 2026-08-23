@@ -71,6 +71,9 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v5
       # Immutable upstream commit containing rustsec/audit-check's official Node 24 migration.

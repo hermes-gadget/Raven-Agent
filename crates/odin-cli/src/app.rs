@@ -221,8 +221,14 @@ async fn persist_orchestration_state(
     root_goal: &str,
     agent_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
+    let graph_root_id = composer
+        .get_graph(root_goal)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{root_goal}' not found"))?;
     if let Some((_, lifecycle)) = composer.get_agent(&agent_id) {
-        store.save_agent_lifecycle(lifecycle).await?;
+        store
+            .save_agent_lifecycle(&graph_root_id, lifecycle)
+            .await?;
     }
     if let Some(graph) = composer.get_graph(root_goal) {
         store.save_task_graph(graph).await?;
@@ -1122,7 +1128,7 @@ async fn run_orchestrated(
                         tracing::info!("[ORCH] Agent '{}' started", agent.label);
                         spawned.insert(agent.agent_id);
                         if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                            store.save_agent_lifecycle(lifecycle).await?;
+                            store.save_agent_lifecycle(&run_id_str, lifecycle).await?;
                         }
                         let graph = composer.get_graph(&root_goal).ok_or_else(|| {
                             anyhow::anyhow!("task graph missing for root goal during spawn")
@@ -1245,7 +1251,7 @@ async fn run_orchestrated(
                     Err(msg) => {
                         tracing::info!("[ORCH] Agent '{}' queued: {}", agent.label, msg);
                         if let Some((_, lifecycle)) = composer.get_agent(&agent.agent_id) {
-                            store.save_agent_lifecycle(lifecycle).await?;
+                            store.save_agent_lifecycle(&run_id_str, lifecycle).await?;
                         }
                         if let Some(graph) = composer.get_graph(&root_goal) {
                             store.save_task_graph(graph).await?;
@@ -1718,9 +1724,20 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
                         println!("🛑 Task graph '{}' cancelled (live control enqueued).", id);
                     }
                     // Also cancel any associated agent lifecycles
+                    let graph_root_id = store
+                        .list_task_graphs()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|graph| graph.run_id == id || graph.root_goal == id)
+                        .map(|graph| graph.run_id);
                     let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
                     for lc in &lifecycles {
-                        if lc.phase != "done" && lc.phase != "failed" && lc.phase != "cancelled" {
+                        if graph_root_id.as_deref() == lc.graph_root_id.as_deref()
+                            && lc.phase != "done"
+                            && lc.phase != "failed"
+                            && lc.phase != "cancelled"
+                        {
                             let _ = store
                                 .update_lifecycle_phase(&lc.agent_id, "cancelled")
                                 .await;
@@ -2014,6 +2031,36 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
 
     let config = load_config(config_path.as_deref())?;
     let addr = addr.unwrap_or_else(|| config.gateway.http_addr.clone());
+    let management_addr = config.gateway.management_addr.clone();
+    let (operator_token, generated_operator_token) = if let Some(token) = config
+        .gateway
+        .control_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    {
+        (token, false)
+    } else if let Some(env_name) = config.gateway.control_token_env.as_deref() {
+        let token = std::env::var(env_name).map_err(|_| {
+            anyhow::anyhow!(
+                "gateway.control_token_env names '{env_name}', but that environment variable is not set"
+            )
+        })?;
+        if token.trim().is_empty() {
+            anyhow::bail!(
+                "gateway.control_token_env names '{env_name}', but that environment variable is empty"
+            );
+        }
+        (token, false)
+    } else {
+        (
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            true,
+        )
+    };
     tracing::info!("[CLI] Starting HTTP server on {addr}");
 
     // Build the provider from config
@@ -2111,7 +2158,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
             odin_gateway::DiscordConfig {
                 enabled: true,
                 token,
-                admin_role: None,
+                admin_role: config.gateway.discord_admin_role.clone(),
+                admin_user_ids: config.gateway.discord_admin_user_ids.clone(),
+                guild_id: config.gateway.discord_guild_id,
+                allow_dms: config.gateway.discord_allow_dms,
                 command_prefix: None,
                 orchestration_db_path: Some(dirs_state_path("orchestration.db")),
             },
@@ -2125,6 +2175,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     } else {
         None
     };
+
+    // Public HTTP submissions share one process-lifetime security principal so
+    // repeated requests cannot reset per-principal tool rate limits.
+    let serve_principal_id = uuid::Uuid::new_v4();
 
     // Build the task handler closure
     let handler: odin_gateway::TaskHandlerFn = {
@@ -2144,6 +2198,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                 let start = std::time::Instant::now();
 
                 let engine = odin_loop::LoopEngine::new()
+                    .with_principal_id(serve_principal_id)
                     .with_provider(provider.clone())
                     .with_policy_engine(policy_engine.clone())
                     .with_max_iterations(req.max_iterations.unwrap_or(100))
@@ -2249,6 +2304,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     println!("║  Chat:     POST http://{addr:<15}/chat  ║", addr = addr);
     println!("║  WebSocket: ws://{addr:<15}/ws    ║", addr = addr);
     println!("╚══════════════════════════════════════════╝");
+    println!("Operator API: http://{management_addr}");
+    if generated_operator_token {
+        println!("Generated operator token (shown once): {operator_token}");
+    }
     println!();
 
     let orch_store = Arc::new(
@@ -2264,10 +2323,12 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
         .map_err(|error| anyhow::anyhow!("Failed to initialize orchestration store: {error}"))?;
     let ws_manager = Arc::new(
         odin_gateway::ws::WsConnectionManager::new(256)
-            .with_control(orch_store, config.gateway.control_token.clone()),
+            .with_control(orch_store, Some(operator_token.clone())),
     );
-    let server_result = odin_gateway::run_http_server_with_approvals(
+    let server_result = odin_gateway::run_http_server_with_management(
         &addr,
+        &management_addr,
+        operator_token,
         Some(handler),
         Some(ws_manager),
         Some(tool_registry),
@@ -3153,7 +3214,7 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                 let dangerous = if tool.is_dangerous() { " ⚠" } else { "  " };
                 let name = tool.name();
                 let truncated = if name.len() > 28 {
-                    format!("{}…", &name[..27])
+                    format!("{}…", name.chars().take(27).collect::<String>())
                 } else {
                     name.to_string()
                 };
@@ -3928,8 +3989,12 @@ mod tests {
             .save_task_graph(composer.get_graph(root_goal).unwrap())
             .await
             .unwrap();
+        let graph_root_id = composer.get_graph(root_goal).unwrap().id.to_string();
         let (_, initial_lifecycle) = composer.get_agent(&agent_id).unwrap();
-        store.save_agent_lifecycle(initial_lifecycle).await.unwrap();
+        store
+            .save_agent_lifecycle(&graph_root_id, initial_lifecycle)
+            .await
+            .unwrap();
         store
             .save_lock_snapshot(&serde_json::to_string(&composer.file_locks().snapshot()).unwrap())
             .await

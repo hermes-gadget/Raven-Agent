@@ -35,6 +35,8 @@ pub trait Phase: Send + Sync {
 
 /// Shared context passed to all phases.
 pub struct PhaseContext {
+    /// Stable principal for authorization, approvals, auditing, and rate limits.
+    pub principal_id: AgentId,
     pub confidence_scorer: ConfidenceScorer,
     pub decomposer: GoalDecomposer,
     pub summarizer: StateSummarizer,
@@ -394,8 +396,8 @@ impl Phase for ActPhase {
                                 };
 
                                 let tool_context = ToolContext {
-                                    agent_id: uuid::Uuid::default(),
-                                    session_id: uuid::Uuid::default(),
+                                    agent_id: context.principal_id,
+                                    session_id: state.task.id,
                                     working_dir: std::env::current_dir().unwrap_or_default(),
                                     env: std::collections::HashMap::new(),
                                 };
@@ -447,7 +449,7 @@ impl Phase for ActPhase {
                                     let needs_approval =
                                         matches!(action, Some(PermissionAction::AskUser))
                                             || (matches!(action, Some(PermissionAction::Allow))
-                                                && tool.requires_approval()
+                                                && tool.requires_approval_for(&args)
                                                 && policy.requires_approval());
                                     if error.is_none() && needs_approval {
                                         match policy
@@ -502,7 +504,7 @@ impl Phase for ActPhase {
                                     }
 
                                     error
-                                } else if tool.requires_approval() {
+                                } else if tool.requires_approval_for(&args) {
                                     Some(format!(
                                         "Tool '{tool_name}' requires approval, but no permission engine is configured"
                                     ))
@@ -1335,16 +1337,13 @@ fn parse_confidence_from_text(text: &str) -> Option<f64> {
 
     // Pattern 2: "XX%" anywhere in the text
     for (i, _) in lower.match_indices('%') {
-        let start = i.saturating_sub(4);
-        let before = &lower[start..i].trim();
-        if let Some(num_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
-            let num_str = before[num_start + 1..].trim();
-            if let Ok(val) = num_str.parse::<f64>()
-                && (0.0..=100.0).contains(&val)
-            {
-                return Some(val / 100.0);
-            }
-        } else if let Ok(val) = before.parse::<f64>()
+        let start = (i.saturating_sub(4)..i)
+            .rev()
+            .find(|offset| lower.is_char_boundary(*offset))
+            .unwrap_or(0);
+        let before = &lower[start..i];
+        if let Some(num_str) = trailing_ascii_number(before)
+            && let Ok(val) = num_str.parse::<f64>()
             && (0.0..=100.0).contains(&val)
         {
             return Some(val / 100.0);
@@ -1352,10 +1351,16 @@ fn parse_confidence_from_text(text: &str) -> Option<f64> {
     }
 
     // Pattern 3: Look for a decimal 0.X pattern near the end of text (last 200 chars)
-    let tail = if text.len() > 200 {
-        &text[text.len().saturating_sub(200)..]
+    let tail = if text.chars().count() > 200 {
+        text.chars()
+            .rev()
+            .take(200)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
     } else {
-        text
+        text.to_string()
     };
     for num_str in tail.split_whitespace() {
         // Strip trailing punctuation
@@ -1369,6 +1374,19 @@ fn parse_confidence_from_text(text: &str) -> Option<f64> {
     }
 
     None
+}
+
+fn trailing_ascii_number(value: &str) -> Option<&str> {
+    let value = value.trim_end();
+    let mut start = value.len();
+    for (offset, character) in value.char_indices().rev() {
+        if character.is_ascii_digit() || character == '.' {
+            start = offset;
+        } else {
+            break;
+        }
+    }
+    (start < value.len()).then(|| &value[start..])
 }
 
 /// Fallback heuristic confidence scoring for the CRITIQUE phase.

@@ -74,6 +74,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this specific invocation requires approval. Tools whose risk
+    /// depends on their arguments can override this while retaining a
+    /// conservative static classification for catalogs and diagnostics.
+    fn requires_approval_for(&self, _args: &serde_json::Value) -> bool {
+        self.requires_approval()
+    }
+
     /// Whether this tool is safe to run without sandboxing.
     fn is_safe(&self) -> bool {
         true

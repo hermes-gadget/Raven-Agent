@@ -16,6 +16,8 @@ use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
+use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
+
 // ── Shared Helper ───────────────────────────────────────────────────
 
 /// Run a `gh` subcommand and return a [`ToolResult`].
@@ -31,20 +33,21 @@ async fn run_gh(
 
     let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
 
-    let output = tokio::time::timeout(timeout, cmd.output())
+    let output = process::run_command(cmd, timeout, DEFAULT_MAX_OUTPUT_BYTES)
         .await
-        .map_err(|_| {
-            let joined = subcommand_args.join(" ");
-            OdinError::Timeout(format!(
-                "gh command timed out after {timeout_secs}s: gh {joined}"
-            ))
+        .map_err(|error| match error {
+            ProcessError::Timeout => {
+                let joined = subcommand_args.join(" ");
+                OdinError::Timeout(format!(
+                    "gh command timed out after {timeout_secs}s: gh {joined}"
+                ))
+            }
+            ProcessError::Io(error) => OdinError::Tool {
+                tool: tool_name.to_string(),
+                message: format!("Failed to execute gh command: {error}"),
+                source: Some(Box::new(error)),
+            },
         })?;
-
-    let output = output.map_err(|e| OdinError::Tool {
-        tool: tool_name.to_string(),
-        message: format!("Failed to execute gh command: {e}"),
-        source: Some(Box::new(e)),
-    })?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -58,6 +61,11 @@ async fn run_gh(
         }
         result_output.push_str("STDERR:\n");
         result_output.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        result_output.push_str(&format!(
+            "\n\n[TRUNCATED: output exceeded {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+        ));
     }
 
     let success = output.status.success();

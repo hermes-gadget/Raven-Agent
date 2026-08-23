@@ -4,7 +4,7 @@
 //! thread-safe (`Send + Sync`) and uses interior mutability so tools can
 //! be registered dynamically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use odin_core::error::{OdinError, OdinResult};
@@ -55,12 +55,27 @@ impl ToolRegistry {
     }
 
     /// Build a registry restricted to the supplied names.
-    /// An empty allow-list intentionally retains all tools for backward
-    /// compatibility with sub-agent configurations created before scoping.
+    ///
+    /// An empty allow-list is intentionally fail-closed and produces an empty
+    /// registry. Callers that need unrestricted access should pass the full
+    /// catalog explicitly.
     pub fn scoped(&self, allowed: &[String]) -> OdinResult<Self> {
+        let tools = self.all_tools();
+        let known: HashSet<&str> = tools.iter().map(|tool| tool.name()).collect();
+        let unknown: Vec<&str> = allowed
+            .iter()
+            .filter_map(|name| (!known.contains(name.as_str())).then_some(name.as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(OdinError::Validation(format!(
+                "Unknown tool names in allow-list: {}",
+                unknown.join(", ")
+            )));
+        }
+
         let scoped = Self::new();
-        for tool in self.all_tools() {
-            if allowed.is_empty() || allowed.iter().any(|name| name == tool.name()) {
+        for tool in tools {
+            if allowed.iter().any(|name| name == tool.name()) {
                 scoped.register_arc(tool)?;
             }
         }
@@ -301,5 +316,25 @@ mod tests {
         let scoped = registry.scoped(&["alpha".to_string()]).unwrap();
         assert!(scoped.is_registered("alpha"));
         assert!(!scoped.is_registered("beta"));
+    }
+
+    #[test]
+    fn test_empty_scoped_registry_is_fail_closed() {
+        let registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new("alpha"))).unwrap();
+
+        let scoped = registry.scoped(&[]).unwrap();
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn test_scoped_registry_rejects_unknown_tools() {
+        let registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new("alpha"))).unwrap();
+
+        let result = registry.scoped(&["missing".to_string()]);
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("missing"));
     }
 }

@@ -1,6 +1,7 @@
 //! Shell command execution tool with dangerous-command detection.
 
 use std::time::Instant;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -13,6 +14,9 @@ use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
+use crate::Sandbox;
+use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
+
 /// Arguments for the `shell` tool.
 #[derive(Debug, Deserialize)]
 struct ShellArgs {
@@ -24,7 +28,7 @@ struct ShellArgs {
     /// If true, validate the command without executing it.
     #[serde(default)]
     dry_run: bool,
-    /// Maximum output bytes before truncation (default: 1MB). Set to 0 to disable.
+    /// Maximum output bytes retained per stream (default: 1MB). Zero uses the default.
     #[serde(default = "default_max_output_bytes")]
     max_output_bytes: usize,
 }
@@ -34,7 +38,7 @@ fn default_timeout() -> u64 {
 }
 
 fn default_max_output_bytes() -> usize {
-    1024 * 1024 // 1MB
+    DEFAULT_MAX_OUTPUT_BYTES
 }
 
 /// Tool that executes shell commands.
@@ -46,6 +50,7 @@ pub struct Shell {
     name: String,
     description: String,
     dangerous_patterns: Vec<Regex>,
+    sandbox: Arc<Sandbox>,
 }
 
 impl Shell {
@@ -80,6 +85,15 @@ impl Shell {
             name: "shell".into(),
             description: "Execute a shell command and return its stdout and stderr. Use for running terminal commands, scripts, or any system interaction.".into(),
             dangerous_patterns: re_patterns,
+            sandbox: Arc::new(Sandbox::default()),
+        }
+    }
+
+    /// Create a shell tool constrained by the supplied filesystem boundary.
+    pub fn with_sandbox(sandbox: Arc<Sandbox>) -> Self {
+        Self {
+            sandbox,
+            ..Self::new()
         }
     }
 
@@ -89,6 +103,7 @@ impl Shell {
             name: "shell".into(),
             description: "Execute a shell command and return its stdout and stderr.".into(),
             dangerous_patterns: patterns,
+            sandbox: Arc::new(Sandbox::default()),
         }
     }
 
@@ -166,11 +181,11 @@ impl Tool for Shell {
         true
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
 
@@ -197,6 +212,18 @@ impl Tool for Shell {
             });
         }
 
+        let requested_workdir = parsed
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| context.working_dir.clone());
+        let requested_workdir = if requested_workdir.is_absolute() {
+            requested_workdir
+        } else {
+            context.working_dir.join(requested_workdir)
+        };
+        let workdir = self.sandbox.check_write(&requested_workdir)?;
+
         // Dry-run mode: validate without executing
         if parsed.dry_run {
             return Ok(ToolResult {
@@ -218,30 +245,29 @@ impl Tool for Shell {
         cmd.args(["-c", command_str]);
 
         // Set working directory if provided
-        if let Some(workdir) = &parsed.workdir {
-            cmd.current_dir(workdir);
-        } else {
-            cmd.current_dir(&_context.working_dir);
-        }
+        cmd.current_dir(workdir);
 
         // Set timeout
         let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
 
-        // Spawn and wait with timeout
-        let output = tokio::time::timeout(timeout, cmd.output())
+        let max_bytes = if parsed.max_output_bytes == 0 {
+            DEFAULT_MAX_OUTPUT_BYTES
+        } else {
+            parsed.max_output_bytes
+        };
+        let output = process::run_command(cmd, timeout, max_bytes)
             .await
-            .map_err(|_| {
-                OdinError::Timeout(format!(
+            .map_err(|error| match error {
+                ProcessError::Timeout => OdinError::Timeout(format!(
                     "Shell command timed out after {}s: {command_str}",
                     parsed.timeout_secs
-                ))
+                )),
+                ProcessError::Io(error) => OdinError::Tool {
+                    tool: self.name.clone(),
+                    message: format!("Failed to execute command: {error}"),
+                    source: Some(Box::new(error)),
+                },
             })?;
-
-        let output = output.map_err(|e| OdinError::Tool {
-            tool: self.name.clone(),
-            message: format!("Failed to execute command: {e}"),
-            source: Some(Box::new(e)),
-        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -258,12 +284,9 @@ impl Tool for Shell {
             result_output.push_str(&String::from_utf8_lossy(&output.stderr));
         }
 
-        // Apply output size cap if configured
-        let max_bytes = parsed.max_output_bytes;
-        if max_bytes > 0 && result_output.len() > max_bytes {
-            result_output.truncate(max_bytes);
+        if output.stdout_truncated || output.stderr_truncated {
             result_output.push_str(&format!(
-                "\n\n[TRUNCATED: output exceeded {max_bytes} bytes]"
+                "\n\n[TRUNCATED: output exceeded {max_bytes} bytes per stream]"
             ));
         }
 
@@ -290,13 +313,12 @@ impl Tool for Shell {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn test_context() -> ToolContext {
         ToolContext {
             agent_id: Default::default(),
             session_id: Default::default(),
-            working_dir: PathBuf::from("/tmp"),
+            working_dir: std::env::current_dir().unwrap(),
             env: HashMap::new(),
         }
     }
@@ -320,14 +342,38 @@ mod tests {
     #[tokio::test]
     async fn test_shell_pwd() {
         let shell = Shell::new();
+        let expected = std::env::current_dir().unwrap();
         let args = serde_json::json!({
             "command": "pwd",
-            "workdir": "/tmp",
+            "workdir": expected,
             "timeout_secs": 10
         });
         let result = shell.execute(args, &test_context()).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("/tmp"), "output: {}", result.output);
+        assert!(
+            result
+                .output
+                .contains(&std::env::current_dir().unwrap().display().to_string()),
+            "output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_workdir_outside_sandbox() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let shell = Shell::with_sandbox(Arc::new(Sandbox::new(odin_core::types::PathBoundary {
+            allowed_read: vec![allowed.path().display().to_string()],
+            allowed_write: vec![allowed.path().display().to_string()],
+            denied: vec![],
+        })));
+        let args = serde_json::json!({
+            "command": "pwd",
+            "workdir": outside.path(),
+            "timeout_secs": 10
+        });
+        assert!(shell.execute(args, &test_context()).await.is_err());
     }
 
     #[tokio::test]
@@ -362,6 +408,23 @@ mod tests {
         });
         let result = shell.execute(args, &test_context()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_timeout_kills_delayed_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("should-not-exist");
+        let command = format!("sleep 3; touch '{}'", marker.display());
+        let shell = Shell::new();
+        let args = serde_json::json!({
+            "command": command,
+            "timeout_secs": 1
+        });
+
+        assert!(shell.execute(args, &test_context()).await.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
