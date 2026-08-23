@@ -115,9 +115,15 @@ impl Provider for LocalProvider {
     }
 
     async fn health_check(&self) -> OdinResult<bool> {
-        match self.list_models().await {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        let response = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .send()
+            .await
+            .map_err(|error| {
+                OdinError::provider("local", format!("Health check failed: {error}"))
+            })?;
+
+        Ok(response.status().is_success())
     }
 }

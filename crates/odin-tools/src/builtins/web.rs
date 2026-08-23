@@ -534,7 +534,7 @@ struct WebSearchArgs {
 pub struct WebSearch {
     name: String,
     description: String,
-    client: Arc<reqwest::Client>,
+    egress_policy: EgressPolicy,
     /// Optional search URL template (use {query} as placeholder).
     search_url_template: Option<String>,
 }
@@ -545,7 +545,7 @@ impl WebSearch {
         Self {
             name: "web_search".into(),
             description: "Search the web for information. Performs a web search using the configured search provider and returns results as text.".into(),
-            client: Arc::new(http_client()),
+            egress_policy: EgressPolicy::default(),
             search_url_template: None,
         }
     }
@@ -559,6 +559,25 @@ impl WebSearch {
             search_url_template: Some(template.into()),
             ..Self::new()
         }
+    }
+
+    /// Allow exact hostnames to resolve to otherwise blocked address ranges.
+    pub fn with_allowed_hosts(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            egress_policy: EgressPolicy::with_allowed_hosts(hosts),
+            ..Self::new()
+        }
+    }
+
+    /// Allow exact hosts and explicit CIDR ranges for controlled private egress.
+    pub fn with_egress_allowlist(
+        hosts: impl IntoIterator<Item = String>,
+        cidrs: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            egress_policy: EgressPolicy::with_allowlist(hosts, cidrs)?,
+            ..Self::new()
+        })
     }
 
     /// Construct the JSON schema.
@@ -635,14 +654,17 @@ impl Tool for WebSearch {
         // If a search URL template is configured, use it
         if let Some(template) = &self.search_url_template {
             let encoded = urlencoding(query);
-            let url = template.replace("{query}", &encoded);
+            let url = parse_http_url(&template.replace("{query}", &encoded))
+                .map_err(OdinError::Validation)?;
 
-            let response = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| OdinError::Network(format!("Search request failed: {e}")))?;
+            let response = send_with_egress_policy(
+                reqwest::Method::GET,
+                url,
+                &reqwest::header::HeaderMap::new(),
+                None,
+                &self.egress_policy,
+            )
+            .await?;
 
             let status = response.status();
             let (body, truncated) = read_bounded_body(response)
@@ -1038,6 +1060,18 @@ mod tests {
         let result = search.execute(args, &test_context()).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_blocks_private_destination() {
+        let search = WebSearch::with_search_url("http://127.0.0.1:9/?q={query}");
+        let args = serde_json::json!({"query": "rust"});
+
+        let error = search
+            .execute(args, &test_context())
+            .await
+            .expect_err("private search destinations must be blocked");
+        assert!(matches!(error, OdinError::PermissionDenied(_)));
     }
 
     #[tokio::test]

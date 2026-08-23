@@ -62,7 +62,18 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         tools: &[ToolSchema],
         options: &CompletionOptions,
-    ) -> Value {
+    ) -> OdinResult<Value> {
+        if let Some(temperature) = options.temperature
+            && !temperature.is_finite()
+        {
+            return Err(OdinError::Validation("temperature must be finite".into()));
+        }
+        if let Some(top_p) = options.top_p
+            && !top_p.is_finite()
+        {
+            return Err(OdinError::Validation("top_p must be finite".into()));
+        }
+
         let messages_json: Vec<Value> = messages
             .iter()
             .map(|m| {
@@ -136,16 +147,22 @@ impl OpenAiCompatProvider {
         }
 
         if let Some(temp) = options.temperature {
-            body["temperature"] = Value::Number(serde_json::Number::from_f64(temp).unwrap());
+            body["temperature"] = Value::Number(
+                serde_json::Number::from_f64(temp)
+                    .ok_or_else(|| OdinError::Validation("temperature must be finite".into()))?,
+            );
         }
         if let Some(mt) = options.max_tokens {
             body["max_tokens"] = Value::Number(mt.into());
         }
         if let Some(tp) = options.top_p {
-            body["top_p"] = Value::Number(serde_json::Number::from_f64(tp).unwrap());
+            body["top_p"] = Value::Number(
+                serde_json::Number::from_f64(tp)
+                    .ok_or_else(|| OdinError::Validation("top_p must be finite".into()))?,
+            );
         }
 
-        body
+        Ok(body)
     }
 }
 
@@ -194,7 +211,7 @@ impl Provider for OpenAiCompatProvider {
         tools: &[ToolSchema],
         options: &CompletionOptions,
     ) -> OdinResult<ChatResponse> {
-        let body = self.build_request(model, messages, tools, options);
+        let body = self.build_request(model, messages, tools, options)?;
 
         let mut req = self.client.post(self.chat_url()).json(&body);
         if let Some(ref key) = self.api_key {
@@ -318,7 +335,9 @@ mod tests {
     fn test_build_request_basic() {
         let provider = OpenAiCompatProvider::new("test", "http://localhost:11434/v1", None);
         let messages = vec![Message::user("Hello")];
-        let body = provider.build_request("llama3", &messages, &[], &CompletionOptions::default());
+        let body = provider
+            .build_request("llama3", &messages, &[], &CompletionOptions::default())
+            .unwrap();
 
         assert_eq!(body["model"], "llama3");
         assert_eq!(body["messages"][0]["role"], "user");
@@ -336,14 +355,40 @@ mod tests {
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             },
         };
-        let body = provider.build_request(
-            "gpt-4",
-            &[Message::user("Use the tool")],
-            &[schema],
-            &CompletionOptions::default(),
-        );
+        let body = provider
+            .build_request(
+                "gpt-4",
+                &[Message::user("Use the tool")],
+                &[schema],
+                &CompletionOptions::default(),
+            )
+            .unwrap();
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tools"][0]["function"]["name"], "test_tool");
+    }
+
+    #[test]
+    fn test_build_request_rejects_non_finite_sampling_options() {
+        let provider = OpenAiCompatProvider::new("test", "http://localhost:11434/v1", None);
+        let messages = vec![Message::user("Hello")];
+
+        let mut options = CompletionOptions {
+            temperature: Some(f64::NAN),
+            ..Default::default()
+        };
+        assert!(
+            provider
+                .build_request("llama3", &messages, &[], &options)
+                .is_err()
+        );
+
+        options.temperature = Some(0.7);
+        options.top_p = Some(f64::INFINITY);
+        assert!(
+            provider
+                .build_request("llama3", &messages, &[], &options)
+                .is_err()
+        );
     }
 }
