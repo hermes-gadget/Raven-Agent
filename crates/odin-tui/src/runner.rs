@@ -506,6 +506,45 @@ async fn run_loop(
                 &event_tx,
             )
             .await?;
+
+            let dependency_failures = composer.fail_blocked_dependents(&goal_key);
+            let mut terminalized_stalled_work = !dependency_failures.is_empty();
+            for agent_id in dependency_failures {
+                terminal.insert(agent_id);
+                if let Some(agent) = exec_agents.iter().find(|agent| agent.agent_id == agent_id) {
+                    let summary = "blocked by a failed or cancelled dependency".to_string();
+                    let _ = event_tx.send(RunnerEvent::AgentFinished {
+                        agent_id: agent_id.to_string(),
+                        label: agent.label.clone(),
+                        success: false,
+                        summary,
+                    });
+                }
+            }
+
+            if join_set.is_empty() && terminal.len() < exec_agents.len() {
+                let stalled: Vec<_> = exec_agents
+                    .iter()
+                    .filter(|agent| !terminal.contains(&agent.agent_id))
+                    .map(|agent| (agent.agent_id, agent.label.clone()))
+                    .collect();
+                for (agent_id, label) in stalled {
+                    terminalized_stalled_work = true;
+                    let summary = "no runnable tasks remain; dependency or lock deadlock";
+                    composer.fail_agent(agent_id, summary);
+                    terminal.insert(agent_id);
+                    let _ = event_tx.send(RunnerEvent::AgentFinished {
+                        agent_id: agent_id.to_string(),
+                        label,
+                        success: false,
+                        summary: summary.into(),
+                    });
+                }
+            }
+
+            if terminalized_stalled_work {
+                persist_all(&store, &composer, &goal_key, None, terminal.iter().copied()).await?;
+            }
         }
 
         if terminal.len() == exec_agents.len() && join_set.is_empty() {
