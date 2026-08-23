@@ -1497,6 +1497,7 @@ fn build_audit_logger(config: &OdinConfig) -> odin_audit::AuditLoggerImpl {
         db_path: None,
         json_format: config.audit.json_format,
         buffer_size: 100,
+        history_size: 1_000,
         mask_secrets: true,
     })
 }

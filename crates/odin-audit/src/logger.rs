@@ -12,12 +12,21 @@ use odin_core::traits::AuditLogger;
 use odin_core::types::{AgentId, AuditEntry, AuditEventType, AuditResult, SessionId};
 use odin_permissions::redact::SecretRedactor;
 use serde::{Deserialize, Serialize};
-use std::io::{Seek, SeekFrom, Write};
+use std::collections::{HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const MAX_AUDIT_QUERY_LIMIT: usize = 1_000;
+const AUDIT_READ_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_AUDIT_LINE_BYTES: usize = 1024 * 1024;
+
+fn default_history_size() -> usize {
+    1_000
+}
 
 /// Configuration for the audit logger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +41,9 @@ pub struct AuditLoggerConfig {
     pub json_format: bool,
     /// Maximum entries to keep in memory before flushing.
     pub buffer_size: usize,
+    /// Maximum recent entries retained in memory for queries.
+    #[serde(default = "default_history_size")]
+    pub history_size: usize,
     /// Backward-compatible configuration field. Sensitive values are always
     /// redacted; setting this to false no longer disables that safety boundary.
     pub mask_secrets: bool,
@@ -45,6 +57,7 @@ impl Default for AuditLoggerConfig {
             db_path: None,
             json_format: true,
             buffer_size: 100,
+            history_size: default_history_size(),
             mask_secrets: true,
         }
     }
@@ -68,7 +81,7 @@ pub struct AuditLoggerImpl {
     /// In-memory buffer of recent entries.
     buffer: Arc<RwLock<Vec<BufferedEntry>>>,
     /// Entries retained for queries during this logger's lifetime.
-    history: Arc<RwLock<Vec<AuditEntry>>>,
+    history: Arc<RwLock<VecDeque<AuditEntry>>>,
     /// File handle (opened lazily).
     file: Arc<Mutex<Option<std::fs::File>>>,
     /// Serializes flushes so a failed write can be retried without overlap.
@@ -108,7 +121,7 @@ impl AuditLoggerImpl {
         Self {
             config,
             buffer: Arc::new(RwLock::new(Vec::new())),
-            history: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(VecDeque::new())),
             file: Arc::new(Mutex::new(file)),
             flush_lock: Arc::new(Mutex::new(())),
             redactor,
@@ -239,16 +252,46 @@ impl AuditLoggerImpl {
         Ok(encoded)
     }
 
-    async fn persisted_entries(&self) -> OdinResult<Vec<AuditEntry>> {
-        if !self.config.json_format {
+    async fn persisted_entries(
+        &self,
+        agent_id: Option<AgentId>,
+        session_id: Option<SessionId>,
+        event_type: Option<AuditEventType>,
+        limit: usize,
+        excluded_ids: HashSet<Uuid>,
+    ) -> OdinResult<Vec<AuditEntry>> {
+        if !self.config.json_format || limit == 0 {
             return Ok(Vec::new());
         }
         let Some(path) = self.config.file_path.as_ref() else {
             return Ok(Vec::new());
         };
 
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(content) => content,
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::read_persisted_reverse(
+                &path,
+                agent_id,
+                session_id,
+                event_type,
+                limit,
+                &excluded_ids,
+            )
+        })
+        .await
+        .map_err(|error| OdinError::Internal(format!("audit log reader task failed: {error}")))?
+    }
+
+    fn read_persisted_reverse(
+        path: &Path,
+        agent_id: Option<AgentId>,
+        session_id: Option<SessionId>,
+        event_type: Option<AuditEventType>,
+        limit: usize,
+        excluded_ids: &HashSet<Uuid>,
+    ) -> OdinResult<Vec<AuditEntry>> {
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(OdinError::Io(std::io::Error::other(format!(
@@ -257,17 +300,96 @@ impl AuditLoggerImpl {
                 ))));
             }
         };
+        let mut position = file.metadata().map_err(OdinError::Io)?.len();
+        let mut carry = Vec::new();
+        let mut results = Vec::with_capacity(limit);
 
-        content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).map_err(OdinError::Serialization))
-            .collect()
+        while position > 0 && results.len() < limit {
+            let read_size = position.min(AUDIT_READ_CHUNK_BYTES as u64) as usize;
+            position -= read_size as u64;
+            file.seek(SeekFrom::Start(position))
+                .map_err(OdinError::Io)?;
+            let mut chunk = vec![0; read_size];
+            file.read_exact(&mut chunk).map_err(OdinError::Io)?;
+            chunk.extend_from_slice(&carry);
+
+            let mut line_end = chunk.len();
+            while results.len() < limit {
+                let Some(newline) = chunk[..line_end].iter().rposition(|byte| *byte == b'\n')
+                else {
+                    break;
+                };
+                Self::push_persisted_match(
+                    &chunk[newline + 1..line_end],
+                    agent_id,
+                    session_id,
+                    event_type,
+                    excluded_ids,
+                    &mut results,
+                )?;
+                line_end = newline;
+            }
+
+            carry = chunk[..line_end].to_vec();
+            if carry.len() > MAX_AUDIT_LINE_BYTES {
+                return Err(OdinError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "audit log contains an oversized entry",
+                )));
+            }
+        }
+
+        if position == 0 && results.len() < limit && !carry.is_empty() {
+            Self::push_persisted_match(
+                &carry,
+                agent_id,
+                session_id,
+                event_type,
+                excluded_ids,
+                &mut results,
+            )?;
+        }
+        Ok(results)
+    }
+
+    fn push_persisted_match(
+        line: &[u8],
+        agent_id: Option<AgentId>,
+        session_id: Option<SessionId>,
+        event_type: Option<AuditEventType>,
+        excluded_ids: &HashSet<Uuid>,
+        results: &mut Vec<AuditEntry>,
+    ) -> OdinResult<()> {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        if line.len() > MAX_AUDIT_LINE_BYTES {
+            return Err(OdinError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit log contains an oversized entry",
+            )));
+        }
+        let entry: AuditEntry = serde_json::from_slice(line).map_err(OdinError::Serialization)?;
+        if excluded_ids.contains(&entry.id)
+            || agent_id.is_some_and(|id| entry.agent_id != id)
+            || session_id.is_some_and(|id| entry.session_id != id)
+            || event_type.is_some_and(|kind| entry.event_type != kind)
+        {
+            return Ok(());
+        }
+        results.push(entry);
+        Ok(())
     }
 
     /// Add an audit entry to the in-memory buffer.
     async fn buffer_entry(&self, entry: AuditEntry) -> OdinResult<()> {
-        self.history.write().await.push(entry.clone());
+        if self.config.history_size > 0 {
+            let mut history = self.history.write().await;
+            history.push_back(entry.clone());
+            while history.len() > self.config.history_size {
+                history.pop_front();
+            }
+        }
         let buffered = BufferedEntry { entry };
 
         {
@@ -322,20 +444,16 @@ impl AuditLogger for AuditLoggerImpl {
         event_type: Option<AuditEventType>,
         limit: usize,
     ) -> OdinResult<Vec<AuditEntry>> {
+        let limit = limit.min(MAX_AUDIT_QUERY_LIMIT);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let _file_guard = self.file.lock().await;
-        let mut entries = self.persisted_entries().await?;
         let history = self.history.read().await;
-        let persisted_ids: std::collections::HashSet<_> =
-            entries.iter().map(|entry| entry.id).collect();
-        entries.extend(
-            history
-                .iter()
-                .filter(|entry| !persisted_ids.contains(&entry.id))
-                .cloned(),
-        );
-
-        let results: Vec<AuditEntry> = entries
+        let history_ids: HashSet<_> = history.iter().map(|entry| entry.id).collect();
+        let mut results: Vec<AuditEntry> = history
             .iter()
+            .rev()
             .filter(|entry| {
                 let mut matches = true;
                 if let Some(ref aid) = agent_id {
@@ -349,28 +467,45 @@ impl AuditLogger for AuditLoggerImpl {
                 }
                 matches
             })
-            .rev()
             .take(limit)
             .cloned()
             .collect();
+        drop(history);
+
+        if results.len() < limit {
+            results.extend(
+                self.persisted_entries(
+                    agent_id,
+                    session_id,
+                    event_type,
+                    limit - results.len(),
+                    history_ids,
+                )
+                .await?,
+            );
+        }
 
         Ok(results)
     }
 
     /// Get the most recent entries.
     async fn recent(&self, limit: usize) -> OdinResult<Vec<AuditEntry>> {
+        let limit = limit.min(MAX_AUDIT_QUERY_LIMIT);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let _file_guard = self.file.lock().await;
-        let mut entries = self.persisted_entries().await?;
         let history = self.history.read().await;
-        let persisted_ids: std::collections::HashSet<_> =
-            entries.iter().map(|entry| entry.id).collect();
-        entries.extend(
-            history
-                .iter()
-                .filter(|entry| !persisted_ids.contains(&entry.id))
-                .cloned(),
-        );
-        let results: Vec<AuditEntry> = entries.iter().rev().take(limit).cloned().collect();
+        let history_ids: HashSet<_> = history.iter().map(|entry| entry.id).collect();
+        let mut results: Vec<AuditEntry> = history.iter().rev().take(limit).cloned().collect();
+        drop(history);
+
+        if results.len() < limit {
+            results.extend(
+                self.persisted_entries(None, None, None, limit - results.len(), history_ids)
+                    .await?,
+            );
+        }
 
         Ok(results)
     }
@@ -628,6 +763,40 @@ mod tests {
 
         let size = logger.buffer_size().await;
         assert!(size <= 10); // buffer_size * 2
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_and_persisted_queries_read_from_the_tail() {
+        let log_path = std::env::temp_dir().join(format!("audit_tail_{}.jsonl", Uuid::new_v4()));
+        let logger = AuditLoggerImpl::new(AuditLoggerConfig {
+            file_path: Some(log_path.clone()),
+            buffer_size: 1,
+            history_size: 2,
+            ..AuditLoggerConfig::default()
+        });
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let mut entry = make_entry(agent_id, session_id, AuditEventType::Decision);
+            entry.action = format!("entry-{index}");
+            ids.push(entry.id);
+            logger.log(entry).await.unwrap();
+        }
+
+        assert_eq!(logger.history.read().await.len(), 2);
+        let recent = logger.recent(4).await.unwrap();
+        assert_eq!(
+            recent.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            ids.iter().rev().take(4).copied().collect::<Vec<_>>()
+        );
+        let queried = logger
+            .query(Some(agent_id), None, Some(AuditEventType::Decision), 4)
+            .await
+            .unwrap();
+        assert_eq!(queried.len(), 4);
+
+        let _ = std::fs::remove_file(log_path);
     }
 
     #[tokio::test]
