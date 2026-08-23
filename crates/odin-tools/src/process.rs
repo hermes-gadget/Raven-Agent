@@ -82,6 +82,42 @@ async fn terminate(child: &mut Child) {
     let _ = child.wait().await;
 }
 
+/// Kills the entire child process group if the command future is cancelled.
+/// `Child::kill_on_drop` only guarantees termination of the direct child.
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(child: &Child) -> Self {
+        Self {
+            #[cfg(unix)]
+            pid: child.id(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pid = None;
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // The command is the group leader (see configure_process_group).
+            // A synchronous signal is required because Drop cannot await.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Spawn a command, drain both output pipes, and enforce a hard timeout and
 /// per-stream retention limit.
 pub(crate) async fn run_command(
@@ -93,6 +129,7 @@ pub(crate) async fn run_command(
     command.kill_on_drop(true);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    let mut process_group_guard = ProcessGroupGuard::new(&child);
     let stdout = child
         .stdout
         .take()
@@ -121,11 +158,59 @@ pub(crate) async fn run_command(
     })
     .await;
 
-    match result {
-        Ok(output) => output.map_err(ProcessError::Io),
+    let output = match result {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            terminate(&mut child).await;
+            Err(ProcessError::Io(error))
+        }
         Err(_) => {
             terminate(&mut child).await;
             Err(ProcessError::Timeout)
         }
+    };
+    process_group_guard.disarm();
+    output
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_kills_the_child_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("child.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let handle = tokio::spawn(run_command(command, Duration::from_secs(60), 1024));
+
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_path).await
+                    && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child pid should be written");
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child process should be killed on cancellation");
     }
 }
