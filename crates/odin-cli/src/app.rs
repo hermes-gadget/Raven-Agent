@@ -742,7 +742,6 @@ async fn cmd_run(
     load_mcp_tools(&tool_registry, &config).await;
 
     let memory = Arc::new(build_memory_store(&config)?);
-    let audit_logger = Arc::new(build_audit_logger(&config));
     let reliability_tracker = build_reliability_tracker(&config)?;
     tracing::info!("[CLI] Memory store and audit logger initialized");
 
@@ -2118,8 +2117,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     let memory = Arc::new(build_memory_store(&config)?);
     tracing::info!("[CLI/serve] Memory store initialized");
 
-    // Wire audit logger
-    let audit_logger = Arc::new(build_audit_logger(&config));
+    // Reuse the policy engine's logger so the audit sink has one writer.
     let reliability_tracker = build_reliability_tracker(&config)?;
     tracing::info!("[CLI/serve] Audit logger initialized");
 
