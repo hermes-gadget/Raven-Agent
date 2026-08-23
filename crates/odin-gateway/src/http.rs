@@ -25,6 +25,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing;
 
+const DEFAULT_CHAT_MAX_ITERATIONS: u32 = 100;
+const MAX_CHAT_TASK_BYTES: usize = 16 * 1024;
+const MAX_CHAT_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_CHAT_TASKS: usize = 16;
+const CHAT_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A boxed async handler for processing chat/task requests.
 pub type TaskHandlerFn = Arc<
     dyn Fn(ChatRequest) -> Pin<Box<dyn Future<Output = OdinResult<ChatResponse>> + Send>>
@@ -41,6 +47,8 @@ pub struct GatewayState {
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// Number of active tasks currently being processed.
     pub active_tasks: Arc<std::sync::atomic::AtomicU64>,
+    /// Admission limit for concurrently executing public chat tasks.
+    pub chat_admission: Arc<tokio::sync::Semaphore>,
     /// Total tool calls since startup.
     pub total_tool_calls: Arc<std::sync::atomic::AtomicU64>,
     /// Total tool call errors since startup.
@@ -61,6 +69,7 @@ impl Default for GatewayState {
             task_handler: None,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_tasks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            chat_admission: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHAT_TASKS)),
             total_tool_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_tool_errors: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -68,6 +77,24 @@ impl Default for GatewayState {
             tool_registry: Arc::new(build_tool_registry(None)),
             approval_gate: None,
         }
+    }
+}
+
+struct ActiveTaskGuard {
+    active_tasks: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ActiveTaskGuard {
+    fn new(active_tasks: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        active_tasks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { active_tasks }
+    }
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        self.active_tasks
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -360,38 +387,75 @@ async fn metrics_handler(
 /// Chat/task endpoint.
 async fn chat_handler(
     state: Arc<GatewayState>,
-    start_time: Arc<std::time::Instant>,
-    Json(request): Json<ChatRequest>,
+    _start_time: Arc<std::time::Instant>,
+    Json(mut request): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    match &state.task_handler {
-        Some(handler) => match handler(request).await {
-            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-            Err(e) => {
-                let error_resp = ChatResponse {
-                    success: false,
-                    summary: format!("Task execution failed: {e}"),
-                    iterations: 0,
-                    tool_calls: 0,
-                    duration_ms: start_time.elapsed().as_millis() as u64,
-                    confidence: 0.0,
-                    error: Some(e.to_string()),
-                };
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(error_resp)).into_response()
-            }
-        },
-        None => {
-            let error_resp = ChatResponse {
-                success: false,
-                summary: "No task handler configured".into(),
-                iterations: 0,
-                tool_calls: 0,
-                duration_ms: 0,
-                confidence: 0.0,
-                error: Some("No task handler configured".into()),
-            };
-            (StatusCode::SERVICE_UNAVAILABLE, Json(error_resp)).into_response()
-        }
+    let request_start = std::time::Instant::now();
+    let max_iterations = request
+        .max_iterations
+        .unwrap_or(DEFAULT_CHAT_MAX_ITERATIONS);
+    if request.task.trim().is_empty()
+        || request.task.len() > MAX_CHAT_TASK_BYTES
+        || request
+            .context
+            .as_ref()
+            .is_some_and(|context| context.len() > MAX_CHAT_CONTEXT_BYTES)
+        || !(1..=DEFAULT_CHAT_MAX_ITERATIONS).contains(&max_iterations)
+    {
+        return chat_error_response(
+            StatusCode::BAD_REQUEST,
+            "task/context size or max_iterations is outside the accepted range",
+            request_start,
+        );
     }
+    request.max_iterations = Some(max_iterations);
+
+    let Ok(_admission_permit) = state.chat_admission.clone().try_acquire_owned() else {
+        return chat_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many chat tasks are already running",
+            request_start,
+        );
+    };
+    let _active_task = ActiveTaskGuard::new(state.active_tasks.clone());
+
+    match &state.task_handler {
+        Some(handler) => match tokio::time::timeout(CHAT_TASK_TIMEOUT, handler(request)).await {
+            Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+            Ok(Err(error)) => chat_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Task execution failed: {error}"),
+                request_start,
+            ),
+            Err(_) => chat_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "task execution exceeded the gateway deadline",
+                request_start,
+            ),
+        },
+        None => chat_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No task handler configured",
+            request_start,
+        ),
+    }
+}
+
+fn chat_error_response(
+    status: StatusCode,
+    message: &str,
+    request_start: std::time::Instant,
+) -> Response {
+    let error_resp = ChatResponse {
+        success: false,
+        summary: message.into(),
+        iterations: 0,
+        tool_calls: 0,
+        duration_ms: request_start.elapsed().as_millis() as u64,
+        confidence: 0.0,
+        error: Some(message.into()),
+    };
+    (status, Json(error_resp)).into_response()
 }
 
 /// Build a tool registry with all built-in tools, filtered by
@@ -1611,6 +1675,20 @@ mod tests {
     fn test_gateway_state_default() {
         let state = GatewayState::default();
         assert!(state.task_handler.is_none());
+        assert_eq!(
+            state.chat_admission.available_permits(),
+            MAX_CONCURRENT_CHAT_TASKS
+        );
+    }
+
+    #[test]
+    fn active_task_guard_tracks_lifetime() {
+        let active_tasks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let _guard = ActiveTaskGuard::new(active_tasks.clone());
+            assert_eq!(active_tasks.load(std::sync::atomic::Ordering::Acquire), 1);
+        }
+        assert_eq!(active_tasks.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1653,6 +1731,63 @@ mod tests {
         let response = handler(request).await.unwrap();
         assert!(response.success);
         assert_eq!(response.summary, "Handled: hello");
+    }
+
+    #[tokio::test]
+    async fn public_chat_rejects_unbounded_work() {
+        let handler: TaskHandlerFn = Arc::new(|_request: ChatRequest| {
+            Box::pin(async move { panic!("invalid requests must not reach the task handler") })
+        });
+        let state = Arc::new(GatewayState {
+            task_handler: Some(handler),
+            ..Default::default()
+        });
+        let router = build_router(state, Arc::new(std::time::Instant::now()));
+
+        for body in [
+            serde_json::json!({"task": "hello", "max_iterations": 0}),
+            serde_json::json!({"task": "hello", "max_iterations": 101}),
+            serde_json::json!({"task": "x".repeat(MAX_CHAT_TASK_BYTES + 1)}),
+            serde_json::json!({"task": "hello", "context": "x".repeat(MAX_CHAT_CONTEXT_BYTES + 1)}),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/chat")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_chat_rejects_when_admission_is_full() {
+        let state = Arc::new(GatewayState {
+            task_handler: Some(Arc::new(|_request: ChatRequest| {
+                Box::pin(async move { panic!("rejected requests must not reach the handler") })
+            })),
+            chat_admission: Arc::new(tokio::sync::Semaphore::new(0)),
+            ..Default::default()
+        });
+        let response = build_router(state, Arc::new(std::time::Instant::now()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"task":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
