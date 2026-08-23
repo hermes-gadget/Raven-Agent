@@ -50,6 +50,8 @@ pub struct Job {
     pub task_goal: Option<String>,
     /// Maximum iterations when executing via runtime.
     pub max_iterations: u32,
+    /// Optional UUID or exact name of the runtime agent that executes this job.
+    pub agent_selector: Option<String>,
     /// When this job was created.
     pub created_at: DateTime<Utc>,
 }
@@ -73,6 +75,7 @@ impl Job {
             running_count: 0,
             task_goal: None,
             max_iterations: 100,
+            agent_selector: None,
             created_at: now,
         }
     }
@@ -109,6 +112,7 @@ impl fmt::Debug for Job {
             .field("run_count", &self.run_count)
             .field("task_goal", &self.task_goal)
             .field("max_iterations", &self.max_iterations)
+            .field("agent_selector", &self.agent_selector)
             .finish()
     }
 }

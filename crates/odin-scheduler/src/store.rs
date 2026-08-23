@@ -70,6 +70,9 @@ pub struct SchedulerJobConfig {
     /// Maximum iterations for the agent loop.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Optional UUID or exact name of the runtime agent for this job.
+    #[serde(default)]
+    pub agent_selector: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -82,12 +85,19 @@ impl SchedulerJobConfig {
         Self {
             task_goal: task_goal.into(),
             max_iterations: 100,
+            agent_selector: None,
         }
     }
 
     /// Set the maximum iterations for this job.
     pub fn with_max_iterations(mut self, max: u32) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Select the runtime agent by UUID or exact name.
+    pub fn with_agent_selector(mut self, selector: impl Into<String>) -> Self {
+        self.agent_selector = Some(selector.into());
         self
     }
 }
@@ -110,6 +120,9 @@ pub struct PersistedJob {
     pub task_goal: Option<String>,
     /// Max iterations when executing via runtime.
     pub max_iterations: u32,
+    /// Optional UUID or exact name of the runtime agent.
+    #[serde(default)]
+    pub agent_selector: Option<String>,
     /// Whether the job is enabled.
     pub enabled: bool,
     /// Timestamp of the last run.
@@ -131,6 +144,7 @@ impl PersistedJob {
             cron_expr: job.schedule.expression.clone(),
             task_goal: job.task_goal.clone(),
             max_iterations: job.max_iterations,
+            agent_selector: job.agent_selector.clone(),
             enabled: job.enabled,
             last_run: job.last_run,
             next_run: job.next_run,
@@ -174,6 +188,7 @@ impl PersistedJob {
             running_count: 0,
             task_goal: self.task_goal,
             max_iterations: self.max_iterations,
+            agent_selector: self.agent_selector,
             created_at: self.created_at,
         };
         // Ensure next_run is recalculated if missing
@@ -283,6 +298,7 @@ impl SqliteSchedulerStore {
                 name        TEXT    NOT NULL,
                 cron_expr   TEXT    NOT NULL,
                 task_goal   TEXT,
+                agent_selector TEXT,
                 max_iterations INTEGER NOT NULL DEFAULT 100,
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 last_run    TEXT,
@@ -304,6 +320,24 @@ impl SqliteSchedulerStore {
         )
         .map_err(|e| OdinError::Database(format!("Failed to create scheduler_jobs table: {e}")))?;
 
+        let has_agent_selector = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('scheduler_jobs') WHERE name = 'agent_selector'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to inspect scheduler_jobs: {e}")))?
+            > 0;
+        if !has_agent_selector {
+            conn.execute(
+                "ALTER TABLE scheduler_jobs ADD COLUMN agent_selector TEXT",
+                [],
+            )
+            .map_err(|e| {
+                OdinError::Database(format!("Failed to migrate scheduler agent selector: {e}"))
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -315,13 +349,14 @@ impl SchedulerStore for SqliteSchedulerStore {
 
         conn.execute(
             "INSERT INTO scheduler_jobs
-                (id, name, cron_expr, task_goal, max_iterations, enabled,
+                (id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
                  last_run, next_run, run_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 name           = excluded.name,
                 cron_expr      = excluded.cron_expr,
                 task_goal      = excluded.task_goal,
+                agent_selector = excluded.agent_selector,
                 max_iterations = excluded.max_iterations,
                 enabled        = excluded.enabled,
                 last_run       = excluded.last_run,
@@ -332,6 +367,7 @@ impl SchedulerStore for SqliteSchedulerStore {
                 job.name,
                 job.cron_expr,
                 job.task_goal,
+                job.agent_selector,
                 job.max_iterations,
                 job.enabled as i32,
                 job.last_run.map(|t| t.to_rfc3339()),
@@ -350,7 +386,7 @@ impl SchedulerStore for SqliteSchedulerStore {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, cron_expr, task_goal, max_iterations, enabled,
+                "SELECT id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
                         last_run, next_run, run_count, created_at
                  FROM scheduler_jobs
                  ORDER BY created_at ASC",
@@ -360,20 +396,21 @@ impl SchedulerStore for SqliteSchedulerStore {
         let rows = stmt
             .query_map([], |row| {
                 let id_str: String = row.get(0)?;
-                let last_run_str: Option<String> = row.get(6)?;
-                let next_run_str: Option<String> = row.get(7)?;
-                let created_at_str: String = row.get(9)?;
+                let last_run_str: Option<String> = row.get(7)?;
+                let next_run_str: Option<String> = row.get(8)?;
+                let created_at_str: String = row.get(10)?;
 
                 Ok(PersistedJobRaw {
                     id: id_str,
                     name: row.get(1)?,
                     cron_expr: row.get(2)?,
                     task_goal: row.get(3)?,
-                    max_iterations: row.get::<_, i64>(4)? as u32,
-                    enabled: row.get::<_, i64>(5)? != 0,
+                    agent_selector: row.get(4)?,
+                    max_iterations: row.get::<_, i64>(5)? as u32,
+                    enabled: row.get::<_, i64>(6)? != 0,
                     last_run: last_run_str,
                     next_run: next_run_str,
-                    run_count: row.get::<_, i64>(8)? as u64,
+                    run_count: row.get::<_, i64>(9)? as u64,
                     created_at: created_at_str,
                 })
             })
@@ -409,6 +446,7 @@ impl SchedulerStore for SqliteSchedulerStore {
                 name: raw.name,
                 cron_expr: raw.cron_expr,
                 task_goal: raw.task_goal,
+                agent_selector: raw.agent_selector,
                 max_iterations: raw.max_iterations,
                 enabled: raw.enabled,
                 last_run,
@@ -570,6 +608,7 @@ struct PersistedJobRaw {
     name: String,
     cron_expr: String,
     task_goal: Option<String>,
+    agent_selector: Option<String>,
     max_iterations: u32,
     enabled: bool,
     last_run: Option<String>,
@@ -591,6 +630,7 @@ mod tests {
             cron_expr: cron_expr.to_string(),
             task_goal: Some(format!("Run {}", name)),
             max_iterations: 50,
+            agent_selector: Some("scheduler-agent".into()),
             enabled: true,
             last_run: None,
             next_run: Some(Utc::now() + chrono::TimeDelta::hours(1)),
@@ -612,7 +652,33 @@ mod tests {
         assert_eq!(loaded[0].cron_expr, "0 * * * *");
         assert_eq!(loaded[0].task_goal.as_deref(), Some("Run test-job"));
         assert_eq!(loaded[0].max_iterations, 50);
+        assert_eq!(loaded[0].agent_selector.as_deref(), Some("scheduler-agent"));
         assert!(loaded[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn existing_scheduler_table_is_migrated_for_agent_selectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scheduler.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE scheduler_jobs (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, cron_expr TEXT NOT NULL,
+                    task_goal TEXT, max_iterations INTEGER NOT NULL DEFAULT 100,
+                    enabled INTEGER NOT NULL DEFAULT 1, last_run TEXT, next_run TEXT,
+                    run_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteSchedulerStore::new(path.to_str().unwrap()).unwrap();
+        let job = make_persisted_job("migrated", "0 * * * *");
+        store.save_job(&job).await.unwrap();
+        let loaded = store.load_all_jobs().await.unwrap();
+
+        assert_eq!(loaded[0].agent_selector, job.agent_selector);
     }
 
     #[tokio::test]

@@ -218,6 +218,7 @@ impl Scheduler {
         let mut job = Job::new(name, sched.clone(), crate::job::noop_task());
         job.task_goal = Some(config.task_goal);
         job.max_iterations = config.max_iterations;
+        job.agent_selector = config.agent_selector;
         let id = job.id;
 
         // Persist to store if configured
@@ -315,17 +316,20 @@ impl Scheduler {
             }
             let runtime_agent =
                 if let (Some(runtime), Some(_)) = (&self.runtime, &job_snapshot.task_goal) {
-                    runtime.list_agents().first().map(|agent| agent.id)
+                    Some(
+                        runtime
+                            .resolve_agent(job_snapshot.agent_selector.as_deref())
+                            .map_err(|error| {
+                                OdinError::Config(format!(
+                                    "Scheduled job '{}' cannot resolve its agent: {error}",
+                                    job_snapshot.name
+                                ))
+                            })?
+                            .id,
+                    )
                 } else {
                     None
                 };
-            if self.runtime.is_some() && job_snapshot.task_goal.is_some() && runtime_agent.is_none()
-            {
-                return Err(OdinError::Internal(format!(
-                    "Scheduled job '{}' cannot run because the runtime has no registered agent",
-                    job_snapshot.name
-                )));
-            }
 
             // Recheck due state and reserve the execution under one write lock.
             let Some((job, task_id)) = reserve_due_job(&self.jobs, job_id, Utc::now()).await else {
@@ -496,13 +500,15 @@ impl Scheduler {
                     let task_goal = job_snapshot.task_goal.clone();
 
                     let runtime_dispatch = match (runtime.as_ref(), task_goal.as_ref()) {
-                        (Some(runtime), Some(goal)) => match runtime.list_agents().first() {
-                            Some(agent) => Some((runtime.clone(), agent.id, goal.clone())),
-                            None => {
-                                warn!(job_id = %job_id, "Scheduled job skipped: runtime has no registered agent");
-                                continue;
+                        (Some(runtime), Some(goal)) => {
+                            match runtime.resolve_agent(job_snapshot.agent_selector.as_deref()) {
+                                Ok(agent) => Some((runtime.clone(), agent.id, goal.clone())),
+                                Err(error) => {
+                                    warn!(job_id = %job_id, %error, "Scheduled job skipped: agent selector did not resolve");
+                                    continue;
+                                }
                             }
-                        },
+                        }
                         (None, Some(_)) => {
                             warn!(job_id = %job_id, "Scheduled job skipped: no runtime is configured");
                             continue;
@@ -927,7 +933,9 @@ mod tests {
         let store = Arc::new(SqliteSchedulerStore::in_memory().unwrap());
         let sched = Scheduler::new(enabled_config()).with_store(store.clone());
 
-        let config = SchedulerJobConfig::new("Run my task").with_max_iterations(50);
+        let config = SchedulerJobConfig::new("Run my task")
+            .with_max_iterations(50)
+            .with_agent_selector("scheduler-agent");
         let _id = sched
             .add_job_with_config("config-test", "0 */6 * * *", config)
             .await
@@ -938,6 +946,7 @@ mod tests {
         assert_eq!(loaded[0].name, "config-test");
         assert_eq!(loaded[0].task_goal.as_deref(), Some("Run my task"));
         assert_eq!(loaded[0].max_iterations, 50);
+        assert_eq!(loaded[0].agent_selector.as_deref(), Some("scheduler-agent"));
     }
 
     #[tokio::test]
@@ -979,6 +988,7 @@ mod tests {
             cron_expr: "0 * * * *".to_string(),
             task_goal: None,
             max_iterations: 100,
+            agent_selector: None,
             enabled: true,
             last_run: None,
             next_run: Some(Utc::now() + chrono::TimeDelta::hours(1)),

@@ -41,6 +41,8 @@ pub struct DiscordConfig {
     /// Path to the orchestration SQLite database.
     /// When set, orchestration commands use real persistent state.
     pub orchestration_db_path: Option<std::path::PathBuf>,
+    /// UUID or exact name of the runtime agent used for `/raven run`.
+    pub agent_selector: Option<String>,
 }
 
 impl DiscordConfig {
@@ -422,6 +424,25 @@ impl DiscordEventHandler {
             )
             .await;
 
+        let agent_id = match self
+            .runtime
+            .resolve_agent(self.config.agent_selector.as_deref())
+        {
+            Ok(agent) => agent.id,
+            Err(error) => {
+                let _ = ctx
+                    .http
+                    .send_message(
+                        channel_id,
+                        vec![],
+                        &CreateMessage::new()
+                            .content(format!("❌ **Error:** Cannot select an agent: {error}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+
         // Create the agent task
         let task = AgentTask {
             id: uuid::Uuid::new_v4(),
@@ -506,24 +527,6 @@ impl DiscordEventHandler {
         let runtime = self.runtime.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-
-            // We need an agent to execute the task. Use the first registered agent.
-            let agents = runtime.list_agents();
-            let agent_id = match agents.first() {
-                Some(a) => a.id,
-                None => {
-                    let _ = ctx
-                        .http
-                        .send_message(
-                            thread_id,
-                            vec![],
-                            &CreateMessage::new()
-                                .content("❌ **Error:** No agents registered in the runtime."),
-                        )
-                        .await;
-                    return;
-                }
-            };
 
             // Submit the task
             let result = runtime.submit_task(&agent_id, &task, None).await;

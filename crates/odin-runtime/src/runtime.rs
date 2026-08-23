@@ -1,7 +1,7 @@
 //! Runtime — orchestrates multiple agents, manages sessions, and spawns sub-agents.
 
 use dashmap::DashMap;
-use odin_core::error::OdinResult;
+use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::MemoryStore;
 use odin_core::types::{AgentId, AgentTask, SessionId, TaskResult};
 use std::sync::Arc;
@@ -141,6 +141,40 @@ impl Runtime {
     /// List all registered agents.
     pub fn list_agents(&self) -> Vec<Agent> {
         self.agents.iter().map(|a| a.value().clone()).collect()
+    }
+
+    /// Resolve an agent by UUID or exact name, rejecting ambiguous defaults.
+    pub fn resolve_agent(&self, selector: Option<&str>) -> OdinResult<Agent> {
+        if let Some(selector) = selector {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                return Err(OdinError::Config("agent selector cannot be empty".into()));
+            }
+            if let Ok(agent_id) = uuid::Uuid::parse_str(selector) {
+                return self.get_agent(&agent_id).ok_or_else(|| {
+                    OdinError::Config(format!("configured agent '{selector}' is not registered"))
+                });
+            }
+            let matches = self.find_agents_by_name(selector);
+            return match matches.as_slice() {
+                [agent] => Ok(agent.clone()),
+                [] => Err(OdinError::Config(format!(
+                    "configured agent '{selector}' is not registered"
+                ))),
+                _ => Err(OdinError::Config(format!(
+                    "agent selector '{selector}' matches multiple agents"
+                ))),
+            };
+        }
+
+        let agents = self.list_agents();
+        match agents.as_slice() {
+            [agent] => Ok(agent.clone()),
+            [] => Err(OdinError::Config("runtime has no registered agent".into())),
+            _ => Err(OdinError::Config(
+                "runtime has multiple agents; an explicit agent selector is required".into(),
+            )),
+        }
     }
 
     /// Get the number of registered agents.
@@ -417,6 +451,18 @@ mod tests {
 
         let builders = rt.find_agents_by_name("builder");
         assert_eq!(builders.len(), 2);
+    }
+
+    #[test]
+    fn agent_resolution_rejects_ambiguous_defaults_and_names() {
+        let rt = Runtime::new();
+        rt.register_agent(make_agent("builder"));
+        assert_eq!(rt.resolve_agent(None).unwrap().name, "builder");
+        rt.register_agent(make_agent("reviewer"));
+        assert!(rt.resolve_agent(None).is_err());
+        assert_eq!(rt.resolve_agent(Some("reviewer")).unwrap().name, "reviewer");
+        rt.register_agent(make_agent("reviewer"));
+        assert!(rt.resolve_agent(Some("reviewer")).is_err());
     }
 
     #[test]
