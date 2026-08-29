@@ -43,10 +43,16 @@ pub struct PhaseContext {
     pub plan: Option<DecomposedPlan>,
     /// Model name to pass to the provider (e.g., "deepseek-v4-pro")
     pub model_name: String,
+    /// Optional cheaper/dedicated model for planning.
+    pub planning_model_name: Option<String>,
+    /// Optional model for critique, revision, and verification.
+    pub critique_model_name: Option<String>,
     /// Optional LLM provider for real model calls
     pub provider: Option<Arc<dyn Provider>>,
     /// Optional stronger provider for escalation
     pub escalation_provider: Option<Arc<dyn Provider>>,
+    /// Optional stronger model selected when escalation occurs.
+    pub escalation_model_name: Option<String>,
     /// Optional tool registry for dispatching real tool calls
     pub tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     /// Optional policy engine for permission checking on tool calls
@@ -59,6 +65,20 @@ pub struct PhaseContext {
     pub reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
     /// Optional small/local model profile for bounded prompts and retries
     pub model_profile: Option<SmallModelProfile>,
+}
+
+impl PhaseContext {
+    fn planning_model(&self) -> &str {
+        self.planning_model_name
+            .as_deref()
+            .unwrap_or(&self.model_name)
+    }
+
+    fn critique_model(&self) -> &str {
+        self.critique_model_name
+            .as_deref()
+            .unwrap_or(&self.model_name)
+    }
 }
 
 // ── Plan Phase ──────────────────────────────────────────────────────
@@ -132,7 +152,7 @@ impl Phase for PlanPhase {
             msgs.push(Message::user(prompt));
             match provider
                 .chat(
-                    &context.model_name,
+                    context.planning_model(),
                     &msgs,
                     &[],
                     &CompletionOptions::default(),
@@ -820,7 +840,7 @@ impl Phase for CritiquePhase {
             msgs.push(Message::user(prompt));
             match provider
                 .chat(
-                    &context.model_name,
+                    context.critique_model(),
                     &msgs,
                     &[],
                     &CompletionOptions::default(),
@@ -942,7 +962,7 @@ impl Phase for RevisePhase {
             msgs.push(Message::user(prompt));
             match provider
                 .chat(
-                    &context.model_name,
+                    context.critique_model(),
                     &msgs,
                     &[],
                     &CompletionOptions::default(),
@@ -1069,7 +1089,7 @@ impl Phase for VerifyPhase {
             msgs.push(Message::user(prompt));
             match provider
                 .chat(
-                    &context.model_name,
+                    context.critique_model(),
                     &msgs,
                     &[],
                     &CompletionOptions::default(),
@@ -1151,22 +1171,19 @@ impl Phase for VerifyPhase {
             (verification, conf)
         };
 
-        if context.model_profile.is_some()
-            && (!state.task.success_criteria.is_empty() || !state.tool_results.is_empty())
-        {
-            let evidence = verify_evidence(state, &state.task.success_criteria);
-            if !evidence.verified {
-                confidence = ConfidenceScore::new(confidence.value().min(evidence.confidence));
-                verification.push_str(&format!(
-                    "\nEvidence missing: {}",
-                    evidence.missing.join(", ")
-                ));
-            } else if !evidence.evidence.is_empty() {
-                verification.push_str(&format!(
-                    "\nEvidence checked: {}",
-                    evidence.evidence.join(", ")
-                ));
-            }
+        let evidence = verify_evidence(state, &state.task.success_criteria);
+        if !evidence.verified {
+            confidence = ConfidenceScore::new(confidence.value().min(evidence.confidence));
+            verification.push_str(&format!(
+                "\nEvidence missing: {}",
+                evidence.missing.join(", ")
+            ));
+        } else if !evidence.evidence.is_empty() {
+            confidence = ConfidenceScore::new(confidence.value().min(evidence.confidence));
+            verification.push_str(&format!(
+                "\nEvidence checked: {}",
+                evidence.evidence.join(", ")
+            ));
         }
 
         let record = PhaseRecord {
@@ -1399,13 +1416,7 @@ fn fallback_critique_confidence(state: &LoopState, scorer: &ConfidenceScorer) ->
             last_tool.duration_ms,
         )
     } else if let Some(last_msg) = state.messages.last() {
-        let text = last_msg.text().unwrap_or("");
-        // For reasoning models, the response is always valid — trust it
-        if text.len() > 200 {
-            ConfidenceScore::new(0.9) // Substantial response = high confidence
-        } else {
-            scorer.score_text_response(text, Some(&state.task.goal))
-        }
+        scorer.score_text_response(last_msg.text().unwrap_or(""), Some(&state.task.goal))
     } else {
         ConfidenceScore::new(0.5)
     }

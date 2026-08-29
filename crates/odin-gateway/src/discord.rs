@@ -1404,6 +1404,7 @@ mod tests {
             allow_dms: false,
             command_prefix: None,
             orchestration_db_path: None,
+            agent_selector: None,
         };
         let runtime = Arc::new(Runtime::new());
         let gateway = DiscordGateway::new(config, runtime);
@@ -1425,6 +1426,7 @@ mod tests {
             allow_dms: false,
             command_prefix: None,
             orchestration_db_path: None,
+            agent_selector: None,
         };
         let runtime = Arc::new(Runtime::new());
         let gateway = DiscordGateway::new(config, runtime);

@@ -75,7 +75,7 @@ impl ConfidenceScorer {
     /// Score a text response from the model.
     ///
     /// Heuristic scoring considers:
-    /// - Response length (not too short, not truncated)
+    /// - Empty or clearly truncated responses
     /// - Presence of error indicators ("error", "failed", "sorry")
     /// - Presence of confidence indicators ("I'm confident", "definitely")
     /// - Whether it addresses the goal
@@ -84,11 +84,10 @@ impl ConfidenceScorer {
 
         let lower = response.to_lowercase();
 
-        // Too short → likely incomplete
-        if response.len() < 20 {
+        // Empty/near-empty output is incomplete. Length never increases
+        // confidence: verbose text is not evidence of successful work.
+        if response.trim().len() < 4 {
             score -= 0.3;
-        } else if response.len() > 100 {
-            score += 0.1;
         }
 
         // Truncation indicators

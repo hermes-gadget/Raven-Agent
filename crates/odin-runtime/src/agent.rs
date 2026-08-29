@@ -37,8 +37,22 @@ impl Agent {
         provider: Arc<dyn Provider>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
+        Self::new_with_id(Uuid::new_v4(), name, engine, provider, tools)
+    }
+
+    /// Create an agent with a caller-provided stable identity.
+    ///
+    /// Production composition uses the same ID for the agent and loop engine so
+    /// authorization, rate limiting, and audit correlation refer to one principal.
+    pub fn new_with_id(
+        id: AgentId,
+        name: impl Into<String>,
+        engine: Arc<dyn LoopEngine>,
+        provider: Arc<dyn Provider>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id,
             name: name.into(),
             engine,
             provider,

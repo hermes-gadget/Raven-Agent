@@ -17,7 +17,9 @@ use odin_core::traits::{AuditLogger, LoopEngine, Tool};
 use odin_core::types::AgentTask;
 use odin_orchestrator::Composer;
 use odin_orchestrator::persistence::OrchestrationStore;
-use odin_runtime::{Agent, Runtime};
+use odin_runtime::{
+    CompositionResources, EngineBuildOptions, ExecutionSurface, ProductionComposition, Runtime,
+};
 use tracing_subscriber::EnvFilter;
 
 // Scheduler types
@@ -682,40 +684,13 @@ async fn cmd_run(
     // Load configuration
     let config = load_config(config_path.as_deref())?;
     tracing::debug!("[CLI] Config loaded");
-
-    // Find the default provider config
-    let provider_name = &config.models.default_provider;
-    let provider_cfg = config
-        .models
-        .providers
-        .get(provider_name)
-        .cloned()
-        .unwrap_or_else(|| {
-            // Fall back to a default openai_compat provider config
-            odin_core::config::ProviderConfig {
-                provider_type: "openai_compat".into(),
-                base_url: Some("http://localhost:11434/v1".into()),
-                api_key: None,
-                api_key_env: None,
-                default_model: None,
-                headers: Default::default(),
-                timeout_secs: 120,
-                max_retries: 3,
-                fallback_chain: None,
-                health_check_interval_secs: 0,
-                circuit_breaker_threshold: 0,
-            }
-        });
-
+    let composition = ProductionComposition::from_config(&config)?;
     tracing::info!(
-        "[CLI] Creating provider '{}' (type: {})",
-        provider_name,
-        provider_cfg.provider_type
+        provider = %composition.resolved().provider_name,
+        model = %composition.resolved().model_name,
+        fallbacks = ?composition.resolved().fallback_providers,
+        "[CLI] Validated production composition"
     );
-
-    // Create the provider via the factory
-    let provider: Arc<dyn odin_core::traits::Provider> =
-        odin_providers::create_provider(&provider_cfg)?;
 
     let audit_logger = Arc::new(build_audit_logger(&config));
     let approval_gate = Arc::new(odin_permissions::ApprovalGate::default());
@@ -746,6 +721,12 @@ async fn cmd_run(
 
     let memory = Arc::new(build_memory_store(&config)?);
     let reliability_tracker = build_reliability_tracker(&config)?;
+    let composition = composition.with_resources(CompositionResources {
+        policy_engine: Some(policy_engine.clone()),
+        tool_registry: Some(tool_registry.clone()),
+        audit_logger: Some(audit_logger.clone()),
+        reliability_tracker: Some(reliability_tracker),
+    });
     tracing::info!("[CLI] Memory store and audit logger initialized");
 
     // Branch: orchestrated (default) or direct single-agent
@@ -753,38 +734,23 @@ async fn cmd_run(
         return run_orchestrated(
             &task,
             max_iterations,
-            provider,
-            policy_engine,
+            composition,
             tool_registry,
-            sandbox,
             &config,
             memory,
-            audit_logger,
-            reliability_tracker,
         )
         .await;
     }
 
     // ── Direct single-agent mode (legacy) ──────────────────────────
-    // Create the loop engine with the provider attached
-    let engine = odin_loop::LoopEngine::new()
-        .with_provider(provider.clone())
-        .with_model_name(config.models.default_model.clone().unwrap_or_default())
-        .with_policy_engine(policy_engine.clone())
-        .with_max_iterations(max_iterations)
-        .with_tool_registry(tool_registry.clone())
-        .with_audit_logger(audit_logger.clone())
-        .with_reliability_tracker(reliability_tracker);
-
-    // Get available tools as Vec<Arc<dyn Tool>>
-    let tools: Vec<Arc<dyn odin_core::traits::Tool>> = tool_registry
-        .list_schemas()
-        .iter()
-        .filter_map(|s| tool_registry.get(&s.function.name))
-        .collect();
-
-    // Create the agent
-    let agent = Agent::new("default-agent", Arc::new(engine), provider, tools);
+    let agent = composition.build_agent(
+        ExecutionSurface::Cli,
+        "default-agent",
+        EngineBuildOptions {
+            max_iterations: Some(max_iterations),
+            ..Default::default()
+        },
+    );
     let agent_id = agent.id;
 
     // Register agent in runtime with memory store
@@ -918,14 +884,10 @@ async fn cmd_run(
 async fn run_orchestrated(
     goal: &str,
     max_iterations: u32,
-    provider: Arc<dyn odin_core::traits::Provider>,
-    policy_engine: Arc<odin_permissions::PolicyEngine>,
+    composition: ProductionComposition,
     tool_registry: Arc<odin_tools::ToolRegistry>,
-    _sandbox: Arc<odin_tools::Sandbox>,
     config: &OdinConfig,
     memory: Arc<odin_memory::SqliteMemoryStore>,
-    audit_logger: Arc<odin_audit::AuditLoggerImpl>,
-    reliability_tracker: Arc<odin_tools::ReliabilityTracker>,
 ) -> anyhow::Result<()> {
     use odin_orchestrator::RunControlKind;
     use odin_orchestrator::composer::ComposerConfig;
@@ -1038,7 +1000,6 @@ async fn run_orchestrated(
     let mut spawned = std::collections::HashSet::<uuid::Uuid>::new();
     let mut terminal = std::collections::HashSet::<uuid::Uuid>::new();
     let max_retries = 1u32;
-    let model_name = config.models.default_model.clone().unwrap_or_default();
 
     println!(
         "🔄 Dispatching up to {} agent(s) with file-lock awareness...",
@@ -1140,14 +1101,10 @@ async fn run_orchestrated(
                             serde_json::to_string(&composer.file_locks().snapshot())?;
                         store.save_lock_snapshot(&lock_snapshot).await?;
 
-                        let provider = provider.clone();
-                        let policy_engine = policy_engine.clone();
-                        let audit_logger = audit_logger.clone();
-                        let reliability_tracker = reliability_tracker.clone();
+                        let composition = composition.clone();
                         let memory = memory.clone();
                         let task_goal = agent.task_goal.clone();
                         let label_for_result = agent.label.clone();
-                        let model_name = model_name.clone();
                         let agent_id = agent.agent_id;
                         let run_id_for_mem = run_id_str.clone();
 
@@ -1158,14 +1115,15 @@ async fn run_orchestrated(
                             let mut total_elapsed = std::time::Duration::ZERO;
 
                             for attempt in 0..=max_retries {
-                                let engine = odin_loop::LoopEngine::new()
-                                    .with_provider(provider.clone())
-                                    .with_model_name(model_name.clone())
-                                    .with_policy_engine(policy_engine.clone())
-                                    .with_max_iterations(max_iterations)
-                                    .with_tool_registry(scoped_registry.clone())
-                                    .with_audit_logger(audit_logger.clone())
-                                    .with_reliability_tracker(reliability_tracker.clone());
+                                let engine = composition.build_engine(
+                                    ExecutionSurface::Orchestration,
+                                    EngineBuildOptions {
+                                        max_iterations: Some(max_iterations),
+                                        principal_id: Some(agent_id),
+                                        tool_registry: Some(scoped_registry.clone()),
+                                        ..Default::default()
+                                    },
+                                );
 
                                 let task_id = uuid::Uuid::new_v4();
                                 let context = if memory_enabled {
@@ -2064,29 +2022,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
         )
     };
     tracing::info!("[CLI] Starting HTTP server on {addr}");
-
-    // Build the provider from config
-    let provider_name = &config.models.default_provider;
-    let provider_cfg = config
-        .models
-        .providers
-        .get(provider_name)
-        .cloned()
-        .unwrap_or_else(|| odin_core::config::ProviderConfig {
-            provider_type: "openai_compat".into(),
-            base_url: Some("http://localhost:11434/v1".into()),
-            api_key: None,
-            api_key_env: None,
-            default_model: None,
-            headers: Default::default(),
-            timeout_secs: 120,
-            max_retries: 3,
-            fallback_chain: None,
-            health_check_interval_secs: 0,
-            circuit_breaker_threshold: 0,
-        });
-
-    let provider = odin_providers::create_provider(&provider_cfg)?;
+    let composition = ProductionComposition::from_config(&config)?;
     let sandbox = Arc::new(odin_tools::Sandbox::new(config.tools.path_boundary.clone()));
     let enabled_tools = config.tools.effective_enabled_tools();
 
@@ -2110,18 +2046,18 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     // Load MCP tools from configured servers
     load_mcp_tools(&tool_registry, &config).await;
 
-    let tools: Vec<Arc<dyn odin_core::traits::Tool>> = tool_registry
-        .list_schemas()
-        .iter()
-        .filter_map(|s| tool_registry.get(&s.function.name))
-        .collect();
-
     // Wire persistent memory store
     let memory = Arc::new(build_memory_store(&config)?);
     tracing::info!("[CLI/serve] Memory store initialized");
 
     // Reuse the policy engine's logger so the audit sink has one writer.
     let reliability_tracker = build_reliability_tracker(&config)?;
+    let composition = composition.with_resources(CompositionResources {
+        policy_engine: Some(policy_engine.clone()),
+        tool_registry: Some(tool_registry.clone()),
+        audit_logger: Some(audit_logger.clone()),
+        reliability_tracker: Some(reliability_tracker),
+    });
     tracing::info!("[CLI/serve] Audit logger initialized");
 
     // Discord shares the configured provider, tools, memory, policy, and audit
@@ -2140,17 +2076,10 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
             );
         }
 
-        let engine = odin_loop::LoopEngine::new()
-            .with_provider(provider.clone())
-            .with_policy_engine(policy_engine.clone())
-            .with_tool_registry(tool_registry.clone())
-            .with_audit_logger(audit_logger.clone())
-            .with_reliability_tracker(reliability_tracker.clone());
-        let agent = Agent::new(
+        let agent = composition.build_agent(
+            ExecutionSurface::Discord,
             "discord-agent",
-            Arc::new(engine),
-            provider.clone(),
-            tools.clone(),
+            EngineBuildOptions::default(),
         );
         let runtime = Arc::new(Runtime::new().with_memory(memory.clone()));
         runtime.register_agent(agent);
@@ -2186,33 +2115,25 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     let handler: odin_gateway::TaskHandlerFn = {
         let memory = memory;
         let audit_logger = audit_logger;
-        let reliability_tracker = reliability_tracker;
-        let tool_registry = tool_registry.clone();
+        let composition = composition.clone();
         Arc::new(move |req: odin_gateway::ChatRequest| {
-            let provider = provider.clone();
-            let tool_registry = tool_registry.clone();
-            let policy_engine = policy_engine.clone();
-            let tools = tools.clone();
+            let composition = composition.clone();
             let memory = memory.clone();
             let audit_logger = audit_logger.clone();
-            let reliability_tracker = reliability_tracker.clone();
             Box::pin(async move {
                 let start = std::time::Instant::now();
+                let max_iterations = req
+                    .max_iterations
+                    .unwrap_or(composition.default_max_iterations());
 
-                let engine = odin_loop::LoopEngine::new()
-                    .with_principal_id(serve_principal_id)
-                    .with_provider(provider.clone())
-                    .with_policy_engine(policy_engine.clone())
-                    .with_max_iterations(req.max_iterations.unwrap_or(100))
-                    .with_tool_registry(tool_registry.clone())
-                    .with_audit_logger(audit_logger.clone())
-                    .with_reliability_tracker(reliability_tracker.clone());
-
-                let agent = Agent::new(
+                let agent = composition.build_agent(
+                    ExecutionSurface::Http,
                     "serve-agent",
-                    Arc::new(engine),
-                    provider.clone(),
-                    tools.clone(),
+                    EngineBuildOptions {
+                        principal_id: Some(serve_principal_id),
+                        max_iterations: Some(max_iterations),
+                        ..Default::default()
+                    },
                 );
                 let agent_id = agent.id;
 
@@ -2231,7 +2152,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                     context: req.context.clone(),
                     sub_tasks: vec![],
                     success_criteria: vec![],
-                    max_iterations: req.max_iterations.unwrap_or(100),
+                    max_iterations,
                     created_at: chrono::Utc::now(),
                 };
 
@@ -2245,7 +2166,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                     action: "serve_run".to_string(),
                     details: serde_json::json!({
                         "task": req.task,
-                        "max_iterations": req.max_iterations.unwrap_or(100),
+                        "max_iterations": max_iterations,
                     }),
                     result: odin_core::types::AuditResult::Success,
                 };
@@ -2461,25 +2382,7 @@ async fn cmd_schedule(action: ScheduleAction, config_path: Option<PathBuf>) -> a
                 return Ok(());
             }
 
-            let provider_cfg = config
-                .models
-                .providers
-                .get(&config.models.default_provider)
-                .cloned()
-                .unwrap_or_else(|| odin_core::config::ProviderConfig {
-                    provider_type: "openai_compat".into(),
-                    base_url: Some("http://localhost:11434/v1".into()),
-                    api_key: None,
-                    api_key_env: None,
-                    default_model: None,
-                    headers: Default::default(),
-                    timeout_secs: 120,
-                    max_retries: 3,
-                    fallback_chain: None,
-                    health_check_interval_secs: 0,
-                    circuit_breaker_threshold: 0,
-                });
-            let provider = odin_providers::create_provider(&provider_cfg)?;
+            let composition = ProductionComposition::from_config(&config)?;
             let policy_engine = Arc::new(odin_permissions::PolicyEngine::new(
                 config.safety.permissions.clone(),
                 &config.safety.dangerous_commands,
@@ -2491,20 +2394,18 @@ async fn cmd_schedule(action: ScheduleAction, config_path: Option<PathBuf>) -> a
             let enabled_tools = config.tools.effective_enabled_tools();
             let tool_registry = Arc::new(build_tool_registry_with(sandbox, Some(&enabled_tools)));
             load_mcp_tools(&tool_registry, &config).await;
-            let tools: Vec<Arc<dyn Tool>> = tool_registry
-                .list_schemas()
-                .iter()
-                .filter_map(|schema| tool_registry.get(&schema.function.name))
-                .collect();
             let audit_logger = Arc::new(build_audit_logger(&config));
-            let engine = odin_loop::LoopEngine::new()
-                .with_provider(provider.clone())
-                .with_model_name(config.models.default_model.clone().unwrap_or_default())
-                .with_policy_engine(policy_engine)
-                .with_max_iterations(config.agent.max_iterations)
-                .with_tool_registry(tool_registry)
-                .with_audit_logger(audit_logger.clone());
-            let agent = Agent::new("scheduler-host", Arc::new(engine), provider, tools);
+            let composition = composition.with_resources(CompositionResources {
+                policy_engine: Some(policy_engine),
+                tool_registry: Some(tool_registry),
+                audit_logger: Some(audit_logger.clone()),
+                reliability_tracker: Some(build_reliability_tracker(&config)?),
+            });
+            let agent = composition.build_agent(
+                ExecutionSurface::Scheduler,
+                "scheduler-host",
+                EngineBuildOptions::default(),
+            );
             let runtime = Arc::new(
                 Runtime::new()
                     .with_memory(Arc::new(build_memory_store(&config)?))

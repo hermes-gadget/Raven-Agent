@@ -58,6 +58,60 @@ impl MockProvider {
         let call_num = *count;
         *count += 1;
 
+        let last_prompt = messages.last().and_then(Message::text).unwrap_or_default();
+
+        // The looped path must provide explicit phase results so the
+        // completion contract is exercised rather than manufactured by
+        // offline placeholders or response length.
+        if last_prompt.contains("Break this goal into sub-tasks") {
+            return ChatResponse {
+                message: Message::assistant(
+                    r#"{"sub_tasks":[{"id":"task_1","description":"complete and verify the requested work"}]}"#,
+                ),
+                usage: TokenUsage::default(),
+                finish_reason: Some("stop".into()),
+                model: self.name.clone(),
+            };
+        }
+        if last_prompt.contains("Decide what action to take next") {
+            return ChatResponse {
+                message: Message::assistant(
+                    "I completed the requested work and recorded the result for verification.",
+                ),
+                usage: TokenUsage::default(),
+                finish_reason: Some("stop".into()),
+                model: self.name.clone(),
+            };
+        }
+        if last_prompt.contains("Evaluate the last action") {
+            return ChatResponse {
+                message: Message::assistant(
+                    "The ACT result addresses the requested goal. Confidence: 0.90",
+                ),
+                usage: TokenUsage::default(),
+                finish_reason: Some("stop".into()),
+                model: self.name.clone(),
+            };
+        }
+        if last_prompt.contains("Has the goal been achieved?") {
+            return ChatResponse {
+                message: Message::assistant(
+                    "VERIFIED. The ACT result is present. Confidence: 0.90",
+                ),
+                usage: TokenUsage::default(),
+                finish_reason: Some("stop".into()),
+                model: self.name.clone(),
+            };
+        }
+        if last_prompt.contains("last attempt was not fully successful") {
+            return ChatResponse {
+                message: Message::assistant("Retry with an explicit result and verification."),
+                usage: TokenUsage::default(),
+                finish_reason: Some("stop".into()),
+                model: self.name.clone(),
+            };
+        }
+
         let all_text: String = messages
             .iter()
             .filter_map(|m| m.text())
@@ -523,8 +577,10 @@ async fn run_comparison(model_type: &str, small_model: bool) -> ComparisonReport
     for task in &tasks {
         // ── Run with Raven's looped engine ──
         {
-            let _mock = Arc::new(MockProvider::new("mock-loop", small_model, 0.3));
-            let engine = LoopEngine::new().with_max_iterations(30);
+            let mock = Arc::new(MockProvider::new("mock-loop", small_model, 0.3));
+            let engine = LoopEngine::new()
+                .with_provider(mock)
+                .with_max_iterations(30);
 
             let agent_task = AgentTask {
                 id: TaskId::new_v4(),

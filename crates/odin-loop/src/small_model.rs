@@ -167,6 +167,22 @@ impl SmallModelProfile {
             .find(|profile| profile.id == id)
     }
 
+    /// Resolve a built-in profile from a configured model name when possible.
+    pub fn for_model(model: &str) -> Option<Self> {
+        let model = model.to_ascii_lowercase();
+        if model.contains("deepseek") {
+            Some(Self::deepseek_cheap())
+        } else if model.contains("qwen") && model.contains("14b") {
+            Some(Self::qwen_coder_14b())
+        } else if model.contains("qwen") && (model.contains("7b") || model.contains("coder")) {
+            Some(Self::ollama_qwen_coder_7b())
+        } else if model.contains("llama") && model.contains("8b") {
+            Some(Self::llama_8b())
+        } else {
+            None
+        }
+    }
+
     /// Compact system instruction for small models.
     pub fn system_instruction(&self) -> String {
         format!(
@@ -380,6 +396,17 @@ pub fn verify_evidence(state: &LoopState, criteria: &[String]) -> EvidenceCheck 
         ));
     }
 
+    let substantive_actions = state
+        .history
+        .iter()
+        .filter(|record| record.phase == LoopPhase::Act)
+        .filter_map(|record| record.output.as_deref())
+        .filter(|output| is_substantive_action_output(output))
+        .count();
+    if substantive_actions > 0 {
+        evidence.push(format!("{substantive_actions} substantive ACT result(s)"));
+    }
+
     let all_text = state
         .messages
         .iter()
@@ -398,6 +425,7 @@ pub fn verify_evidence(state: &LoopState, criteria: &[String]) -> EvidenceCheck 
 
     if criteria.is_empty()
         && (successful_tools.is_empty()
+            && substantive_actions == 0
             && !state
                 .task
                 .sub_tasks
@@ -422,6 +450,19 @@ pub fn verify_evidence(state: &LoopState, criteria: &[String]) -> EvidenceCheck 
         evidence,
         missing,
     }
+}
+
+/// Whether ACT produced a result rather than a planning/status/error placeholder.
+pub(crate) fn is_substantive_action_output(output: &str) -> bool {
+    let output = output.trim();
+    if output.is_empty() {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    !lower.starts_with("working on:")
+        && lower != "executing next action"
+        && !lower.starts_with("calling tool:")
+        && !lower.starts_with("llm call failed:")
 }
 
 /// Classify a failed tool result into the small-model failure taxonomy.

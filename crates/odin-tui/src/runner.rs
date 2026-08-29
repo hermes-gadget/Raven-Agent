@@ -26,6 +26,9 @@ use odin_orchestrator::lifecycle::AgentPhase;
 use odin_orchestrator::merge::{MergeStrategy, SubAgentResult};
 use odin_orchestrator::persistence::{OrchestrationStore, SqliteOrchestrationStore};
 use odin_orchestrator::task_graph::{TaskGraph, TaskGraphStatus, TaskNodeStatus};
+use odin_runtime::{
+    CompositionResources, EngineBuildOptions, ExecutionSurface, ProductionComposition,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -173,31 +176,18 @@ struct AgentExecution {
 
 #[derive(Clone)]
 struct ExecutionResources {
-    provider: Option<Arc<dyn Provider>>,
-    policy_engine: Option<Arc<odin_permissions::PolicyEngine>>,
+    composition: ProductionComposition,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     audit_logger: Option<Arc<dyn AuditLogger>>,
-    reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
     memory: Option<Arc<odin_memory::SqliteMemoryStore>>,
     memory_max_entries: usize,
-    model_name: String,
     run_id: String,
 }
 
 impl ExecutionResources {
     async fn from_environment() -> Result<Self> {
         let config = load_config(None)?;
-
-        let provider_name = &config.models.default_provider;
-        let provider_cfg = config
-            .models
-            .providers
-            .get(provider_name)
-            .cloned()
-            .unwrap_or_else(default_provider_config);
-        let provider =
-            odin_providers::create_provider_chain(&provider_cfg, &config.models.providers)
-                .or_else(|_| odin_providers::create_provider(&provider_cfg))?;
+        let composition = ProductionComposition::from_config(&config)?;
 
         let policy_engine = Arc::new(odin_permissions::PolicyEngine::new(
             config.safety.permissions.clone(),
@@ -221,12 +211,6 @@ impl ExecutionResources {
             &reliability_path,
             odin_tools::ReliabilityConfig::default(),
         )?);
-        let model_name = config
-            .models
-            .default_model
-            .clone()
-            .or_else(|| provider_cfg.default_model.clone())
-            .unwrap_or_default();
         let memory = if config.memory.enabled {
             let path = config.memory.db_path.as_ref().map_or_else(
                 || configured_data_dir(&config).join("memory.db"),
@@ -246,15 +230,19 @@ impl ExecutionResources {
             None
         };
 
-        Ok(Self {
-            provider: Some(provider),
+        let composition = composition.with_resources(CompositionResources {
             policy_engine: Some(policy_engine),
+            tool_registry: Some(tool_registry.clone()),
+            audit_logger: Some(audit_logger.clone()),
+            reliability_tracker: Some(reliability_tracker),
+        });
+
+        Ok(Self {
+            composition,
             tool_registry: Some(tool_registry),
             audit_logger: Some(audit_logger),
-            reliability_tracker: Some(reliability_tracker),
             memory,
             memory_max_entries: config.memory.max_entries.max(1),
-            model_name,
             run_id: String::new(),
         })
     }
@@ -976,41 +964,42 @@ fn spawn_agent_execution(
                 max_iterations,
                 created_at: chrono::Utc::now(),
             };
-            let mut engine = odin_loop::LoopEngine::new().with_max_iterations(max_iterations);
-            if let Some(provider) = resources.provider.clone() {
-                engine = engine.with_provider(Arc::new(ProgressProvider::new(
-                    provider,
-                    agent.agent_id,
-                    agent.label.clone(),
-                    event_tx.clone(),
-                )));
-            }
-            if !resources.model_name.is_empty() {
-                engine = engine.with_model_name(resources.model_name.clone());
-            }
-            if let Some(policy_engine) = resources.policy_engine.clone() {
-                engine = engine.with_policy_engine(policy_engine);
-            }
-            if let Some(registry) = resources.tool_registry.clone() {
-                let scoped = registry.scoped(&agent.allowed_tools).map_err(|error| {
-                    odin_core::error::OdinError::Validation(format!(
-                        "invalid tool scope for agent '{}': {error}",
-                        agent.label
-                    ))
-                })?;
-                engine = engine.with_tool_registry(Arc::new(scoped));
-            }
-            if let Some(audit_logger) = resources.audit_logger.clone() {
-                engine = engine.with_audit_logger(Arc::new(ProgressAuditLogger::new(
+            let scoped_registry = if let Some(registry) = resources.tool_registry.clone() {
+                Some(Arc::new(registry.scoped(&agent.allowed_tools).map_err(
+                    |error| {
+                        odin_core::error::OdinError::Validation(format!(
+                            "invalid tool scope for agent '{}': {error}",
+                            agent.label
+                        ))
+                    },
+                )?))
+            } else {
+                None
+            };
+            let audit_logger = resources.audit_logger.clone().map(|audit_logger| {
+                Arc::new(ProgressAuditLogger::new(
                     audit_logger,
                     agent.agent_id,
                     agent.label.clone(),
                     event_tx.clone(),
-                )));
-            }
-            if let Some(reliability_tracker) = resources.reliability_tracker.clone() {
-                engine = engine.with_reliability_tracker(reliability_tracker);
-            }
+                )) as Arc<dyn AuditLogger>
+            });
+            let provider: Arc<dyn Provider> = Arc::new(ProgressProvider::new(
+                resources.composition.provider(),
+                agent.agent_id,
+                agent.label.clone(),
+                event_tx.clone(),
+            ));
+            let engine = resources.composition.build_engine(
+                ExecutionSurface::Tui,
+                EngineBuildOptions {
+                    max_iterations: Some(max_iterations),
+                    principal_id: Some(agent.agent_id),
+                    provider: Some(provider),
+                    tool_registry: scoped_registry,
+                    audit_logger,
+                },
+            );
             let result = engine.execute_task(&task).await;
             if let (Some(memory), Ok(task_result)) = (resources.memory.as_ref(), result.as_ref()) {
                 let redacted =
@@ -1405,22 +1394,6 @@ async fn persist_locks(store: &SqliteOrchestrationStore, composer: &Composer) ->
     let snapshot = serde_json::to_string(&composer.file_locks().snapshot())?;
     store.save_lock_snapshot(&snapshot).await?;
     Ok(())
-}
-
-fn default_provider_config() -> odin_core::config::ProviderConfig {
-    odin_core::config::ProviderConfig {
-        provider_type: "openai_compat".into(),
-        base_url: Some("http://localhost:11434/v1".into()),
-        api_key: None,
-        api_key_env: None,
-        default_model: None,
-        headers: Default::default(),
-        timeout_secs: 120,
-        max_retries: 3,
-        fallback_chain: None,
-        health_check_interval_secs: 0,
-        circuit_breaker_threshold: 0,
-    }
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<OdinConfig> {

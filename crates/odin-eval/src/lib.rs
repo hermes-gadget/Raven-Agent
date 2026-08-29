@@ -6,12 +6,13 @@
 
 use chrono::{DateTime, Utc};
 use odin_core::error::{OdinError, OdinResult};
-use odin_core::traits::LoopEngine as LoopEngineTrait;
+use odin_core::traits::{ChatStream, LoopEngine as LoopEngineTrait, Provider};
 use odin_core::types::*;
 use odin_loop::{
     AdaptiveExecutionPolicy, ExecutionMode, FailureKind, SmallModelProfile, TaskComplexity,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Required eval coverage areas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -268,12 +269,13 @@ async fn run_raven_mocked(
             task.difficulty
         )),
         sub_tasks: vec![],
-        success_criteria: vec![],
+        success_criteria: task.expected_evidence.clone(),
         max_iterations,
         created_at: Utc::now(),
     };
 
     let engine = odin_loop::LoopEngine::new()
+        .with_provider(Arc::new(EvidenceMockProvider::new(task)))
         .with_small_model_profile(profile.clone())
         .with_max_iterations(max_iterations);
 
@@ -318,6 +320,82 @@ async fn run_raven_mocked(
         execution_mode: mode,
         failures: simulated_failures,
     })
+}
+
+/// Deterministic provider that makes the mocked eval exercise the real
+/// ACT/evidence contract instead of succeeding in offline placeholder mode.
+struct EvidenceMockProvider {
+    action_result: String,
+}
+
+impl EvidenceMockProvider {
+    fn new(task: &EvalTask) -> Self {
+        Self {
+            action_result: format!(
+                "Completed the requested work. Evidence: {}.",
+                task.expected_evidence.join("; ")
+            ),
+        }
+    }
+
+    fn response(&self, content: impl Into<String>) -> ChatResponse {
+        ChatResponse {
+            message: Message::assistant(content),
+            usage: TokenUsage::default(),
+            finish_reason: Some("stop".into()),
+            model: "deterministic-eval".into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for EvidenceMockProvider {
+    fn name(&self) -> &str {
+        "deterministic-eval"
+    }
+
+    async fn list_models(&self) -> OdinResult<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _options: &CompletionOptions,
+    ) -> OdinResult<ChatResponse> {
+        let prompt = messages.last().and_then(Message::text).unwrap_or_default();
+        let response = if prompt.contains("Return only JSON using this schema") {
+            r#"{"sub_tasks":[{"id":"task_1","description":"produce verified eval result"}]}"#
+                .to_string()
+        } else if prompt.contains("Evaluate the last action") {
+            "The ACT result is explicit and addresses the goal. Confidence: 0.90".into()
+        } else if prompt.contains("Has the goal been achieved?") {
+            "VERIFIED. The expected evidence is present. Confidence: 0.90".into()
+        } else if prompt.contains("last attempt was not fully successful") {
+            "Retry once with the expected evidence stated explicitly.".into()
+        } else {
+            self.action_result.clone()
+        };
+        Ok(self.response(response))
+    }
+
+    async fn chat_stream(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _options: &CompletionOptions,
+    ) -> OdinResult<Box<dyn ChatStream>> {
+        Err(OdinError::Other(
+            "deterministic eval provider does not stream".into(),
+        ))
+    }
+
+    async fn health_check(&self) -> OdinResult<bool> {
+        Ok(true)
+    }
 }
 
 fn run_baseline_mocked(profile: &SmallModelProfile, task: &EvalTask) -> EvalRunMetrics {

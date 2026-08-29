@@ -9,6 +9,7 @@ description = "Interactive terminal UI for Raven Agent — Claude Code-style cha
 [dependencies]
 odin-core.workspace = true
 odin-loop.workspace = true
+odin-runtime.workspace = true
 odin-mcp.workspace = true
 odin-orchestrator = { path = "../odin-orchestrator" }
 odin-providers.workspace = true
