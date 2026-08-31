@@ -58,11 +58,7 @@ impl ToolCatalog {
 
         for tool in &tools {
             let name = tool.name().to_string();
-            let tags: Vec<String> = tool
-                .capability_tags()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let tags = tool.capability_tags();
             let primary_category = tags.first().cloned().unwrap_or_else(|| "other".into());
 
             // Collect all unique tags

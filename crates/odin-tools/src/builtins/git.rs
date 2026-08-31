@@ -14,7 +14,7 @@ use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 
 use crate::Sandbox;
-use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
+use crate::process::{self, ProcessError};
 
 /// Arguments for the `git` tool.
 #[derive(Debug, Deserialize)]
@@ -82,7 +82,9 @@ impl Git {
                         "timeout_secs": {
                             "type": "integer",
                             "description": "Timeout in seconds (optional, defaults to 120)",
-                            "default": 120
+                            "default": 120,
+                            "minimum": 1,
+                            "maximum": 300
                         }
                     },
                     "required": ["command"]
@@ -132,8 +134,8 @@ impl Tool for Git {
         false
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["version-control", "git", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["version-control".into(), "git".into(), "dangerous".into()]
     }
 
     fn is_dangerous(&self) -> bool {
@@ -179,14 +181,19 @@ impl Tool for Git {
         cmd.current_dir(repo_path);
 
         // Set timeout
-        let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
+        let timeout_secs = parsed
+            .timeout_secs
+            .max(1)
+            .min(context.resource_budgets.max_tool_timeout_secs.max(1));
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let max_output_bytes = context.resource_budgets.max_tool_output_bytes.max(1);
 
-        let output = process::run_command(cmd, timeout, DEFAULT_MAX_OUTPUT_BYTES)
+        let output = process::run_command(cmd, timeout, max_output_bytes)
             .await
             .map_err(|error| match error {
                 ProcessError::Timeout => OdinError::Timeout(format!(
                     "Git command timed out after {}s: git {}",
-                    parsed.timeout_secs, command_str
+                    timeout_secs, command_str
                 )),
                 ProcessError::Io(error) => OdinError::Tool {
                     tool: self.name.clone(),
@@ -211,7 +218,7 @@ impl Tool for Git {
         }
         if output.stdout_truncated || output.stderr_truncated {
             result_output.push_str(&format!(
-                "\n\n[TRUNCATED: output exceeded {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+                "\n\n[TRUNCATED: output exceeded {max_output_bytes} bytes per stream]"
             ));
         }
 
@@ -301,6 +308,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: std::env::current_dir().unwrap(),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 

@@ -84,6 +84,7 @@ async fn test_skills_injected_via_loop_engine() {
         audit_logger: None,
         reliability_tracker: None,
         model_profile: None,
+        resource_budgets: odin_core::config::ResourceBudgetConfig::default(),
     };
 
     let plan_phase = PlanPhase::new(GoalDecomposer::default());
@@ -117,7 +118,11 @@ async fn test_skills_injected_via_loop_engine() {
     );
 
     assert!(
-        text.contains("[USE_SKILL: skill-name]"),
-        "System prompt must explain how to invoke a skill"
+        text.contains("Skill metadata is informational"),
+        "System prompt must describe the supported skill behavior"
+    );
+    assert!(
+        !text.contains("[USE_SKILL:"),
+        "System prompt must not advertise an unparsed skill marker"
     );
 }

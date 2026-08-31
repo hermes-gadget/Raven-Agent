@@ -236,7 +236,9 @@ async fn persist_orchestration_state(
         store.save_task_graph(graph).await?;
     }
     let lock_snapshot = serde_json::to_string(&composer.file_locks().snapshot())?;
-    store.save_lock_snapshot(&lock_snapshot).await?;
+    store
+        .save_lock_snapshot(&graph_root_id, &lock_snapshot)
+        .await?;
     Ok(())
 }
 
@@ -640,10 +642,19 @@ fn init_tracing(launching_tui: bool) -> anyhow::Result<()> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&log_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .compact()
@@ -692,7 +703,7 @@ async fn cmd_run(
         "[CLI] Validated production composition"
     );
 
-    let audit_logger = Arc::new(build_audit_logger(&config));
+    let audit_logger = Arc::new(build_audit_logger(&config)?);
     let approval_gate = Arc::new(odin_permissions::ApprovalGate::default());
     let policy_engine = Arc::new(
         odin_permissions::PolicyEngine::new(
@@ -780,14 +791,14 @@ async fn cmd_run(
         event_type: odin_core::types::AuditEventType::SessionStart,
         action: "cli_run".to_string(),
         details: serde_json::json!({
+            "task_id": agent_task.id,
+            "session_id": session.id,
             "task": task,
             "max_iterations": max_iterations,
         }),
         result: odin_core::types::AuditResult::Success,
     };
-    if let Err(e) = audit_logger.log(start_entry).await {
-        tracing::warn!("[CLI] Failed to log audit start: {e}");
-    }
+    audit_logger.log(start_entry).await?;
 
     // Submit the task
     tracing::info!(task_id = %agent_task.id, agent_id = %agent_id, "Submitting CLI task");
@@ -806,6 +817,8 @@ async fn cmd_run(
         event_type: odin_core::types::AuditEventType::SessionEnd,
         action: "cli_run_complete".to_string(),
         details: serde_json::json!({
+            "task_id": result.task_id,
+            "session_id": session.id,
             "success": result.success,
             "iterations": result.iterations,
             "duration_ms": elapsed.as_millis(),
@@ -818,9 +831,7 @@ async fn cmd_run(
             odin_core::types::AuditResult::Failure
         },
     };
-    if let Err(e) = audit_logger.log(end_entry).await {
-        tracing::warn!("[CLI] Failed to log audit end: {e}");
-    }
+    audit_logger.log(end_entry).await?;
 
     // Print the result
     println!();
@@ -880,6 +891,31 @@ async fn cmd_run(
 }
 
 /// Orchestrated execution — decompose goal, spawn parallel sub-agents, merge results.
+fn subagent_retry_is_idempotent(allowed_tools: &[String]) -> bool {
+    const READ_ONLY_TOOLS: &[&str] = &[
+        "disk_usage",
+        "env_var",
+        "file_exists",
+        "file_list",
+        "file_read",
+        "github_actions_status",
+        "github_issue_search",
+        "github_pr_status",
+        "json_extract",
+        "json_validate",
+        "network_ping",
+        "process_list",
+        "system_info",
+        "text_search",
+        "time_now",
+        "web_fetch",
+        "web_search",
+    ];
+    allowed_tools
+        .iter()
+        .all(|tool| READ_ONLY_TOOLS.contains(&tool.as_str()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_orchestrated(
     goal: &str,
@@ -999,7 +1035,7 @@ async fn run_orchestrated(
     let mut agent_handles = AgentTaskSet::new();
     let mut spawned = std::collections::HashSet::<uuid::Uuid>::new();
     let mut terminal = std::collections::HashSet::<uuid::Uuid>::new();
-    let max_retries = 1u32;
+    let max_retries = config.agent.max_retries.min(3);
 
     println!(
         "🔄 Dispatching up to {} agent(s) with file-lock awareness...",
@@ -1099,7 +1135,9 @@ async fn run_orchestrated(
                         store.save_task_graph(graph).await?;
                         let lock_snapshot =
                             serde_json::to_string(&composer.file_locks().snapshot())?;
-                        store.save_lock_snapshot(&lock_snapshot).await?;
+                        store
+                            .save_lock_snapshot(&run_id_str, &lock_snapshot)
+                            .await?;
 
                         let composition = composition.clone();
                         let memory = memory.clone();
@@ -1107,6 +1145,8 @@ async fn run_orchestrated(
                         let label_for_result = agent.label.clone();
                         let agent_id = agent.agent_id;
                         let run_id_for_mem = run_id_str.clone();
+                        let retry_is_idempotent =
+                            subagent_retry_is_idempotent(&agent.allowed_tools);
 
                         agent_handles.spawn(agent.agent_id, async move {
                             let mut final_result = Err(odin_core::error::OdinError::Internal(
@@ -1114,7 +1154,8 @@ async fn run_orchestrated(
                             ));
                             let mut total_elapsed = std::time::Duration::ZERO;
 
-                            for attempt in 0..=max_retries {
+                            let retry_limit = if retry_is_idempotent { max_retries } else { 0 };
+                            for attempt in 0..=retry_limit {
                                 let engine = composition.build_engine(
                                     ExecutionSurface::Orchestration,
                                     EngineBuildOptions {
@@ -1185,7 +1226,11 @@ async fn run_orchestrated(
                                     }
                                 }
 
-                                if is_success || attempt == max_retries {
+                                let retryable_failure = result
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(odin_core::error::OdinError::is_retryable);
+                                if is_success || attempt == retry_limit || !retryable_failure {
                                     final_result = result;
                                     break;
                                 }
@@ -1200,7 +1245,7 @@ async fn run_orchestrated(
                                     "[ORCH] Agent '{}' attempt {}/{} failed: {}",
                                     label_for_result,
                                     attempt + 1,
-                                    max_retries + 1,
+                                    retry_limit + 1,
                                     err_msg
                                 );
                             }
@@ -1218,7 +1263,9 @@ async fn run_orchestrated(
                         }
                         let lock_snapshot =
                             serde_json::to_string(&composer.file_locks().snapshot())?;
-                        store.save_lock_snapshot(&lock_snapshot).await?;
+                        store
+                            .save_lock_snapshot(&run_id_str, &lock_snapshot)
+                            .await?;
                     }
                 }
             }
@@ -1335,7 +1382,9 @@ async fn run_orchestrated(
     let results = composer.collect_results();
     let merged = composer.merge_results(results);
     let lock_snapshot = serde_json::to_string(&composer.file_locks().snapshot())?;
-    store.save_lock_snapshot(&lock_snapshot).await?;
+    store
+        .save_lock_snapshot(&run_id_str, &lock_snapshot)
+        .await?;
 
     println!();
     println!("╔══════════════════════════════════════════╗");
@@ -1446,11 +1495,21 @@ async fn load_mcp_tools(registry: &odin_tools::ToolRegistry, config: &OdinConfig
 
         tracing::info!("[MCP] Loading tools from server '{}'", server_cfg.name);
 
-        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = Arc::new(Mutex::new(
+        let transport = Arc::new(Mutex::new(
             StdioTransport::new(&server_cfg.command, server_cfg.args.clone())
                 .with_env(server_cfg.env.clone()),
         ));
 
+        if let Err(error) = transport.lock().await.connect().await {
+            tracing::warn!(
+                "[MCP] Failed to spawn server '{}': {}",
+                server_cfg.name,
+                error
+            );
+            continue;
+        }
+
+        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = transport;
         let mut client = McpClient::new(transport.clone());
         let shared_client = match client.connect().await {
             Ok(()) => {
@@ -1593,7 +1652,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let graphs = store.list_task_graphs().await.unwrap_or_default();
             let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
@@ -1622,7 +1684,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             // New records use a run UUID; old records also accept their goal key.
             if let Ok(graph) = store.load_task_graph(&id).await {
@@ -1668,7 +1733,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             match store.update_graph_status(&id, "cancelled").await {
                 Ok(()) => {
@@ -1725,7 +1793,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let graphs = store.list_task_graphs().await.unwrap_or_default();
             let mut paused = 0;
@@ -1753,7 +1824,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let graphs = store.list_task_graphs().await.unwrap_or_default();
             let mut resumed = 0;
@@ -1781,7 +1855,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
             if lifecycles.is_empty() {
@@ -1817,7 +1894,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let graphs = store.list_task_graphs().await.unwrap_or_default();
             if graphs.is_empty() {
@@ -1861,7 +1941,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             let graphs = store.list_task_graphs().await.unwrap_or_default();
             let lifecycles = store.list_agent_lifecycles().await.unwrap_or_default();
@@ -1907,7 +1990,10 @@ async fn cmd_orchestrate(action: OrchestrateAction) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Store: {e}"))?;
-            store.initialize().await.ok();
+            store
+                .initialize()
+                .await
+                .map_err(|e| anyhow::anyhow!("Store init: {e}"))?;
 
             if let Some(ref run_id) = id {
                 // Restore a specific run
@@ -2021,12 +2107,34 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
             true,
         )
     };
+    let public_auth_token = if let Some(token) = config
+        .gateway
+        .public_auth_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    {
+        Some(token)
+    } else if let Some(env_name) = config.gateway.public_auth_token_env.as_deref() {
+        let token = std::env::var(env_name).map_err(|_| {
+            anyhow::anyhow!(
+                "gateway.public_auth_token_env names '{env_name}', but that environment variable is not set"
+            )
+        })?;
+        if token.trim().is_empty() {
+            anyhow::bail!(
+                "gateway.public_auth_token_env names '{env_name}', but that environment variable is empty"
+            );
+        }
+        Some(token)
+    } else {
+        None
+    };
     tracing::info!("[CLI] Starting HTTP server on {addr}");
     let composition = ProductionComposition::from_config(&config)?;
     let sandbox = Arc::new(odin_tools::Sandbox::new(config.tools.path_boundary.clone()));
     let enabled_tools = config.tools.effective_enabled_tools();
 
-    let audit_logger = Arc::new(build_audit_logger(&config));
+    let audit_logger = Arc::new(build_audit_logger(&config)?);
     let approval_gate = Arc::new(odin_permissions::ApprovalGate::default());
     let policy_engine = Arc::new(
         odin_permissions::PolicyEngine::new(
@@ -2114,7 +2222,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
     // Build the task handler closure
     let handler: odin_gateway::TaskHandlerFn = {
         let memory = memory;
-        let audit_logger = audit_logger;
+        let audit_logger = audit_logger.clone();
         let composition = composition.clone();
         Arc::new(move |req: odin_gateway::ChatRequest| {
             let composition = composition.clone();
@@ -2144,7 +2252,8 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                 let session_id = req
                     .session_id
                     .clone()
-                    .and_then(|sid| uuid::Uuid::parse_str(&sid).ok());
+                    .and_then(|sid| uuid::Uuid::parse_str(&sid).ok())
+                    .unwrap_or_else(uuid::Uuid::new_v4);
 
                 let runtime_task = AgentTask {
                     id: uuid::Uuid::new_v4(),
@@ -2161,23 +2270,22 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                     id: uuid::Uuid::new_v4(),
                     timestamp: chrono::Utc::now(),
                     agent_id,
-                    session_id: session_id.unwrap_or_default(),
+                    session_id,
                     event_type: odin_core::types::AuditEventType::SessionStart,
                     action: "serve_run".to_string(),
                     details: serde_json::json!({
+                        "task_id": runtime_task.id,
+                        "session_id": session_id,
                         "task": req.task,
                         "max_iterations": max_iterations,
                     }),
                     result: odin_core::types::AuditResult::Success,
                 };
-                if let Err(e) = audit_logger.log(start_entry).await {
-                    tracing::warn!("[CLI/serve] Failed to log audit start: {e}");
-                }
+                audit_logger.log(start_entry).await?;
 
                 let result = runtime
-                    .submit_task(&agent_id, &runtime_task, session_id)
-                    .await
-                    .map_err(|e| odin_core::error::OdinError::Internal(e.to_string()))?;
+                    .submit_task(&agent_id, &runtime_task, Some(session_id))
+                    .await?;
 
                 let elapsed = start.elapsed().as_millis() as u64;
 
@@ -2186,10 +2294,12 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                     id: uuid::Uuid::new_v4(),
                     timestamp: chrono::Utc::now(),
                     agent_id,
-                    session_id: result.task_id,
+                    session_id,
                     event_type: odin_core::types::AuditEventType::SessionEnd,
                     action: "serve_run_complete".to_string(),
                     details: serde_json::json!({
+                        "task_id": result.task_id,
+                        "session_id": session_id,
                         "success": result.success,
                         "iterations": result.iterations,
                         "duration_ms": elapsed,
@@ -2202,9 +2312,7 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
                         odin_core::types::AuditResult::Failure
                     },
                 };
-                if let Err(e) = audit_logger.log(end_entry).await {
-                    tracing::warn!("[CLI/serve] Failed to log audit end: {e}");
-                }
+                audit_logger.log(end_entry).await?;
 
                 Ok(odin_gateway::ChatResponse {
                     success: result.success,
@@ -2248,10 +2356,13 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
         odin_gateway::ws::WsConnectionManager::new(256)
             .with_control(orch_store, Some(operator_token.clone())),
     );
-    let server_result = odin_gateway::run_http_server_with_management(
+    let server_result = odin_gateway::run_http_server_with_management_auth_and_budgets(
         &addr,
         &management_addr,
         operator_token,
+        public_auth_token,
+        config.gateway.allow_insecure_non_loopback,
+        config.effective_resource_budgets(),
         Some(handler),
         Some(ws_manager),
         Some(tool_registry),
@@ -2263,6 +2374,13 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
         && let Err(error) = gateway.stop().await
     {
         tracing::warn!("[CLI/serve] Failed to stop Discord gateway: {error}");
+    }
+
+    if let Err(error) = audit_logger.flush().await {
+        tracing::error!(%error, "Failed to flush audit sink during shutdown");
+        if server_result.is_ok() {
+            return Err(anyhow::anyhow!("Failed to flush audit sink: {error}"));
+        }
     }
 
     server_result.map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
@@ -2394,7 +2512,7 @@ async fn cmd_schedule(action: ScheduleAction, config_path: Option<PathBuf>) -> a
             let enabled_tools = config.tools.effective_enabled_tools();
             let tool_registry = Arc::new(build_tool_registry_with(sandbox, Some(&enabled_tools)));
             load_mcp_tools(&tool_registry, &config).await;
-            let audit_logger = Arc::new(build_audit_logger(&config));
+            let audit_logger = Arc::new(build_audit_logger(&config)?);
             let composition = composition.with_resources(CompositionResources {
                 policy_engine: Some(policy_engine),
                 tool_registry: Some(tool_registry),
@@ -3089,7 +3207,7 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                     .filter(|t| {
                         let tt = t.capability_tags();
                         tag.iter()
-                            .all(|filter_tag| tt.contains(&filter_tag.as_str()))
+                            .all(|filter_tag| tt.iter().any(|tool_tag| tool_tag == filter_tag))
                     })
                     .collect()
             };
@@ -3206,10 +3324,10 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
             approve,
         } => {
             let registry = build_tool_registry();
+            let config = load_config(None)?;
             let reliability_tracker = if dry_run {
                 None
             } else {
-                let config = load_config(None)?;
                 Some(build_reliability_tracker(&config)?)
             };
             match registry.get(&name) {
@@ -3219,11 +3337,13 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                             Ok(value) => value,
                             Err(error) => {
                                 if let Some(tracker) = &reliability_tracker {
-                                    tracker.record_outcome(
-                                        &name,
-                                        odin_tools::ReliabilityOutcome::ValidationFailure,
-                                        0,
-                                    );
+                                    tracker
+                                        .record_outcome_async(
+                                            &name,
+                                            odin_tools::ReliabilityOutcome::ValidationFailure,
+                                            0,
+                                        )
+                                        .await;
                                 }
                                 return Err(anyhow::anyhow!("Invalid JSON args: {error}"));
                             }
@@ -3240,6 +3360,7 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                             session_id: uuid::Uuid::new_v4(),
                             working_dir: std::env::current_dir().unwrap_or_default(),
                             env: std::collections::HashMap::new(),
+                            resource_budgets: config.effective_resource_budgets(),
                         };
                         let start = std::time::Instant::now();
                         match dry_tool.execute(json_args, &context).await {
@@ -3271,11 +3392,13 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                     } else {
                         if (tool.requires_approval() || tool.is_dangerous()) && !approve {
                             if let Some(tracker) = &reliability_tracker {
-                                tracker.record_outcome(
-                                    tool.name(),
-                                    odin_tools::ReliabilityOutcome::PolicyDenial,
-                                    0,
-                                );
+                                tracker
+                                    .record_outcome_async(
+                                        tool.name(),
+                                        odin_tools::ReliabilityOutcome::PolicyDenial,
+                                        0,
+                                    )
+                                    .await;
                             }
                             anyhow::bail!(
                                 "Tool '{}' requires approval. Review the arguments, then rerun with --approve; use --dry-run to validate without execution.",
@@ -3296,21 +3419,24 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                             session_id: uuid::Uuid::new_v4(),
                             working_dir: std::env::current_dir().unwrap_or_default(),
                             env: std::collections::HashMap::new(),
+                            resource_budgets: config.effective_resource_budgets(),
                         };
                         let start = std::time::Instant::now();
                         match tool.execute(json_args, &context).await {
                             Ok(result) => {
                                 let elapsed = start.elapsed();
                                 if let Some(tracker) = &reliability_tracker {
-                                    tracker.record_outcome(
-                                        tool.name(),
-                                        if result.success {
-                                            odin_tools::ReliabilityOutcome::Success
-                                        } else {
-                                            odin_tools::ReliabilityOutcome::ToolFailure
-                                        },
-                                        elapsed.as_millis() as u64,
-                                    );
+                                    tracker
+                                        .record_outcome_async(
+                                            tool.name(),
+                                            if result.success {
+                                                odin_tools::ReliabilityOutcome::Success
+                                            } else {
+                                                odin_tools::ReliabilityOutcome::ToolFailure
+                                            },
+                                            elapsed.as_millis() as u64,
+                                        )
+                                        .await;
                                 }
                                 println!(
                                     "  Status:   {}",
@@ -3328,11 +3454,13 @@ async fn cmd_tools(action: ToolsAction) -> anyhow::Result<()> {
                             }
                             Err(e) => {
                                 if let Some(tracker) = &reliability_tracker {
-                                    tracker.record_outcome(
-                                        tool.name(),
-                                        odin_tools::classify_tool_error(&e),
-                                        start.elapsed().as_millis() as u64,
-                                    );
+                                    tracker
+                                        .record_outcome_async(
+                                            tool.name(),
+                                            odin_tools::classify_tool_error(&e),
+                                            start.elapsed().as_millis() as u64,
+                                        )
+                                        .await;
                                 }
                                 println!("  Error: {}", redactor.redact(&e.to_string()));
                                 std::process::exit(1);
@@ -3628,25 +3756,27 @@ fn build_memory_store(config: &OdinConfig) -> anyhow::Result<odin_memory::Sqlite
             )
         })?;
     }
-    odin_memory::SqliteMemoryStore::new(&path.to_string_lossy()).map_err(|error| {
-        anyhow::anyhow!(
-            "Failed to open memory database '{}': {error}",
-            path.display()
-        )
-    })
+    odin_memory::SqliteMemoryStore::new(&path.to_string_lossy())
+        .map(|store| store.with_retention_limit(config.memory.max_entries))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to open memory database '{}': {error}",
+                path.display()
+            )
+        })
 }
 
-fn build_audit_logger(config: &OdinConfig) -> odin_audit::AuditLoggerImpl {
+fn build_audit_logger(config: &OdinConfig) -> anyhow::Result<odin_audit::AuditLoggerImpl> {
     let file_path = configured_audit_path(config);
-    odin_audit::AuditLoggerImpl::new(odin_audit::AuditLoggerConfig {
+    odin_audit::AuditLoggerImpl::try_new(odin_audit::AuditLoggerConfig {
         enabled: config.audit.enabled,
         file_path: config.audit.enabled.then_some(file_path),
-        db_path: None,
-        json_format: config.audit.json_format,
-        buffer_size: 100,
+        json_format: true,
+        buffer_size: 1,
         history_size: 1_000,
         mask_secrets: true,
     })
+    .map_err(|error| anyhow::anyhow!("Failed to open audit sink: {error}"))
 }
 
 fn configured_audit_path(config: &OdinConfig) -> PathBuf {
@@ -3664,7 +3794,7 @@ fn read_redacted_audit(path: &std::path::Path) -> anyhow::Result<String> {
 
 /// Load configuration from an optional path.
 fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<OdinConfig> {
-    match path {
+    let config = match path {
         Some(p) if p.exists() => OdinConfig::load(p).map_err(|e| {
             anyhow::anyhow!("Failed to load Raven Agent config '{}': {e}", p.display())
         }),
@@ -3692,17 +3822,21 @@ fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<OdinConfig> {
                 "odin.yml".to_string(),
             ];
 
-            for path_str in &default_paths {
-                let path = std::path::Path::new(path_str);
-                if path.exists() {
-                    return OdinConfig::load(path)
-                        .map_err(|e| anyhow::anyhow!("Config load error: {e}"));
-                }
+            if let Some(path) = default_paths
+                .iter()
+                .map(std::path::Path::new)
+                .find(|path| path.exists())
+            {
+                OdinConfig::load(path).map_err(|e| anyhow::anyhow!("Config load error: {e}"))
+            } else {
+                Ok(OdinConfig::default())
             }
-
-            Ok(OdinConfig::default())
         }
-    }
+    }?;
+    config
+        .validate()
+        .map_err(|error| anyhow::anyhow!("Invalid Raven Agent configuration: {error}"))?;
+    Ok(config)
 }
 
 /// Resolve the canonical skills directory with a legacy read fallback.
@@ -3740,8 +3874,33 @@ mod tests {
     use super::Cli;
     use super::Commands;
     use super::cleanup_failed_orchestration;
+    use super::load_config;
     use super::recover_failed_orchestration;
+    use super::subagent_retry_is_idempotent;
     use clap::Parser;
+
+    #[test]
+    fn orchestration_retry_policy_only_allows_read_only_tools() {
+        assert!(subagent_retry_is_idempotent(&[
+            "file_read".into(),
+            "web_search".into()
+        ]));
+        assert!(!subagent_retry_is_idempotent(&["shell".into()]));
+        assert!(!subagent_retry_is_idempotent(&["file_write".into()]));
+    }
+
+    #[test]
+    fn invalid_loaded_config_is_rejected_before_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "raven-config-validation-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "budgets:\n  max_tool_calls_per_turn: 0\n").unwrap();
+
+        let result = load_config(Some(&path));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn test_agent_task_set_yields_first_completed_agent() {
@@ -3905,7 +4064,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .save_lock_snapshot(&serde_json::to_string(&composer.file_locks().snapshot()).unwrap())
+            .save_lock_snapshot(
+                &graph_root_id,
+                &serde_json::to_string(&composer.file_locks().snapshot()).unwrap(),
+            )
             .await
             .unwrap();
 
@@ -3936,8 +4098,14 @@ mod tests {
             graph.status,
             odin_orchestrator::task_graph::TaskGraphStatus::Failed
         );
-        let snapshot: odin_orchestrator::file_lock::LockSnapshot =
-            serde_json::from_str(&store.load_lock_snapshot().await.unwrap().unwrap()).unwrap();
+        let snapshot: odin_orchestrator::file_lock::LockSnapshot = serde_json::from_str(
+            &store
+                .load_lock_snapshot(&graph_root_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert!(snapshot.held_locks.is_empty());
         assert!(snapshot.write_queues.is_empty());
     }

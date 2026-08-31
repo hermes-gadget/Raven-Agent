@@ -24,6 +24,7 @@ use crate::process::{self, DEFAULT_MAX_OUTPUT_BYTES, ProcessError};
 async fn run_gh(
     subcommand_args: &[String],
     timeout_secs: u64,
+    context: &ToolContext,
     tool_name: &str,
 ) -> OdinResult<ToolResult> {
     let start = Instant::now();
@@ -31,9 +32,12 @@ async fn run_gh(
     let mut cmd = Command::new("gh");
     cmd.args(subcommand_args);
 
-    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    let timeout_secs = timeout_secs.min(context.resource_budgets.max_tool_timeout_secs.max(1));
+    let max_output_bytes =
+        DEFAULT_MAX_OUTPUT_BYTES.min(context.resource_budgets.max_tool_output_bytes.max(1));
+    let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let output = process::run_command(cmd, timeout, DEFAULT_MAX_OUTPUT_BYTES)
+    let output = process::run_command(cmd, timeout, max_output_bytes)
         .await
         .map_err(|error| match error {
             ProcessError::Timeout => {
@@ -64,7 +68,7 @@ async fn run_gh(
     }
     if output.stdout_truncated || output.stderr_truncated {
         result_output.push_str(&format!(
-            "\n\n[TRUNCATED: output exceeded {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream]"
+            "\n\n[TRUNCATED: output exceeded {max_output_bytes} bytes per stream]"
         ));
     }
 
@@ -303,19 +307,24 @@ impl Tool for GithubIssueCreate {
         false
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["github", "issue", "write", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec![
+            "github".into(),
+            "issue".into(),
+            "write".into(),
+            "dangerous".into(),
+        ]
     }
 
     fn is_dangerous(&self) -> bool {
         true
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let parsed: IssueCreateArgs =
             serde_json::from_value(args).map_err(|e| OdinError::Tool {
@@ -331,7 +340,7 @@ impl Tool for GithubIssueCreate {
             parsed.labels.as_deref(),
         );
 
-        run_gh(&gh_args, 60, &self.name).await
+        run_gh(&gh_args, 60, context, &self.name).await
     }
 }
 
@@ -436,19 +445,24 @@ impl Tool for GithubIssueSearch {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["github", "issue", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec![
+            "github".into(),
+            "issue".into(),
+            "read".into(),
+            "safe".into(),
+        ]
     }
 
     fn is_dangerous(&self) -> bool {
         false
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let parsed: IssueSearchArgs =
             serde_json::from_value(args).map_err(|e| OdinError::Tool {
@@ -464,7 +478,7 @@ impl Tool for GithubIssueSearch {
             parsed.limit,
         );
 
-        run_gh(&gh_args, 30, &self.name).await
+        run_gh(&gh_args, 30, context, &self.name).await
     }
 }
 
@@ -573,19 +587,24 @@ impl Tool for GithubPrCreate {
         false
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["github", "pr", "write", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec![
+            "github".into(),
+            "pr".into(),
+            "write".into(),
+            "dangerous".into(),
+        ]
     }
 
     fn is_dangerous(&self) -> bool {
         true
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let parsed: PrCreateArgs = serde_json::from_value(args).map_err(|e| OdinError::Tool {
             tool: self.name.clone(),
@@ -601,7 +620,7 @@ impl Tool for GithubPrCreate {
             &parsed.head,
         );
 
-        run_gh(&gh_args, 60, &self.name).await
+        run_gh(&gh_args, 60, context, &self.name).await
     }
 }
 
@@ -686,19 +705,19 @@ impl Tool for GithubPrStatus {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["github", "pr", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["github".into(), "pr".into(), "read".into(), "safe".into()]
     }
 
     fn is_dangerous(&self) -> bool {
         false
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let parsed: PrStatusArgs = serde_json::from_value(args).map_err(|e| OdinError::Tool {
             tool: self.name.clone(),
@@ -708,7 +727,7 @@ impl Tool for GithubPrStatus {
 
         let gh_args = build_pr_status_args(&parsed.repo, parsed.pr_number);
 
-        run_gh(&gh_args, 30, &self.name).await
+        run_gh(&gh_args, 30, context, &self.name).await
     }
 }
 
@@ -792,19 +811,19 @@ impl Tool for GithubActionsStatus {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["github", "ci", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["github".into(), "ci".into(), "read".into(), "safe".into()]
     }
 
     fn is_dangerous(&self) -> bool {
         false
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let parsed: ActionsStatusArgs =
             serde_json::from_value(args).map_err(|e| OdinError::Tool {
@@ -815,7 +834,7 @@ impl Tool for GithubActionsStatus {
 
         let gh_args = build_actions_status_args(&parsed.repo, parsed.workflow.as_deref());
 
-        run_gh(&gh_args, 30, &self.name).await
+        run_gh(&gh_args, 30, context, &self.name).await
     }
 }
 
@@ -833,6 +852,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 
@@ -886,7 +906,12 @@ mod tests {
         assert!(!tool.is_safe());
         assert_eq!(
             tool.capability_tags(),
-            &["github", "issue", "write", "dangerous"]
+            vec![
+                "github".to_string(),
+                "issue".to_string(),
+                "write".to_string(),
+                "dangerous".to_string()
+            ]
         );
     }
 
@@ -928,7 +953,15 @@ mod tests {
         assert!(!tool.is_dangerous());
         assert!(!tool.requires_approval());
         assert!(tool.is_safe());
-        assert_eq!(tool.capability_tags(), &["github", "issue", "read", "safe"]);
+        assert_eq!(
+            tool.capability_tags(),
+            vec![
+                "github".to_string(),
+                "issue".to_string(),
+                "read".to_string(),
+                "safe".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -979,7 +1012,12 @@ mod tests {
         assert!(!tool.is_safe());
         assert_eq!(
             tool.capability_tags(),
-            &["github", "pr", "write", "dangerous"]
+            vec![
+                "github".to_string(),
+                "pr".to_string(),
+                "write".to_string(),
+                "dangerous".to_string()
+            ]
         );
     }
 
@@ -1021,7 +1059,15 @@ mod tests {
         assert!(!tool.is_dangerous());
         assert!(!tool.requires_approval());
         assert!(tool.is_safe());
-        assert_eq!(tool.capability_tags(), &["github", "pr", "read", "safe"]);
+        assert_eq!(
+            tool.capability_tags(),
+            vec![
+                "github".to_string(),
+                "pr".to_string(),
+                "read".to_string(),
+                "safe".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1062,7 +1108,15 @@ mod tests {
         assert!(!tool.is_dangerous());
         assert!(!tool.requires_approval());
         assert!(tool.is_safe());
-        assert_eq!(tool.capability_tags(), &["github", "ci", "read", "safe"]);
+        assert_eq!(
+            tool.capability_tags(),
+            vec![
+                "github".to_string(),
+                "ci".to_string(),
+                "read".to_string(),
+                "safe".to_string()
+            ]
+        );
     }
 
     // ── Command Construction Tests ──────────────────────────────────

@@ -17,13 +17,33 @@ use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
 const MAX_REDIRECTS: usize = 5;
 const MAX_HTTP_BODY_BYTES: usize = 100_000;
 
+fn http_timeout(context: &ToolContext) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        context
+            .resource_budgets
+            .max_tool_timeout_secs
+            .max(1)
+            .min(30),
+    )
+}
+
+fn http_body_limit(context: &ToolContext) -> usize {
+    MAX_HTTP_BODY_BYTES.min(context.resource_budgets.max_tool_output_bytes.max(1))
+}
+
+fn http_request_body_limit(context: &ToolContext) -> usize {
+    context.resource_budgets.max_request_bytes.max(1)
+}
+
 /// Read at most the configured response size while allowing the caller to
 /// report that bytes were discarded. This avoids `Response::text()` buffering
 /// an attacker-controlled body before the display limit is applied.
 async fn read_bounded_body(
     mut response: reqwest::Response,
+    max_bytes: usize,
 ) -> Result<(String, bool), reqwest::Error> {
-    let mut bytes = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
+    let max_bytes = max_bytes.max(1);
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
     let mut truncated = false;
 
     while let Some(chunk) = response.chunk().await? {
@@ -159,7 +179,11 @@ fn parse_http_url(raw: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-async fn pinned_client(url: &reqwest::Url, policy: &EgressPolicy) -> OdinResult<reqwest::Client> {
+async fn pinned_client(
+    url: &reqwest::Url,
+    policy: &EgressPolicy,
+    timeout: std::time::Duration,
+) -> OdinResult<reqwest::Client> {
     let host = url
         .host_str()
         .ok_or_else(|| OdinError::Validation("URL must include a host".into()))?;
@@ -195,7 +219,7 @@ async fn pinned_client(url: &reqwest::Url, policy: &EgressPolicy) -> OdinResult<
     // original hostname in the URL preserves Host/SNI while preventing a
     // second DNS lookup from rebinding it to a private address.
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .user_agent("OdinTools/0.3 (Raven Agent)")
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
@@ -285,60 +309,68 @@ async fn send_with_egress_policy(
     headers: &reqwest::header::HeaderMap,
     mut body: Option<String>,
     policy: &EgressPolicy,
+    timeout: std::time::Duration,
 ) -> OdinResult<reqwest::Response> {
-    let original = url.clone();
-    for redirects in 0..=MAX_REDIRECTS {
-        let client = pinned_client(&url, policy).await?;
-        let mut request = client.request(method.clone(), url.clone());
-        let forwarding_sensitive = same_origin(&original, &url);
-        for (name, value) in headers {
-            if forwarding_sensitive || !is_sensitive_header(name) {
-                request = request.header(name, value);
+    let original_url = url.clone();
+    tokio::time::timeout(timeout, async move {
+        let original = url.clone();
+        for redirects in 0..=MAX_REDIRECTS {
+            let client = pinned_client(&url, policy, timeout).await?;
+            let mut request = client.request(method.clone(), url.clone());
+            let forwarding_sensitive = same_origin(&original, &url);
+            for (name, value) in headers {
+                if forwarding_sensitive || !is_sensitive_header(name) {
+                    request = request.header(name, value);
+                }
             }
-        }
-        if let Some(payload) = body.as_ref() {
-            request = request.body(payload.clone());
-        }
-
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                OdinError::Timeout(format!("Request to {url} timed out"))
-            } else {
-                OdinError::Network(format!("Request to {url} failed: {error}"))
+            if let Some(payload) = body.as_ref() {
+                request = request.body(payload.clone());
             }
-        })?;
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-        if redirects == MAX_REDIRECTS {
-            return Err(OdinError::Network(format!(
-                "Request exceeded {MAX_REDIRECTS} redirects"
-            )));
-        }
 
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .ok_or_else(|| OdinError::Network("Redirect omitted Location header".into()))?
-            .to_str()
-            .map_err(|error| OdinError::Network(format!("Invalid redirect location: {error}")))?;
-        let next = url.join(location).map_err(|error| {
-            OdinError::Network(format!(
-                "Invalid redirect destination '{location}': {error}"
-            ))
-        })?;
-        let next = parse_http_url(next.as_str()).map_err(OdinError::Validation)?;
-        if response.status() == reqwest::StatusCode::SEE_OTHER
-            || ((response.status() == reqwest::StatusCode::MOVED_PERMANENTLY
-                || response.status() == reqwest::StatusCode::FOUND)
-                && method == reqwest::Method::POST)
-        {
-            method = reqwest::Method::GET;
-            body = None;
+            let response = request.send().await.map_err(|error| {
+                if error.is_timeout() {
+                    OdinError::Timeout(format!("Request to {url} timed out"))
+                } else {
+                    OdinError::Network(format!("Request to {url} failed: {error}"))
+                }
+            })?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            if redirects == MAX_REDIRECTS {
+                return Err(OdinError::Network(format!(
+                    "Request exceeded {MAX_REDIRECTS} redirects"
+                )));
+            }
+
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| OdinError::Network("Redirect omitted Location header".into()))?
+                .to_str()
+                .map_err(|error| {
+                    OdinError::Network(format!("Invalid redirect location: {error}"))
+                })?;
+            let next = url.join(location).map_err(|error| {
+                OdinError::Network(format!(
+                    "Invalid redirect destination '{location}': {error}"
+                ))
+            })?;
+            let next = parse_http_url(next.as_str()).map_err(OdinError::Validation)?;
+            if response.status() == reqwest::StatusCode::SEE_OTHER
+                || ((response.status() == reqwest::StatusCode::MOVED_PERMANENTLY
+                    || response.status() == reqwest::StatusCode::FOUND)
+                    && method == reqwest::Method::POST)
+            {
+                method = reqwest::Method::GET;
+                body = None;
+            }
+            url = next;
         }
-        url = next;
-    }
-    unreachable!("redirect loop returns or errors at its fixed bound")
+        unreachable!("redirect loop returns or errors at its fixed bound")
+    })
+    .await
+    .map_err(|_| OdinError::Timeout(format!("Request to {original_url} timed out")))?
 }
 
 /// Arguments for `web_fetch`.
@@ -437,17 +469,19 @@ impl Tool for WebFetch {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["web", "http", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["web".into(), "http".into(), "read".into(), "safe".into()]
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
+        let timeout = http_timeout(context);
+        let max_body_bytes = http_body_limit(context);
 
         let parsed: WebFetchArgs = serde_json::from_value(args).map_err(|e| OdinError::Tool {
             tool: self.name.clone(),
@@ -476,19 +510,22 @@ impl Tool for WebFetch {
             &reqwest::header::HeaderMap::new(),
             None,
             &self.egress_policy,
+            timeout,
         )
         .await?;
 
         let status = response.status();
-        let (body, truncated) = read_bounded_body(response).await.map_err(|e| {
-            OdinError::Network(format!("Failed to read response body from {url}: {e}"))
-        })?;
+        let (body, truncated) = read_bounded_body(response, max_body_bytes)
+            .await
+            .map_err(|e| {
+                OdinError::Network(format!("Failed to read response body from {url}: {e}"))
+            })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = status.is_success();
 
         let output = if truncated {
-            format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
+            format!("{body} (truncated after {max_body_bytes} bytes)")
         } else {
             body
         };
@@ -622,17 +659,19 @@ impl Tool for WebSearch {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["web", "search", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["web".into(), "search".into(), "read".into(), "safe".into()]
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
+        let timeout = http_timeout(context);
+        let max_body_bytes = http_body_limit(context);
 
         let parsed: WebSearchArgs = serde_json::from_value(args).map_err(|e| OdinError::Tool {
             tool: self.name.clone(),
@@ -654,11 +693,12 @@ impl Tool for WebSearch {
                 &reqwest::header::HeaderMap::new(),
                 None,
                 &self.egress_policy,
+                timeout,
             )
             .await?;
 
             let status = response.status();
-            let (body, truncated) = read_bounded_body(response)
+            let (body, truncated) = read_bounded_body(response, max_body_bytes)
                 .await
                 .map_err(|e| OdinError::Network(format!("Failed to read search response: {e}")))?;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -668,7 +708,7 @@ impl Tool for WebSearch {
                 tool_name: self.name.clone(),
                 success: status.is_success(),
                 output: if truncated {
-                    format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
+                    format!("{body} (truncated after {max_body_bytes} bytes)")
                 } else {
                     body
                 },
@@ -862,17 +902,24 @@ impl Tool for HttpRequest {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["web", "http", "network", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec![
+            "web".into(),
+            "http".into(),
+            "network".into(),
+            "dangerous".into(),
+        ]
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
+        let timeout = http_timeout(context);
+        let max_body_bytes = http_body_limit(context);
 
         let parsed: HttpRequestArgs =
             serde_json::from_value(args).map_err(|e| OdinError::Tool {
@@ -917,6 +964,17 @@ impl Tool for HttpRequest {
             }
         };
 
+        if parsed
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > http_request_body_limit(context))
+        {
+            return Err(OdinError::Validation(format!(
+                "HTTP request body exceeds the {} byte budget",
+                http_request_body_limit(context)
+            )));
+        }
+
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref configured_headers) = parsed.headers {
             for header in configured_headers {
@@ -944,23 +1002,31 @@ impl Tool for HttpRequest {
             }
         }
 
-        let response =
-            send_with_egress_policy(method, url, &headers, parsed.body, &self.egress_policy)
-                .await?;
+        let response = send_with_egress_policy(
+            method,
+            url,
+            &headers,
+            parsed.body,
+            &self.egress_policy,
+            timeout,
+        )
+        .await?;
 
         let status = response.status();
-        let (body, truncated) = read_bounded_body(response).await.map_err(|e| {
-            OdinError::Network(format!(
-                "Failed to read response body from {}: {e}",
-                parsed.url
-            ))
-        })?;
+        let (body, truncated) = read_bounded_body(response, max_body_bytes)
+            .await
+            .map_err(|e| {
+                OdinError::Network(format!(
+                    "Failed to read response body from {}: {e}",
+                    parsed.url
+                ))
+            })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = status.is_success();
 
         let output = if truncated {
-            format!("{body} (truncated after {MAX_HTTP_BODY_BYTES} bytes)")
+            format!("{body} (truncated after {max_body_bytes} bytes)")
         } else {
             body
         };
@@ -1012,7 +1078,20 @@ mod tests {
             session_id: Default::default(),
             working_dir: PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
+    }
+
+    #[test]
+    fn web_limits_respect_central_budgets() {
+        let mut context = test_context();
+        context.resource_budgets.max_tool_timeout_secs = 7;
+        context.resource_budgets.max_tool_output_bytes = 512;
+        context.resource_budgets.max_request_bytes = 256;
+
+        assert_eq!(http_timeout(&context), std::time::Duration::from_secs(7));
+        assert_eq!(http_body_limit(&context), 512);
+        assert_eq!(http_request_body_limit(&context), 256);
     }
 
     #[tokio::test]

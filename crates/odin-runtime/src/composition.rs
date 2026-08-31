@@ -90,6 +90,7 @@ pub struct ProductionComposition {
     skill_registry: Option<Arc<odin_skills::SkillRegistry>>,
     model_profile: Option<SmallModelProfile>,
     resources: CompositionResources,
+    budgets: odin_core::config::ResourceBudgetConfig,
 }
 
 impl ProductionComposition {
@@ -127,6 +128,7 @@ impl ProductionComposition {
             skill_registry,
             model_profile,
             resources: CompositionResources::default(),
+            budgets: config.effective_resource_budgets(),
         })
     }
 
@@ -179,7 +181,8 @@ impl ProductionComposition {
             .with_confidence_thresholds(
                 self.confidence_threshold,
                 self.confidence_threshold.max(0.8),
-            );
+            )
+            .with_resource_budgets(self.budgets.clone());
 
         if let Some(planning_model) = self.resolved.planning_model.clone() {
             engine = engine.with_planning_model_name(planning_model);
@@ -251,6 +254,7 @@ impl ProductionComposition {
 fn validate_and_resolve(
     config: &OdinConfig,
 ) -> OdinResult<(&str, &ProviderConfig, String, Vec<String>)> {
+    config.validate()?;
     if config.agent.max_iterations == 0 {
         return Err(OdinError::Config(
             "agent.max_iterations must be greater than zero".into(),

@@ -28,6 +28,9 @@
 //!         ])
 //!     ));
 //!
+//!     // Spawn the configured child before performing the MCP handshake.
+//!     transport.lock().await.connect().await.unwrap();
+//!
 //!     // Connect and initialize
 //!     let mut client = McpClient::new(transport);
 //!     client.connect().await.unwrap();

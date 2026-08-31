@@ -31,9 +31,11 @@ use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use odin_core::error::OdinResult;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tracing;
+use uuid::Uuid;
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -333,6 +335,14 @@ pub struct WsConnectionManager {
     /// Broadcast channel — any message sent here goes to all connected clients.
     broadcast_tx: broadcast::Sender<WsMessage>,
 
+    /// Isolated subscribers used by live WebSocket connections. The legacy
+    /// broadcast channel above is retained for embedding compatibility, but
+    /// the HTTP WebSocket handler always uses this scoped registry.
+    subscribers: Arc<std::sync::RwLock<HashMap<String, WsSubscriber>>>,
+
+    /// Capacity for each isolated subscriber channel.
+    subscriber_capacity: usize,
+
     /// Start time for uptime calculation.
     start_time: Arc<std::time::Instant>,
 
@@ -344,6 +354,65 @@ pub struct WsConnectionManager {
     control_token: Option<String>,
 }
 
+struct WsSubscriber {
+    tx: broadcast::Sender<WsMessage>,
+    scopes: HashSet<String>,
+}
+
+fn normalize_scope(scope: &str) -> Result<String, String> {
+    let scope = scope.trim();
+    if scope.is_empty() || scope.len() > 256 || !scope.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("stream scope must be 1-256 visible ASCII bytes".into());
+    }
+    let has_known_prefix = ["task:", "run:", "stream:"].iter().any(|prefix| {
+        scope
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty())
+    });
+    if !has_known_prefix {
+        return Err("stream scope must start with task:, run:, or stream:".into());
+    }
+    Ok(scope.to_string())
+}
+
+fn message_scopes(message: &WsMessage) -> Vec<String> {
+    let Some(payload) = message.payload.as_ref() else {
+        return Vec::new();
+    };
+    let Some(payload) = payload.as_object() else {
+        return Vec::new();
+    };
+    let mut scopes = Vec::new();
+    for (field, prefix) in [
+        ("task_id", "task:"),
+        ("run_id", "run:"),
+        ("stream_id", "stream:"),
+    ] {
+        if let Some(id) = payload.get(field).and_then(serde_json::Value::as_str)
+            && let Ok(scope) = normalize_scope(&format!("{prefix}{id}"))
+        {
+            scopes.push(scope);
+        }
+    }
+    scopes
+}
+
+fn requested_scope(payload: &serde_json::Value) -> Option<String> {
+    if let Some(scope) = payload.get("scope").and_then(serde_json::Value::as_str) {
+        return Some(scope.to_string());
+    }
+    for (field, prefix) in [
+        ("task_id", "task:"),
+        ("run_id", "run:"),
+        ("stream_id", "stream:"),
+    ] {
+        if let Some(id) = payload.get(field).and_then(serde_json::Value::as_str) {
+            return Some(format!("{prefix}{id}"));
+        }
+    }
+    None
+}
+
 impl WsConnectionManager {
     /// Create a new connection manager.
     pub fn new(broadcast_capacity: usize) -> Self {
@@ -351,6 +420,8 @@ impl WsConnectionManager {
         Self {
             connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             broadcast_tx: tx,
+            subscribers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            subscriber_capacity: broadcast_capacity.max(1),
             start_time: Arc::new(std::time::Instant::now()),
             control_store: None,
             control_token: None,
@@ -380,11 +451,80 @@ impl WsConnectionManager {
         self.broadcast_tx.subscribe()
     }
 
+    /// Register an isolated WebSocket stream.
+    ///
+    /// The returned client ID must be used for subscriptions, direct replies,
+    /// and cleanup. A client starts with no stream subscriptions and therefore
+    /// receives no task/orchestration broadcasts until it explicitly subscribes.
+    pub fn register_isolated(&self) -> (String, broadcast::Receiver<WsMessage>) {
+        let (tx, receiver) = broadcast::channel(self.subscriber_capacity);
+        let client_id = Uuid::new_v4().to_string();
+        self.subscribers
+            .write()
+            .expect("WS subscriber registry lock poisoned")
+            .insert(
+                client_id.clone(),
+                WsSubscriber {
+                    tx,
+                    scopes: HashSet::new(),
+                },
+            );
+        self.connection_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (client_id, receiver)
+    }
+
+    /// Subscribe an isolated client to a task/run stream.
+    pub fn subscribe(&self, client_id: &str, scope: &str) -> Result<(), String> {
+        let scope = normalize_scope(scope)?;
+        let mut subscribers = self
+            .subscribers
+            .write()
+            .map_err(|_| "WS subscriber registry lock poisoned".to_string())?;
+        let subscriber = subscribers
+            .get_mut(client_id)
+            .ok_or_else(|| "WebSocket client is no longer connected".to_string())?;
+        subscriber.scopes.insert(scope);
+        Ok(())
+    }
+
+    /// Remove an isolated client and its subscriptions.
+    pub fn unregister_client(&self, client_id: &str) -> bool {
+        let removed = self
+            .subscribers
+            .write()
+            .map(|mut subscribers| subscribers.remove(client_id).is_some())
+            .unwrap_or(false);
+        if removed {
+            let _ = self.connection_count.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| count.checked_sub(1),
+            );
+        }
+        removed
+    }
+
+    /// Send a response only to one isolated WebSocket client.
+    pub fn send_to(&self, client_id: &str, message: &WsMessage) -> bool {
+        let result = self.subscribers.read().ok().and_then(|subscribers| {
+            subscribers
+                .get(client_id)
+                .map(|s| s.tx.send(message.clone()))
+        });
+        matches!(result, Some(Ok(_)))
+    }
+
     /// Unregister a connection.
     pub fn unregister(&self) {
         let prev = self
             .connection_count
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| count.checked_sub(1),
+            )
+            .unwrap_or(0);
         if prev == 0 {
             tracing::warn!("[WS] Unregister called with zero count (underflow?)");
         }
@@ -393,15 +533,35 @@ impl WsConnectionManager {
     /// Broadcast a message to all connected clients.
     /// Returns the number of clients who received it.
     pub fn broadcast(&self, message: &WsMessage) -> usize {
-        let count = self.broadcast_tx.receiver_count();
-        if count > 0 {
+        // Keep the pre-isolation channel working for embedders that still use
+        // register(). Isolated HTTP clients are routed below by stream scope.
+        let mut delivered = self.broadcast_tx.receiver_count();
+        if delivered > 0 {
             let _ = self.broadcast_tx.send(message.clone());
             tracing::debug!(
-                "[WS] Broadcast message type '{}' to {count} clients",
+                "[WS] Broadcast compatibility message type '{}' to {delivered} clients",
                 message.msg_type
             );
         }
-        count
+
+        let scopes = message_scopes(message);
+        let mut closed_clients = Vec::new();
+        if let Ok(subscribers) = self.subscribers.read() {
+            for (client_id, subscriber) in subscribers.iter() {
+                let interested = !scopes.is_empty()
+                    && scopes.iter().any(|scope| subscriber.scopes.contains(scope));
+                if interested {
+                    match subscriber.tx.send(message.clone()) {
+                        Ok(_) => delivered += 1,
+                        Err(_) => closed_clients.push(client_id.clone()),
+                    }
+                }
+            }
+        }
+        for client_id in closed_clients {
+            self.unregister_client(&client_id);
+        }
+        delivered
     }
 
     /// Get the number of connected clients.
@@ -453,7 +613,10 @@ impl WsConnectionManager {
             odin_orchestrator::RunControlKind::Resume => "running",
             odin_orchestrator::RunControlKind::Cancel => "cancelled",
         };
-        let _ = store.update_graph_status(graph_id, status).await;
+        store
+            .update_graph_status(graph_id, status)
+            .await
+            .map_err(|error| format!("failed to persist control status: {error}"))?;
         Ok(command)
     }
 }
@@ -480,11 +643,8 @@ pub async fn ws_handler(
 
 /// Handle an individual WebSocket connection.
 async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManager>) {
-    let conn_id = uuid::Uuid::new_v4().to_string();
+    let (conn_id, mut broadcast_rx) = conn_mgr.register_isolated();
     let (mut sender, mut receiver) = socket.split();
-
-    // Register for broadcasts
-    let mut broadcast_rx = conn_mgr.register();
 
     tracing::info!(
         "[WS] Client connected: {conn_id} (total: {})",
@@ -557,8 +717,54 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                             }
                         }
                         "task_submit" => {
-                            conn_mgr.broadcast(&ws_msg);
+                            // A submission is a request, not a broadcast. If
+                            // the caller supplied a stream identifier, bind
+                            // this connection to it before acknowledging only
+                            // the submitting client.
+                            let payload = ws_msg.payload.clone().unwrap_or_default();
+                            if let Some(scope) = requested_scope(&payload) {
+                                if let Err(error) = conn_mgr.subscribe(&conn_id_clone, &scope) {
+                                    let response = WsMessage {
+                                        msg_type: "task_error".into(),
+                                        payload: Some(serde_json::json!({"error": error})),
+                                        correlation_id: ws_msg.correlation_id.clone(),
+                                    };
+                                    let _ = conn_mgr.send_to(&conn_id_clone, &response);
+                                    continue;
+                                }
+                            }
+                            let response = WsMessage {
+                                msg_type: "task_submitted".into(),
+                                payload: Some(payload),
+                                correlation_id: ws_msg.correlation_id.clone(),
+                            };
+                            let _ = conn_mgr.send_to(&conn_id_clone, &response);
                             tracing::info!("[WS] Task submitted by {conn_id_clone}");
+                        }
+                        "subscribe" => {
+                            let payload = ws_msg.payload.clone().unwrap_or_default();
+                            let response = match requested_scope(&payload) {
+                                Some(scope) => match conn_mgr.subscribe(&conn_id_clone, &scope) {
+                                    Ok(()) => WsMessage {
+                                        msg_type: "subscription_ack".into(),
+                                        payload: Some(serde_json::json!({"scope": scope})),
+                                        correlation_id: ws_msg.correlation_id.clone(),
+                                    },
+                                    Err(error) => WsMessage {
+                                        msg_type: "subscription_error".into(),
+                                        payload: Some(serde_json::json!({"error": error})),
+                                        correlation_id: ws_msg.correlation_id.clone(),
+                                    },
+                                },
+                                None => WsMessage {
+                                    msg_type: "subscription_error".into(),
+                                    payload: Some(serde_json::json!({
+                                        "error": "task_id, run_id, stream_id, or scope is required"
+                                    })),
+                                    correlation_id: ws_msg.correlation_id.clone(),
+                                },
+                            };
+                            let _ = conn_mgr.send_to(&conn_id_clone, &response);
                         }
                         "task_cancel" | "task_pause" | "task_resume" => {
                             let kind = match ws_msg.msg_type.as_str() {
@@ -603,7 +809,7 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                                         })),
                                         correlation_id: ws_msg.correlation_id.clone(),
                                     };
-                                    conn_mgr.broadcast(&ack);
+                                    let _ = conn_mgr.send_to(&conn_id_clone, &ack);
                                     tracing::info!(
                                         "[WS] Control {:?} enqueued for {} by {conn_id_clone}",
                                         kind,
@@ -619,7 +825,7 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                                         })),
                                         correlation_id: ws_msg.correlation_id.clone(),
                                     };
-                                    conn_mgr.broadcast(&err);
+                                    let _ = conn_mgr.send_to(&conn_id_clone, &err);
                                     tracing::warn!(
                                         "[WS] Control rejected from {conn_id_clone}: {error}"
                                     );
@@ -633,7 +839,7 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                                 conn_mgr.connection_count(),
                                 conn_mgr.uptime_secs(),
                             );
-                            conn_mgr.broadcast(&status);
+                            let _ = conn_mgr.send_to(&conn_id_clone, &status);
                         }
                         _ => {
                             tracing::debug!(
@@ -661,7 +867,7 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
 
     // Cleanup
     send_task.abort();
-    conn_mgr.unregister();
+    conn_mgr.unregister_client(&conn_id);
     tracing::info!(
         "[WS] Client disconnected: {conn_id} (total: {})",
         conn_mgr.connection_count()
@@ -861,6 +1067,10 @@ mod tests {
 
         mgr.unregister();
         assert_eq!(mgr.connection_count(), 0);
+
+        // A duplicate cleanup must not underflow the shared count.
+        mgr.unregister();
+        assert_eq!(mgr.connection_count(), 0);
     }
 
     #[test]
@@ -880,6 +1090,46 @@ mod tests {
         let received = rx.try_recv();
         assert!(received.is_ok());
         assert_eq!(received.unwrap().msg_type, "pong");
+    }
+
+    #[test]
+    fn isolated_subscribers_receive_only_their_stream() {
+        let mgr = WsConnectionManager::new(16);
+        let (first_id, mut first_rx) = mgr.register_isolated();
+        let (_second_id, mut second_rx) = mgr.register_isolated();
+        mgr.subscribe(&first_id, "task:first").unwrap();
+
+        let first = WsMessage::task_progress("first", 1, 0.8, "ACT");
+        assert_eq!(mgr.broadcast(&first), 1);
+        assert_eq!(
+            first_rx.try_recv().unwrap().payload.unwrap()["task_id"],
+            "first"
+        );
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let direct = WsMessage::task_error("first", "only me", None);
+        assert!(mgr.send_to(&first_id, &direct));
+        assert_eq!(first_rx.try_recv().unwrap().msg_type, "task_error");
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(mgr.unregister_client(&first_id));
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[test]
+    fn isolated_subscribers_reject_invalid_scopes() {
+        let mgr = WsConnectionManager::new(4);
+        let (client_id, _rx) = mgr.register_isolated();
+        assert!(mgr.subscribe(&client_id, "all").is_err());
+        assert!(mgr.subscribe(&client_id, "task:").is_err());
+        assert!(mgr.subscribe(&client_id, "task:abc").is_ok());
+        assert_eq!(mgr.broadcast(&WsMessage::pong()), 0);
+        assert!(!mgr.send_to("missing-client", &WsMessage::pong()));
     }
 
     #[test]

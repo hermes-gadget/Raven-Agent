@@ -205,7 +205,7 @@ impl ExecutionResources {
         );
         load_mcp_tools(&tool_registry, &config).await;
 
-        let audit_logger: Arc<dyn AuditLogger> = Arc::new(build_audit_logger(&config));
+        let audit_logger: Arc<dyn AuditLogger> = Arc::new(build_audit_logger(&config)?);
         let reliability_path = configured_data_dir(&config).join("reliability.db");
         let reliability_tracker = Arc::new(odin_tools::ReliabilityTracker::persistent(
             &reliability_path,
@@ -223,9 +223,10 @@ impl ExecutionResources {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            Some(Arc::new(odin_memory::SqliteMemoryStore::new(
-                &path.to_string_lossy(),
-            )?))
+            Some(Arc::new(
+                odin_memory::SqliteMemoryStore::new(&path.to_string_lossy())?
+                    .with_retention_limit(config.memory.max_entries),
+            ))
         } else {
             None
         };
@@ -284,7 +285,7 @@ pub async fn spawn_run(db_path: PathBuf, goal: String, max_iterations: u32) -> R
         exec_agents.iter().map(|agent| agent.agent_id),
     )
     .await?;
-    persist_locks(&store, &composer).await?;
+    persist_locks(&store, &composer, &run_id).await?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -833,7 +834,7 @@ async fn start_ready_agents(
                         }
                         persist_graph(store, composer, goal_key, Some(TaskGraphStatus::Running))
                             .await?;
-                        persist_locks(store, composer).await?;
+                        persist_locks(store, composer, &graph_root_id).await?;
                         let _ = event_tx.send(RunnerEvent::AgentStarted {
                             agent_id: agent.agent_id.to_string(),
                             label: agent.label.clone(),
@@ -863,7 +864,7 @@ async fn start_ready_agents(
                                 Some(TaskGraphStatus::Running),
                             )
                             .await?;
-                            persist_locks(store, composer).await?;
+                            persist_locks(store, composer, &graph_root_id).await?;
                         }
                         if phase != AgentPhase::WaitingForLock {
                             let _ = event_tx.send(RunnerEvent::AgentQueued {
@@ -1332,7 +1333,7 @@ async fn finish_agent_execution(
             .await?;
     }
     persist_graph(store, composer, goal_key, None).await?;
-    persist_locks(store, composer).await?;
+    persist_locks(store, composer, &graph_root_id).await?;
     Ok(())
 }
 
@@ -1345,7 +1346,11 @@ async fn persist_all(
 ) -> Result<()> {
     persist_graph(store, composer, goal_key, status_override).await?;
     persist_agent_lifecycles(store, composer, goal_key, agent_ids).await?;
-    persist_locks(store, composer).await?;
+    let graph_root_id = composer
+        .get_graph(goal_key)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{goal_key}' not found"))?;
+    persist_locks(store, composer, &graph_root_id).await?;
     Ok(())
 }
 
@@ -1390,9 +1395,13 @@ async fn persist_agent_lifecycles(
     Ok(())
 }
 
-async fn persist_locks(store: &SqliteOrchestrationStore, composer: &Composer) -> Result<()> {
+async fn persist_locks(
+    store: &SqliteOrchestrationStore,
+    composer: &Composer,
+    graph_root_id: &str,
+) -> Result<()> {
     let snapshot = serde_json::to_string(&composer.file_locks().snapshot())?;
-    store.save_lock_snapshot(&snapshot).await?;
+    store.save_lock_snapshot(graph_root_id, &snapshot).await?;
     Ok(())
 }
 
@@ -1460,19 +1469,19 @@ fn configured_audit_path(config: &OdinConfig) -> PathBuf {
     )
 }
 
-fn build_audit_logger(config: &OdinConfig) -> odin_audit::AuditLoggerImpl {
-    odin_audit::AuditLoggerImpl::new(odin_audit::AuditLoggerConfig {
+fn build_audit_logger(config: &OdinConfig) -> Result<odin_audit::AuditLoggerImpl> {
+    odin_audit::AuditLoggerImpl::try_new(odin_audit::AuditLoggerConfig {
         enabled: config.audit.enabled,
         file_path: config
             .audit
             .enabled
             .then_some(configured_audit_path(config)),
-        db_path: None,
-        json_format: config.audit.json_format,
-        buffer_size: 100,
+        json_format: true,
+        buffer_size: 1,
         history_size: 1_000,
         mask_secrets: true,
     })
+    .map_err(|error| anyhow::anyhow!("failed to open audit sink: {error}"))
 }
 
 async fn load_mcp_tools(registry: &odin_tools::ToolRegistry, config: &OdinConfig) {
@@ -1495,11 +1504,21 @@ async fn load_mcp_tools(registry: &odin_tools::ToolRegistry, config: &OdinConfig
             continue;
         }
 
-        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = Arc::new(Mutex::new(
+        let transport = Arc::new(Mutex::new(
             StdioTransport::new(&server_cfg.command, server_cfg.args.clone())
                 .with_env(server_cfg.env.clone()),
         ));
 
+        if let Err(error) = transport.lock().await.connect().await {
+            tracing::warn!(
+                "[TUI/MCP] Failed to spawn server '{}': {}",
+                server_cfg.name,
+                error
+            );
+            continue;
+        }
+
+        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = transport;
         let mut client = McpClient::new(transport);
         let shared_client = match client.connect().await {
             Ok(()) => Arc::new(Mutex::new(client)),

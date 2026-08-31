@@ -113,6 +113,12 @@ separate listeners. The public API defaults to `127.0.0.1:9177`; the management
 API defaults to loopback-only `127.0.0.1:9178`. Every management request needs
 the shared operator credential as `Authorization: Bearer <token>`.
 
+If the public listener is bound to a non-loopback address, configure
+`gateway.public_auth_token_env` (preferred) or `gateway.public_auth_token`; the
+server refuses an unauthenticated public bind unless
+`gateway.allow_insecure_non_loopback: true` is explicitly set for a trusted
+upstream boundary. Public HTTP and WebSocket requests use that bearer token.
+
 Configure `gateway.control_token` or `gateway.control_token_env`. If neither is
 set, `raven serve` generates an ephemeral token and prints it once at startup.
 An authenticated operator can list redacted pending calls with **GET

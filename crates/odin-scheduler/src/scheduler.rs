@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{Duration, Instant, interval, timeout_at};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 async fn reserve_due_job(
@@ -560,13 +560,13 @@ impl Scheduler {
                     }
 
                     if let Some(logger) = &audit_logger {
-                        let _ = logger
+                        if let Err(error) = logger
                             .log(AuditEntry {
                                 id: Uuid::new_v4(),
                                 timestamp: Utc::now(),
                                 agent_id: runtime_dispatch
                                     .as_ref()
-                                    .map_or_else(Uuid::nil, |(_, agent_id, _)| *agent_id),
+                                    .map_or(job_id, |(_, agent_id, _)| *agent_id),
                                 session_id: job_id,
                                 event_type: AuditEventType::SessionStart,
                                 action: "scheduler_job_started".into(),
@@ -577,12 +577,15 @@ impl Scheduler {
                                 }),
                                 result: AuditResult::Pending,
                             })
-                            .await;
+                            .await
+                        {
+                            error!(job_id = %job_id, "Failed to write scheduler start audit record: {error}");
+                        }
                     }
 
                     let execution_agent_id = runtime_dispatch
                         .as_ref()
-                        .map_or_else(Uuid::nil, |(_, agent_id, _)| *agent_id);
+                        .map_or(job_id, |(_, agent_id, _)| *agent_id);
                     let handle = if let Some((runtime, agent_id, goal)) = runtime_dispatch {
                         // Runtime-driven execution path in the loop
                         let store = store.clone();
@@ -628,7 +631,10 @@ impl Scheduler {
                             job_id,
                             job_name: name.clone(),
                             task_id,
-                            agent_id: Uuid::nil(),
+                            // Closure jobs have no runtime agent; use the
+                            // stable job identity rather than emitting a nil
+                            // audit principal.
+                            agent_id: job_id,
                         };
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -718,7 +724,7 @@ impl Scheduler {
             warn!(task_id = %execution.task_id, "Failed to persist cancelled scheduler run: {persist_error}");
         }
         if let Some(logger) = &self.audit_logger {
-            let _ = logger
+            if let Err(error) = logger
                 .log(AuditEntry {
                     id: Uuid::new_v4(),
                     timestamp: Utc::now(),
@@ -734,7 +740,10 @@ impl Scheduler {
                     }),
                     result: AuditResult::Failure,
                 })
-                .await;
+                .await
+            {
+                error!(job_id = %execution.job_id, "Failed to write scheduler cancellation audit record: {error}");
+            }
         }
     }
 
@@ -790,7 +799,7 @@ impl ExecutionCompletion {
             warn!(task_id = %self.task_id, "Failed to persist scheduler outcome: {persist_error}");
         }
         if let Some(logger) = self.audit_logger {
-            let _ = logger
+            if let Err(error) = logger
                 .log(AuditEntry {
                     id: Uuid::new_v4(),
                     timestamp: Utc::now(),
@@ -810,7 +819,10 @@ impl ExecutionCompletion {
                         AuditResult::Failure
                     },
                 })
-                .await;
+                .await
+            {
+                error!(job_id = %self.job_id, "Failed to write scheduler completion audit record: {error}");
+            }
         }
         self.running_guard.release().await;
     }

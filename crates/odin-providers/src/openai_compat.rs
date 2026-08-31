@@ -1,5 +1,6 @@
 //! OpenAI-compatible provider (works with OpenAI, Ollama, vLLM, Groq, DeepSeek, etc.)
 
+use crate::provider_http_error;
 use async_trait::async_trait;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{ChatStream, Provider};
@@ -182,8 +183,14 @@ impl Provider for OpenAiCompatProvider {
             OdinError::provider(&self.name, format!("Failed to list models: {}", e))
         })?;
 
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(provider_http_error(&self.name, status, body));
+        }
+
         let json: Value = resp.json().await.map_err(|e| {
-            OdinError::provider(&self.name, format!("Invalid models response: {}", e))
+            OdinError::provider_permanent(&self.name, format!("Invalid models response: {}", e))
         })?;
 
         let models = json["data"]
@@ -225,15 +232,12 @@ impl Provider for OpenAiCompatProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(OdinError::provider(
-                &self.name,
-                format!("HTTP {}: {}", status.as_u16(), text),
-            ));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(provider_http_error(&self.name, status.as_u16(), body));
         }
 
         let json: Value = resp.json().await.map_err(|e| {
-            OdinError::provider(&self.name, format!("Invalid chat response: {}", e))
+            OdinError::provider_permanent(&self.name, format!("Invalid chat response: {}", e))
         })?;
 
         let choice = &json["choices"][0];

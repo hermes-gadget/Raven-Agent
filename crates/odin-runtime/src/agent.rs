@@ -81,16 +81,6 @@ impl Agent {
         &self.engine
     }
 
-    /// Add a tool to this agent.
-    pub fn add_tool(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
-    }
-
-    /// Remove a tool by name.
-    pub fn remove_tool(&mut self, name: &str) {
-        self.tools.retain(|t| t.name() != name);
-    }
-
     /// Check if the agent has a tool with the given name.
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t.name() == name)
@@ -210,12 +200,10 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_tool_management() {
+    fn test_agent_tool_inventory() {
         let engine = Arc::new(MockEngine);
         let provider = Arc::new(MockProvider);
-        let mut agent = Agent::new("test", engine, provider, vec![]);
 
-        // Add a mock tool
         struct MockTool;
         #[async_trait]
         impl Tool for MockTool {
@@ -246,12 +234,9 @@ mod tests {
             }
         }
 
-        agent.add_tool(Arc::new(MockTool));
+        let agent = Agent::new("test", engine, provider, vec![Arc::new(MockTool)]);
         assert_eq!(agent.tools().len(), 1);
         assert!(agent.has_tool("mock-tool"));
-
-        agent.remove_tool("mock-tool");
-        assert_eq!(agent.tools().len(), 0);
     }
 
     #[tokio::test]

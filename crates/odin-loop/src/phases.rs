@@ -65,6 +65,8 @@ pub struct PhaseContext {
     pub reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
     /// Optional small/local model profile for bounded prompts and retries
     pub model_profile: Option<SmallModelProfile>,
+    /// Central limits shared by all tool execution paths.
+    pub resource_budgets: odin_core::config::ResourceBudgetConfig,
 }
 
 impl PhaseContext {
@@ -123,7 +125,7 @@ impl Phase for PlanPhase {
                     ));
                 }
                 skills_prompt.push_str(
-                    "\nTo use a skill, include [USE_SKILL: skill-name] in your response.\n",
+                    "\nSkill metadata is informational; use the listed tools directly.\n",
                 );
 
                 // Append to the first system message
@@ -291,7 +293,14 @@ impl Phase for ActPhase {
                             context.tool_registry
                         {
                             let mut results = Vec::new();
-                            for tc in calls {
+                            let task_calls = state.tool_results.len() as u32;
+                            let max_calls = context.resource_budgets.max_tool_calls_per_turn.min(
+                                context
+                                    .resource_budgets
+                                    .max_tool_calls_per_task
+                                    .saturating_sub(task_calls),
+                            ) as usize;
+                            for tc in calls.iter().take(max_calls) {
                                 let attempt_start = std::time::Instant::now();
                                 let tool_name = tc.function.name.clone();
                                 let requested_dry_run =
@@ -302,11 +311,12 @@ impl Phase for ActPhase {
                                         if !requested_dry_run
                                             && let Some(tracker) = &context.reliability_tracker
                                         {
-                                            tracker.record_outcome(
+                                            tracker.record_outcome_async(
                                                 &tool_name,
                                                 odin_tools::ReliabilityOutcome::ValidationFailure,
                                                 attempt_start.elapsed().as_millis() as u64,
-                                            );
+                                            )
+                                            .await;
                                         }
                                         let tr = ToolResult {
                                             call_id: tc.id.clone(),
@@ -320,13 +330,26 @@ impl Phase for ActPhase {
                                             duration_ms: 0,
                                             timestamp: chrono::Utc::now(),
                                         };
+                                        audit_tool_event(
+                                            context,
+                                            state,
+                                            tc,
+                                            &tool_name,
+                                            serde_json::json!({
+                                                "permission_decision": "unavailable",
+                                                "error": tr.error.clone(),
+                                            }),
+                                            AuditResult::Failure,
+                                        )
+                                        .await?;
                                         results.push(tr);
                                         continue;
                                     }
                                 };
+                                let capability_tags = tool.capability_tags();
                                 let is_dry_run = !should_record_reliability(
                                     &tc.function.arguments,
-                                    tool.capability_tags(),
+                                    &capability_tags,
                                 );
 
                                 let schema = tool.schema();
@@ -354,12 +377,13 @@ impl Phase for ActPhase {
                                                         && let Some(tracker) =
                                                             &context.reliability_tracker
                                                     {
-                                                        tracker.record_outcome(
+                                                        tracker.record_outcome_async(
                                                                 &tool_name,
                                                                 odin_tools::ReliabilityOutcome::ValidationFailure,
                                                                 attempt_start.elapsed().as_millis()
                                                                     as u64,
-                                                            );
+                                                            )
+                                                            .await;
                                                     }
                                                     let tr = tool_arg_error_result(
                                                         &tc,
@@ -369,6 +393,18 @@ impl Phase for ActPhase {
                                                             validation_error
                                                         ),
                                                     );
+                                                    audit_tool_event(
+                                                        context,
+                                                        state,
+                                                        tc,
+                                                        &tool_name,
+                                                        serde_json::json!({
+                                                            "permission_decision": "validation_failed",
+                                                            "error": tr.error.clone(),
+                                                        }),
+                                                        AuditResult::Failure,
+                                                    )
+                                                    .await?;
                                                     results.push(tr);
                                                     continue;
                                                 }
@@ -396,18 +432,31 @@ impl Phase for ActPhase {
                                                     && let Some(tracker) =
                                                         &context.reliability_tracker
                                                 {
-                                                    tracker.record_outcome(
+                                                    tracker.record_outcome_async(
                                                             &tool_name,
                                                             odin_tools::ReliabilityOutcome::ValidationFailure,
                                                             attempt_start.elapsed().as_millis()
                                                                 as u64,
-                                                        );
+                                                        )
+                                                        .await;
                                                 }
                                                 let tr = tool_arg_error_result(
                                                     &tc,
                                                     &tool_name,
                                                     format!("Invalid tool args: {}", parse_error),
                                                 );
+                                                audit_tool_event(
+                                                    context,
+                                                    state,
+                                                    tc,
+                                                    &tool_name,
+                                                    serde_json::json!({
+                                                        "permission_decision": "validation_failed",
+                                                        "error": tr.error.clone(),
+                                                    }),
+                                                    AuditResult::Failure,
+                                                )
+                                                .await?;
                                                 results.push(tr);
                                                 continue;
                                             }
@@ -420,6 +469,7 @@ impl Phase for ActPhase {
                                     session_id: state.task.id,
                                     working_dir: std::env::current_dir().unwrap_or_default(),
                                     env: std::collections::HashMap::new(),
+                                    resource_budgets: context.resource_budgets.clone(),
                                 };
 
                                 // Enforce rate limits, explicit policy rules, approval gates,
@@ -473,8 +523,9 @@ impl Phase for ActPhase {
                                                 && policy.requires_approval());
                                     if error.is_none() && needs_approval {
                                         match policy
-                                            .request_approval(
+                                            .request_approval_for_session(
                                                 tool_context.agent_id,
+                                                state.task.id,
                                                 &tool_name,
                                                 &args.to_string(),
                                             )
@@ -536,11 +587,13 @@ impl Phase for ActPhase {
                                     if !is_dry_run
                                         && let Some(tracker) = &context.reliability_tracker
                                     {
-                                        tracker.record_outcome(
-                                            &tool_name,
-                                            odin_tools::ReliabilityOutcome::PolicyDenial,
-                                            attempt_start.elapsed().as_millis() as u64,
-                                        );
+                                        tracker
+                                            .record_outcome_async(
+                                                &tool_name,
+                                                odin_tools::ReliabilityOutcome::PolicyDenial,
+                                                attempt_start.elapsed().as_millis() as u64,
+                                            )
+                                            .await;
                                     }
                                     let tr = ToolResult {
                                         call_id: tc.id.clone(),
@@ -551,6 +604,18 @@ impl Phase for ActPhase {
                                         duration_ms: 0,
                                         timestamp: chrono::Utc::now(),
                                     };
+                                    audit_tool_event(
+                                        context,
+                                        state,
+                                        tc,
+                                        &tool_name,
+                                        serde_json::json!({
+                                            "permission_decision": "denied",
+                                            "error": tr.error.clone(),
+                                        }),
+                                        AuditResult::Denied,
+                                    )
+                                    .await?;
                                     results.push(tr);
                                     continue;
                                 }
@@ -563,38 +628,68 @@ impl Phase for ActPhase {
                                     SecretRedactor::full().redact(&args.to_string());
                                 let input_summary: String =
                                     redacted_args.chars().take(200).collect();
-                                let (mut tr, outcome) =
-                                    match tool.execute(args, &tool_context).await {
-                                        Ok(tr) => {
-                                            let outcome = if tr.success {
-                                                odin_tools::ReliabilityOutcome::Success
-                                            } else {
-                                                odin_tools::ReliabilityOutcome::ToolFailure
-                                            };
-                                            (tr, outcome)
-                                        }
-                                        Err(e) => {
-                                            let outcome = odin_tools::classify_tool_error(&e);
-                                            (
-                                                ToolResult {
-                                                    call_id: tc.id.clone(),
-                                                    tool_name: tool_name.clone(),
-                                                    success: false,
-                                                    output: String::new(),
-                                                    error: Some(e.to_string()),
-                                                    duration_ms: start.elapsed().as_millis() as u64,
-                                                    timestamp: chrono::Utc::now(),
-                                                },
-                                                outcome,
-                                            )
-                                        }
-                                    };
+                                let (mut tr, outcome) = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(
+                                        context.resource_budgets.max_tool_timeout_secs.max(1),
+                                    ),
+                                    tool.execute(args, &tool_context),
+                                )
+                                .await
+                                {
+                                    Err(_) => (
+                                        ToolResult {
+                                            call_id: tc.id.clone(),
+                                            tool_name: tool_name.clone(),
+                                            success: false,
+                                            output: String::new(),
+                                            error: Some(format!(
+                                                "tool '{tool_name}' exceeded the {} second budget",
+                                                context
+                                                    .resource_budgets
+                                                    .max_tool_timeout_secs
+                                                    .max(1)
+                                            )),
+                                            duration_ms: start.elapsed().as_millis() as u64,
+                                            timestamp: chrono::Utc::now(),
+                                        },
+                                        odin_tools::ReliabilityOutcome::TransportFailure,
+                                    ),
+                                    Ok(Ok(tr)) => {
+                                        let outcome = if tr.success {
+                                            odin_tools::ReliabilityOutcome::Success
+                                        } else {
+                                            odin_tools::ReliabilityOutcome::ToolFailure
+                                        };
+                                        (tr, outcome)
+                                    }
+                                    Ok(Err(e)) => {
+                                        let outcome = odin_tools::classify_tool_error(&e);
+                                        (
+                                            ToolResult {
+                                                call_id: tc.id.clone(),
+                                                tool_name: tool_name.clone(),
+                                                success: false,
+                                                output: String::new(),
+                                                error: Some(e.to_string()),
+                                                duration_ms: start.elapsed().as_millis() as u64,
+                                                timestamp: chrono::Utc::now(),
+                                            },
+                                            outcome,
+                                        )
+                                    }
+                                };
+                                truncate_tool_result(
+                                    &mut tr,
+                                    context.resource_budgets.max_tool_output_bytes,
+                                );
                                 if !is_dry_run && let Some(tracker) = &context.reliability_tracker {
-                                    tracker.record_outcome(
-                                        &tool_name,
-                                        outcome,
-                                        start.elapsed().as_millis() as u64,
-                                    );
+                                    tracker
+                                        .record_outcome_async(
+                                            &tool_name,
+                                            outcome,
+                                            start.elapsed().as_millis() as u64,
+                                        )
+                                        .await;
                                 }
 
                                 // Apply secret redaction before audit logging
@@ -613,40 +708,102 @@ impl Phase for ActPhase {
                                     let audit_entry = AuditEntry {
                                         id: uuid::Uuid::new_v4(),
                                         timestamp: chrono::Utc::now(),
-                                        agent_id: uuid::Uuid::default(),
-                                        session_id: uuid::Uuid::default(),
+                                        agent_id: context.principal_id,
+                                        session_id: state.task.id,
                                         event_type: AuditEventType::ToolCall,
                                         action: tool_name.clone(),
-                                        details,
+                                        details: serde_json::json!({
+                                            "call_id": tc.id,
+                                            "task_id": state.task.id,
+                                            "agent_id": context.principal_id,
+                                            "input_summary": details["input_summary"].clone(),
+                                            "result": details["result"].clone(),
+                                            "duration_ms": details["duration_ms"].clone(),
+                                            "permission_decision": details["permission_decision"].clone(),
+                                        }),
                                         result: if tr.success {
                                             AuditResult::Success
                                         } else {
                                             AuditResult::Failure
                                         },
                                     };
-                                    let _ = audit_logger.log(audit_entry).await;
+                                    audit_logger.log(audit_entry).await?;
                                 }
 
+                                results.push(tr);
+                            }
+                            for tc in calls.iter().skip(max_calls) {
+                                let error = format!(
+                                    "tool-call budget exceeded: at most {max_calls} calls are allowed per turn"
+                                );
+                                let tr = tool_arg_error_result(tc, &tc.function.name, error);
+                                audit_tool_event(
+                                    context,
+                                    state,
+                                    tc,
+                                    &tc.function.name,
+                                    serde_json::json!({
+                                        "permission_decision": "budget_denied"
+                                    }),
+                                    AuditResult::Denied,
+                                )
+                                .await?;
                                 results.push(tr);
                             }
                             results
                         } else {
                             // A model requested tools that this engine cannot dispatch.
-                            calls
-                                .iter()
-                                .map(|tc| ToolResult {
-                                    call_id: tc.id.clone(),
-                                    tool_name: tc.function.name.clone(),
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some(format!(
+                            let max_calls = context.resource_budgets.max_tool_calls_per_turn.min(
+                                context
+                                    .resource_budgets
+                                    .max_tool_calls_per_task
+                                    .saturating_sub(state.tool_results.len() as u32),
+                            ) as usize;
+                            let mut results = Vec::new();
+                            for tc in calls.iter().take(max_calls) {
+                                let tr = tool_arg_error_result(
+                                    tc,
+                                    &tc.function.name,
+                                    format!(
                                         "Tool '{}' cannot run because no tool registry is configured",
                                         tc.function.name
-                                    )),
-                                    duration_ms: 0,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .collect()
+                                    ),
+                                );
+                                audit_tool_event(
+                                    context,
+                                    state,
+                                    tc,
+                                    &tc.function.name,
+                                    serde_json::json!({
+                                        "permission_decision": "unavailable",
+                                        "error": tr.error.clone(),
+                                    }),
+                                    AuditResult::Failure,
+                                )
+                                .await?;
+                                results.push(tr);
+                            }
+                            for tc in calls.iter().skip(max_calls) {
+                                let tr = tool_arg_error_result(
+                                    tc,
+                                    &tc.function.name,
+                                    "tool-call budget exceeded".into(),
+                                );
+                                audit_tool_event(
+                                    context,
+                                    state,
+                                    tc,
+                                    &tc.function.name,
+                                    serde_json::json!({
+                                        "permission_decision": "budget_denied",
+                                        "error": tr.error.clone(),
+                                    }),
+                                    AuditResult::Denied,
+                                )
+                                .await?;
+                                results.push(tr);
+                            }
+                            results
                         };
 
                         for tr in &tool_results {
@@ -664,9 +821,10 @@ impl Phase for ActPhase {
                     }
                 }
                 Err(e) => {
-                    let err_msg = format!("LLM call failed: {}", e);
-                    state.messages.push(Message::assistant(err_msg.clone()));
-                    (err_msg, vec![])
+                    // Preserve the typed provider failure for callers and retry
+                    // policy. Turning it into assistant prose makes an outage
+                    // indistinguishable from a legitimate model response.
+                    return Err(e);
                 }
             }
         } else {
@@ -1312,8 +1470,57 @@ fn tool_arg_error_result(tc: &ToolCall, tool_name: &str, error: String) -> ToolR
     }
 }
 
-fn should_record_reliability(arguments: &str, capability_tags: &[&str]) -> bool {
-    if capability_tags.contains(&"dry-run") {
+async fn audit_tool_event(
+    context: &PhaseContext,
+    state: &LoopState,
+    call: &ToolCall,
+    tool_name: &str,
+    mut details: serde_json::Value,
+    result: AuditResult,
+) -> OdinResult<()> {
+    let Some(logger) = context.audit_logger.as_ref() else {
+        return Ok(());
+    };
+    if let Some(object) = details.as_object_mut() {
+        object.insert("call_id".into(), serde_json::json!(call.id));
+        object.insert("task_id".into(), serde_json::json!(state.task.id));
+        object.insert("agent_id".into(), serde_json::json!(context.principal_id));
+    }
+    logger
+        .log(AuditEntry {
+            id: uuid::Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent_id: context.principal_id,
+            session_id: state.task.id,
+            event_type: AuditEventType::ToolCall,
+            action: tool_name.to_string(),
+            details,
+            result,
+        })
+        .await
+}
+
+fn truncate_tool_result(result: &mut ToolResult, max_bytes: usize) {
+    truncate_string(&mut result.output, max_bytes.max(1));
+    if let Some(error) = result.error.as_mut() {
+        truncate_string(error, max_bytes.max(1));
+    }
+}
+
+fn truncate_string(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(" [truncated]");
+}
+
+fn should_record_reliability(arguments: &str, capability_tags: &[String]) -> bool {
+    if capability_tags.iter().any(|tag| tag == "dry-run") {
         return false;
     }
     !serde_json::from_str::<serde_json::Value>(arguments)
@@ -1438,7 +1645,10 @@ mod reliability_tests {
     #[test]
     fn dry_run_requests_are_excluded_from_reliability() {
         assert!(!should_record_reliability(r#"{"dry_run":true}"#, &[]));
-        assert!(!should_record_reliability("{}", &["dry-run", "safe"]));
+        assert!(!should_record_reliability(
+            "{}",
+            &["dry-run".into(), "safe".into()]
+        ));
         assert!(should_record_reliability(r#"{"dry_run":false}"#, &[]));
         assert!(should_record_reliability("{}", &[]));
     }

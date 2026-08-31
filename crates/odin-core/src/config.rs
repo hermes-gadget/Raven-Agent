@@ -43,6 +43,10 @@ pub struct OdinConfig {
     /// Scheduler configuration
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+
+    /// Central resource and payload budgets shared by all execution surfaces.
+    #[serde(default)]
+    pub budgets: ResourceBudgetConfig,
 }
 
 impl OdinConfig {
@@ -69,7 +73,10 @@ impl OdinConfig {
         let contents = serde_yaml::to_string(self).map_err(|e| {
             crate::error::OdinError::Config(format!("Failed to serialize config: {}", e))
         })?;
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|e| {
                 crate::error::OdinError::Config(format!(
                     "Failed to create config directory {}: {}",
@@ -78,13 +85,196 @@ impl OdinConfig {
                 ))
             })?;
         }
-        std::fs::write(path, contents).map_err(|e| {
+        let temporary = path.with_extension(format!(
+            "{}.tmp-{}",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("yaml"),
+            std::process::id()
+        ));
+        std::fs::write(&temporary, contents).map_err(|e| {
             crate::error::OdinError::Config(format!(
-                "Failed to write config file {}: {}",
+                "Failed to write temporary config file {}: {}",
+                temporary.display(),
+                e
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    crate::error::OdinError::Config(format!(
+                        "Failed to restrict config file permissions {}: {}",
+                        temporary.display(),
+                        e
+                    ))
+                },
+            )?;
+        }
+
+        std::fs::rename(&temporary, path).map_err(|e| {
+            crate::error::OdinError::Config(format!(
+                "Failed to atomically replace config file {}: {}",
                 path.display(),
                 e
             ))
         })
+    }
+}
+
+/// Central limits applied to caller-controlled payloads and work.
+///
+/// Individual tools may impose a stricter limit, but they must never raise
+/// these ceilings. Keeping the values in one serializable object prevents the
+/// HTTP, CLI, scheduler, and loop surfaces from silently drifting apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceBudgetConfig {
+    /// Maximum model-requested tool calls in one ACT turn.
+    #[serde(default = "default_budget_tool_calls")]
+    pub max_tool_calls_per_turn: u32,
+    /// Maximum tool calls across the complete task execution.
+    #[serde(default = "default_budget_task_tool_calls")]
+    pub max_tool_calls_per_task: u32,
+    /// Maximum retained output from one tool invocation.
+    #[serde(default = "default_budget_output_bytes")]
+    pub max_tool_output_bytes: usize,
+    /// Maximum wall-clock time for one tool invocation.
+    #[serde(default = "default_budget_timeout_secs")]
+    pub max_tool_timeout_secs: u64,
+    /// Maximum network diagnostic packets requested by a caller.
+    #[serde(default = "default_budget_ping_count")]
+    pub max_network_ping_count: u32,
+    /// Maximum request body accepted by an HTTP gateway surface.
+    #[serde(default = "default_budget_request_bytes")]
+    pub max_request_bytes: usize,
+    /// Maximum context bytes accepted by an HTTP gateway surface.
+    #[serde(default = "default_budget_context_bytes")]
+    pub max_context_bytes: usize,
+}
+
+fn default_budget_tool_calls() -> u32 {
+    10
+}
+
+fn default_budget_task_tool_calls() -> u32 {
+    100
+}
+
+fn default_budget_output_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_budget_timeout_secs() -> u64 {
+    60
+}
+
+fn default_budget_ping_count() -> u32 {
+    4
+}
+
+fn default_budget_request_bytes() -> usize {
+    128 * 1024
+}
+
+fn default_budget_context_bytes() -> usize {
+    64 * 1024
+}
+
+impl Default for ResourceBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_calls_per_turn: default_budget_tool_calls(),
+            max_tool_calls_per_task: default_budget_task_tool_calls(),
+            max_tool_output_bytes: default_budget_output_bytes(),
+            max_tool_timeout_secs: default_budget_timeout_secs(),
+            max_network_ping_count: default_budget_ping_count(),
+            max_request_bytes: default_budget_request_bytes(),
+            max_context_bytes: default_budget_context_bytes(),
+        }
+    }
+}
+
+impl OdinConfig {
+    /// Return the effective budget after applying legacy per-agent/tool caps.
+    pub fn effective_resource_budgets(&self) -> ResourceBudgetConfig {
+        let mut budgets = self.budgets.clone();
+        budgets.max_tool_calls_per_turn = budgets
+            .max_tool_calls_per_turn
+            .min(self.agent.max_tool_calls_per_turn);
+        budgets.max_tool_timeout_secs = budgets
+            .max_tool_timeout_secs
+            .min(self.tools.default_timeout_secs.max(1));
+        budgets
+    }
+
+    /// Validate the semantic ranges that cannot be expressed by serde alone.
+    pub fn validate(&self) -> Result<(), crate::error::OdinError> {
+        if self.budgets.max_tool_calls_per_turn == 0 || self.budgets.max_tool_calls_per_turn > 100 {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_tool_calls_per_turn must be between 1 and 100".into(),
+            ));
+        }
+        if self.budgets.max_tool_calls_per_task == 0
+            || self.budgets.max_tool_calls_per_task > 10_000
+        {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_tool_calls_per_task must be between 1 and 10000".into(),
+            ));
+        }
+        if self.budgets.max_tool_output_bytes == 0
+            || self.budgets.max_tool_output_bytes > 16 * 1024 * 1024
+        {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_tool_output_bytes must be between 1 and 16777216".into(),
+            ));
+        }
+        if self.budgets.max_tool_timeout_secs == 0 || self.budgets.max_tool_timeout_secs > 300 {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_tool_timeout_secs must be between 1 and 300".into(),
+            ));
+        }
+        if self.budgets.max_network_ping_count == 0 || self.budgets.max_network_ping_count > 32 {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_network_ping_count must be between 1 and 32".into(),
+            ));
+        }
+        if self.budgets.max_request_bytes == 0 || self.budgets.max_request_bytes > 1024 * 1024 {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_request_bytes must be between 1 and 1048576".into(),
+            ));
+        }
+        if self.budgets.max_context_bytes == 0 || self.budgets.max_context_bytes > 4 * 1024 * 1024 {
+            return Err(crate::error::OdinError::Config(
+                "budgets.max_context_bytes must be between 1 and 4194304".into(),
+            ));
+        }
+
+        let budgets = self.effective_resource_budgets();
+        if budgets.max_tool_calls_per_turn == 0 {
+            return Err(crate::error::OdinError::Config(
+                "the effective tool-call budget must be greater than zero".into(),
+            ));
+        }
+        if self.audit.enabled && !self.audit.json_format {
+            return Err(crate::error::OdinError::Config(
+                "audit.json_format must be true for correlatable durable audit records".into(),
+            ));
+        }
+        for (index, pattern) in self.safety.dangerous_commands.iter().enumerate() {
+            regex::Regex::new(pattern).map_err(|error| {
+                crate::error::OdinError::Config(format!(
+                    "safety.dangerous_commands[{index}] is not a valid regex: {error}"
+                ))
+            })?;
+        }
+        if self.memory.max_entries == 0 {
+            return Err(crate::error::OdinError::Config(
+                "memory.max_entries must be greater than zero".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -185,7 +375,7 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
 
     /// API key (or env var name)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub api_key: Option<String>,
 
     /// Environment variable name for the API key
@@ -551,7 +741,7 @@ pub struct AuditConfig {
     pub log_path: Option<PathBuf>,
 
     /// Log in JSON format
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub json_format: bool,
 }
 
@@ -560,7 +750,7 @@ impl Default for AuditConfig {
         Self {
             enabled: true,
             log_path: None,
-            json_format: false,
+            json_format: true,
         }
     }
 }
@@ -586,7 +776,7 @@ pub struct GatewayConfig {
     pub discord_enabled: bool,
 
     /// Discord bot token (or env var name)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub discord_token: Option<String>,
 
     /// Discord token env var name
@@ -612,12 +802,28 @@ pub struct GatewayConfig {
     /// Optional shared operator credential for the management API and
     /// WebSocket pause/resume/cancel commands. When unset, `raven serve`
     /// generates an ephemeral credential and prints it once at startup.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub control_token: Option<String>,
 
     /// Environment variable containing the shared operator credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_token_env: Option<String>,
+
+    /// Bearer credential required by the public HTTP and WebSocket listener
+    /// when configured. Prefer `public_auth_token_env` so the secret is never
+    /// serialized into a config file.
+    #[serde(default, skip_serializing)]
+    pub public_auth_token: Option<String>,
+
+    /// Environment variable containing the public listener credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_auth_token_env: Option<String>,
+
+    /// Explicitly permit an unauthenticated non-loopback public listener.
+    /// This is intentionally opt-in and should only be used behind another
+    /// trusted authentication boundary.
+    #[serde(default)]
+    pub allow_insecure_non_loopback: bool,
 }
 
 fn default_http_addr() -> String {
@@ -643,6 +849,9 @@ impl Default for GatewayConfig {
             discord_allow_dms: false,
             control_token: None,
             control_token_env: None,
+            public_auth_token: None,
+            public_auth_token_env: None,
+            allow_insecure_non_loopback: false,
         }
     }
 }
@@ -692,5 +901,85 @@ impl Default for SchedulerConfig {
             db_path: None,
             shutdown_grace_secs: default_scheduler_shutdown_grace(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_budget_and_audit_fields_use_safe_defaults() {
+        let config: OdinConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.budgets.max_tool_calls_per_task, 100);
+        assert!(config.audit.json_format);
+    }
+
+    #[test]
+    fn invalid_budget_and_safety_configuration_is_rejected() {
+        let mut config = OdinConfig::default();
+        config.budgets.max_tool_output_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = OdinConfig::default();
+        config.budgets.max_tool_calls_per_turn = 101;
+        assert!(config.validate().is_err());
+
+        let mut config = OdinConfig::default();
+        config.safety.dangerous_commands = vec!["[unterminated".into()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_save_replaces_atomically_and_restricts_file_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        OdinConfig::default().save(&path).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("yaml.tmp").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn config_serialization_omits_direct_secret_values() {
+        let mut config = OdinConfig::default();
+        config.gateway.discord_token = Some("discord-secret".into());
+        config.gateway.control_token = Some("operator-secret".into());
+        config.gateway.public_auth_token = Some("public-secret".into());
+        config.models.providers.insert(
+            "hosted".into(),
+            ProviderConfig {
+                provider_type: "openai_compat".into(),
+                base_url: None,
+                api_key: Some("provider-secret".into()),
+                api_key_env: Some("RAVEN_TEST_PROVIDER_KEY".into()),
+                default_model: Some("model".into()),
+                headers: HashMap::new(),
+                timeout_secs: 120,
+                max_retries: 3,
+                fallback_chain: None,
+                health_check_interval_secs: 0,
+                circuit_breaker_threshold: 0,
+            },
+        );
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        for secret in [
+            "discord-secret",
+            "operator-secret",
+            "public-secret",
+            "provider-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        assert!(serialized.contains("RAVEN_TEST_PROVIDER_KEY"));
     }
 }

@@ -58,6 +58,8 @@ pub struct Engine {
     critique_model_name: Option<String>,
     /// Optional small/local model profile used to bound prompts, retries, and context.
     model_profile: Option<SmallModelProfile>,
+    /// Central limits shared by all tool execution paths.
+    resource_budgets: odin_core::config::ResourceBudgetConfig,
 }
 
 impl Engine {
@@ -81,6 +83,7 @@ impl Engine {
             planning_model_name: None,
             critique_model_name: None,
             model_profile: None,
+            resource_budgets: odin_core::config::ResourceBudgetConfig::default(),
         }
     }
 
@@ -179,6 +182,15 @@ impl Engine {
         self
     }
 
+    /// Set the central tool-call/output/time budgets used by every ACT phase.
+    pub fn with_resource_budgets(
+        mut self,
+        budgets: odin_core::config::ResourceBudgetConfig,
+    ) -> Self {
+        self.resource_budgets = budgets;
+        self
+    }
+
     /// Set custom confidence thresholds.
     pub fn with_confidence_thresholds(mut self, low: f64, high: f64) -> Self {
         self.confidence_scorer.low_threshold = low;
@@ -268,6 +280,7 @@ impl LoopEngineTrait for Engine {
             audit_logger: self.audit_logger.clone(),
             reliability_tracker: self.reliability_tracker.clone(),
             model_profile: self.model_profile.clone(),
+            resource_budgets: self.resource_budgets.clone(),
         };
 
         let mut total_tool_calls = 0u32;
@@ -472,6 +485,7 @@ impl LoopEngineTrait for Engine {
             audit_logger: self.audit_logger.clone(),
             reliability_tracker: self.reliability_tracker.clone(),
             model_profile: self.model_profile.clone(),
+            resource_budgets: self.resource_budgets.clone(),
         };
 
         match phase {
@@ -937,7 +951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_error_graceful_degradation() {
+    async fn test_provider_error_remains_typed_and_fail_closed() {
         struct FailingProvider;
         #[async_trait]
         impl ProviderTrait for FailingProvider {
@@ -978,9 +992,9 @@ mod tests {
             .with_provider(Arc::new(FailingProvider))
             .with_max_iterations(5);
         let task = make_task("Do something");
-        let result = engine.execute_task(&task).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.is_some());
+        let error = engine.execute_task(&task).await.unwrap_err();
+        assert!(matches!(error, OdinError::Provider { .. }));
+        assert!(error.is_retryable());
     }
 
     #[tokio::test]
@@ -1450,6 +1464,7 @@ mod tests {
             session_id: uuid::Uuid::default(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: std::collections::HashMap::new(),
+            resource_budgets: Default::default(),
         };
         let result = shell_tool.execute(args, &context).await.unwrap();
         assert!(!result.success, "Dangerous command should not succeed");

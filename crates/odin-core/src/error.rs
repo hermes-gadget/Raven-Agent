@@ -16,6 +16,17 @@ pub enum OdinError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
+    /// A provider rejected the request or returned an invalid response. This
+    /// is intentionally distinct from a transport/provider outage so fallback
+    /// and orchestration code cannot retry it blindly.
+    #[error("Non-retryable provider error ({provider}): {message}")]
+    ProviderPermanent {
+        provider: String,
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
     #[error("Model error: {0}")]
     Model(String),
 
@@ -70,6 +81,7 @@ impl OdinError {
         match self {
             OdinError::Config(_) => Severity::Error,
             OdinError::Provider { .. } => Severity::Error,
+            OdinError::ProviderPermanent { .. } => Severity::Error,
             OdinError::Model(_) => Severity::Warning,
             OdinError::Tool { .. } => Severity::Warning,
             OdinError::PermissionDenied(_) => Severity::Warning,
@@ -92,7 +104,6 @@ impl OdinError {
         matches!(
             self,
             OdinError::Provider { .. }
-                | OdinError::Model(_)
                 | OdinError::RateLimit(_)
                 | OdinError::Timeout(_)
                 | OdinError::Network(_)
@@ -102,6 +113,15 @@ impl OdinError {
     /// Create a provider error.
     pub fn provider(provider: impl Into<String>, message: impl Into<String>) -> Self {
         OdinError::Provider {
+            provider: provider.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a provider error that must not be retried.
+    pub fn provider_permanent(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        OdinError::ProviderPermanent {
             provider: provider.into(),
             message: message.into(),
             source: None,
@@ -128,3 +148,16 @@ impl OdinError {
 
 /// Convenience Result type.
 pub type OdinResult<T> = Result<T, OdinError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryability_is_explicit_for_provider_failures() {
+        assert!(OdinError::provider("p", "temporary outage").is_retryable());
+        assert!(!OdinError::provider_permanent("p", "bad request").is_retryable());
+        assert!(!OdinError::Validation("bad arguments".into()).is_retryable());
+        assert!(!OdinError::Model("invalid model".into()).is_retryable());
+    }
+}

@@ -71,8 +71,16 @@ impl StdioTransport {
 
     /// Spawn the child process and open communication channels.
     pub async fn connect(&self) -> McpResult<()> {
-        let mut child = Command::new(&self.command)
-            .args(&self.args)
+        // MCP servers are untrusted child processes. Start from an empty
+        // environment and provide only a minimal executable-search path plus
+        // the variables explicitly configured for this server.
+        let inherited_path = std::env::var_os("PATH");
+        let mut command = Command::new(&self.command);
+        command.args(&self.args).env_clear();
+        if let Some(path) = inherited_path {
+            command.env("PATH", path);
+        }
+        let mut child = command
             .envs(&self.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -430,6 +438,7 @@ impl McpTransport for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn oversized_frame_is_drained_before_the_next_response() {
@@ -482,5 +491,36 @@ mod tests {
         assert_eq!(first_rx.await.unwrap().unwrap().result.unwrap()["value"], 1);
         drop(writer);
         dispatcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_child_receives_only_explicit_environment_entries() {
+        struct EnvCleanup(String);
+
+        impl Drop for EnvCleanup {
+            fn drop(&mut self) {
+                // Environment mutation is unsafe in Rust 2024 because another
+                // thread could be reading the process environment concurrently.
+                unsafe { std::env::remove_var(&self.0) };
+            }
+        }
+
+        let secret_key = format!("RAVEN_TEST_PARENT_SECRET_{}", std::process::id());
+        unsafe { std::env::set_var(&secret_key, "must-not-cross") };
+        let _cleanup = EnvCleanup(secret_key.clone());
+        let script = format!(
+            "IFS= read -r _request; printf '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"secret\":\"%s\",\"safe\":\"%s\"}}}}\\n' \"${{{}:-}}\" \"$RAVEN_SAFE\"",
+            secret_key
+        );
+
+        let mut transport = StdioTransport::new("sh", vec!["-c".into(), script]).with_env(
+            HashMap::from([(String::from("RAVEN_SAFE"), String::from("configured"))]),
+        );
+        transport.connect().await.unwrap();
+        let response = transport.send_request("ping", None).await.unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["secret"], "");
+        assert_eq!(result["safe"], "configured");
+        transport.close().await.unwrap();
     }
 }

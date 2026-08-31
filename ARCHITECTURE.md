@@ -63,11 +63,11 @@ The store persists:
 
 - graph structure, node state, results, and overall status;
 - agent lifecycle transitions;
-- the latest file-lock and write-queue snapshot.
+- per-run file-lock and write-queue snapshots, with a latest-snapshot fallback for operator views.
 
 **raven run** and TUI-submitted runs write these records during real execution. **orchestrate submit**, HTTP **/orchestrate**, and Discord **/raven orchestrate submit** create a building-state plan without claiming execution.
 
-Stored pause/resume/cancel changes from the non-interactive **orchestrate** commands are state markers. They are not a cross-process control channel. The TUI can pause, resume, redirect, reprioritise, and cancel the in-process run that it started.
+Pause/resume/cancel changes from the non-interactive **orchestrate** commands are persisted control records consumed by the active process. The TUI can pause, resume, redirect, reprioritise, and cancel the in-process run that it started; HTTP, WebSocket, and Discord management surfaces use the same persisted control path.
 
 ## Tool and permission path
 
@@ -102,7 +102,7 @@ The TUI reads the orchestration database every tick and overlays in-memory runne
 
 The HTTP server exposes health, chat/task, live-registry tool inspection, orchestration plan/state, and WebSocket routes. The **/chat** handler builds a runtime agent with the configured provider, tools, permission engine, memory store, and audit logger.
 
-WebSocket output events are broadcast through the shared connection manager. Inbound pause/resume/cancel messages are parsed but not dispatched to an executor.
+WebSocket task/run events use explicit per-connection subscriptions, so a client does not receive another client’s stream. Direct replies stay on the requesting connection. Public HTTP and WebSocket routes require a bearer token when the listener is non-loopback; pause/resume/cancel remains on the authenticated management/control path.
 
 ### Discord
 
@@ -129,4 +129,4 @@ Configured memory, audit, scheduler, and general data paths override those defau
 
 ## Boundaries still open
 
-The authoritative list is in [TODO.md](TODO.md). The main architectural gaps are general interactive tool-call approvals, cross-process orchestration control, inbound WebSocket control dispatch, orchestrated memory retrieval, continuous scheduler hosting, and persistent reliability samples.
+The authoritative list is in [TODO.md](TODO.md). The main architectural gap still open is general interactive tool-call approval UX; continuous scheduler hosting remains an explicitly configured mode rather than a default background service.

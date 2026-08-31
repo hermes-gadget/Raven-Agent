@@ -112,6 +112,7 @@ async fn test_skills_loaded_and_injected_into_plan_phase() {
         audit_logger: None,
         reliability_tracker: None,
         model_profile: None,
+        resource_budgets: odin_core::config::ResourceBudgetConfig::default(),
     };
 
     let plan_phase = odin_loop::PlanPhase::new(odin_loop::GoalDecomposer::default());
@@ -134,8 +135,12 @@ async fn test_skills_loaded_and_injected_into_plan_phase() {
         "System prompt should mention 'git-workflow' skill"
     );
     assert!(
-        text.contains("[USE_SKILL: skill-name]"),
-        "System prompt should explain how to use skills"
+        text.contains("Skill metadata is informational"),
+        "System prompt should describe the supported skill behavior"
+    );
+    assert!(
+        !text.contains("[USE_SKILL:"),
+        "System prompt must not advertise an unparsed skill marker"
     );
 }
 

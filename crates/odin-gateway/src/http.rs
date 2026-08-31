@@ -10,13 +10,13 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use odin_core::config::ToolsConfig;
+use odin_core::config::{ResourceBudgetConfig, ToolsConfig};
 use odin_core::error::OdinResult;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -61,6 +61,10 @@ pub struct GatewayState {
     pub tool_registry: Arc<odin_tools::ToolRegistry>,
     /// Correlated tool-call approval gate exposed by the approval API.
     pub approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
+    /// Optional bearer credential for the public HTTP and WebSocket surface.
+    pub public_auth_token: Option<Arc<str>>,
+    /// Central request and execution budgets applied by this gateway.
+    pub resource_budgets: ResourceBudgetConfig,
 }
 
 impl Default for GatewayState {
@@ -76,6 +80,8 @@ impl Default for GatewayState {
             ws_manager: None,
             tool_registry: Arc::new(build_tool_registry(None)),
             approval_gate: None,
+            public_auth_token: None,
+            resource_budgets: ResourceBudgetConfig::default(),
         }
     }
 }
@@ -279,6 +285,11 @@ struct OperatorAuth {
     token: Arc<str>,
 }
 
+#[derive(Clone)]
+struct PublicAuth {
+    token: Arc<str>,
+}
+
 async fn require_operator(
     State(auth): State<OperatorAuth>,
     request: Request<Body>,
@@ -317,6 +328,69 @@ fn bearer_token(value: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+async fn require_public(
+    State(auth): State<PublicAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    let authorized = matches!(
+        odin_orchestrator::authorize_control(Some(auth.token.as_ref()), provided),
+        odin_orchestrator::ControlAuth::Allowed
+    );
+
+    if authorized {
+        next.run(request).await
+    } else {
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "public API authentication required"})),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        );
+        response
+    }
+}
+
+fn validate_public_listener_auth(
+    addr: &str,
+    token: Option<&str>,
+    allow_insecure_non_loopback: bool,
+) -> OdinResult<()> {
+    if let Some(token) = token
+        && (token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(odin_core::error::OdinError::Config(
+            "the public API token must be non-empty visible ASCII".into(),
+        ));
+    }
+
+    let parsed_addr = addr.parse::<std::net::SocketAddr>().map_err(|error| {
+        odin_core::error::OdinError::Config(format!(
+            "invalid public listener address '{addr}': {error}"
+        ))
+    })?;
+    let is_non_loopback = !parsed_addr.ip().is_loopback();
+    if is_non_loopback && token.is_none() && !allow_insecure_non_loopback {
+        return Err(odin_core::error::OdinError::Config(format!(
+            "public listener {addr} is non-loopback; configure gateway.public_auth_token_env/public_auth_token or explicitly set allow_insecure_non_loopback"
+        )));
+    }
+    if is_non_loopback && token.is_none() {
+        tracing::warn!(
+            "[GATEWAY] Public listener is non-loopback and explicitly configured without authentication"
+        );
+    }
+    Ok(())
 }
 
 // ── Route Handlers ───────────────────────────────────────────────────
@@ -391,15 +465,17 @@ async fn chat_handler(
     Json(mut request): Json<ChatRequest>,
 ) -> impl IntoResponse {
     let request_start = std::time::Instant::now();
+    let max_task_bytes = MAX_CHAT_TASK_BYTES.min(state.resource_budgets.max_request_bytes);
+    let max_context_bytes = MAX_CHAT_CONTEXT_BYTES.min(state.resource_budgets.max_context_bytes);
     let max_iterations = request
         .max_iterations
         .unwrap_or(DEFAULT_CHAT_MAX_ITERATIONS);
     if request.task.trim().is_empty()
-        || request.task.len() > MAX_CHAT_TASK_BYTES
+        || request.task.len() > max_task_bytes
         || request
             .context
             .as_ref()
-            .is_some_and(|context| context.len() > MAX_CHAT_CONTEXT_BYTES)
+            .is_some_and(|context| context.len() > max_context_bytes)
         || !(1..=DEFAULT_CHAT_MAX_ITERATIONS).contains(&max_iterations)
     {
         return chat_error_response(
@@ -680,18 +756,14 @@ async fn tools_list_handler(
             // Filter by tags if specified
             if !filter_tags.is_empty() {
                 let tt = tool.capability_tags();
-                if !filter_tags.iter().all(|ft| tt.contains(&ft.as_str())) {
+                if !filter_tags.iter().all(|ft| tt.iter().any(|tag| tag == ft)) {
                     return None;
                 }
             }
 
             let is_safe = tool.is_safe();
             let requires_approval = tool.requires_approval();
-            let capability_tags: Vec<String> = tool
-                .capability_tags()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let capability_tags = tool.capability_tags();
 
             Some(ToolInfo {
                 name,
@@ -718,11 +790,7 @@ async fn tool_inspect_handler(
     match registry.get(&name) {
         Some(tool) => {
             let schema = tool.schema();
-            let capability_tags: Vec<String> = tool
-                .capability_tags()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let capability_tags = tool.capability_tags();
             let info = ToolInfo {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -858,10 +926,54 @@ pub async fn run_http_server(
     ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
 ) -> OdinResult<()> {
+    run_http_server_with_auth(addr, None, false, task_handler, ws_manager, tool_registry).await
+}
+
+/// Run the single public listener with optional bearer authentication.
+///
+/// A non-loopback listener must provide a token unless the caller explicitly
+/// opts into `allow_insecure_non_loopback` for an already-protected embedding.
+pub async fn run_http_server_with_auth(
+    addr: &str,
+    public_auth_token: Option<String>,
+    allow_insecure_non_loopback: bool,
+    task_handler: Option<TaskHandlerFn>,
+    ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
+    tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
+) -> OdinResult<()> {
+    run_http_server_with_auth_and_budgets(
+        addr,
+        public_auth_token,
+        allow_insecure_non_loopback,
+        ResourceBudgetConfig::default(),
+        task_handler,
+        ws_manager,
+        tool_registry,
+    )
+    .await
+}
+
+/// Run the single public listener with explicit central resource budgets.
+pub async fn run_http_server_with_auth_and_budgets(
+    addr: &str,
+    public_auth_token: Option<String>,
+    allow_insecure_non_loopback: bool,
+    resource_budgets: ResourceBudgetConfig,
+    task_handler: Option<TaskHandlerFn>,
+    ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
+    tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
+) -> OdinResult<()> {
+    validate_public_listener_auth(
+        addr,
+        public_auth_token.as_deref(),
+        allow_insecure_non_loopback,
+    )?;
     let state: Arc<GatewayState> = Arc::new(GatewayState {
         task_handler,
         ws_manager,
         tool_registry: tool_registry.unwrap_or_else(|| Arc::new(build_tool_registry(None))),
+        public_auth_token: public_auth_token.map(Arc::<str>::from),
+        resource_budgets,
         ..Default::default()
     });
     let start_time = Arc::new(std::time::Instant::now());
@@ -893,11 +1005,71 @@ pub async fn run_http_server_with_management(
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
 ) -> OdinResult<()> {
+    run_http_server_with_management_auth(
+        public_addr,
+        management_addr,
+        operator_token,
+        None,
+        false,
+        task_handler,
+        ws_manager,
+        tool_registry,
+        approval_gate,
+    )
+    .await
+}
+
+/// Run public and operator-only listeners with independent authentication.
+pub async fn run_http_server_with_management_auth(
+    public_addr: &str,
+    management_addr: &str,
+    operator_token: String,
+    public_auth_token: Option<String>,
+    allow_insecure_non_loopback: bool,
+    task_handler: Option<TaskHandlerFn>,
+    ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
+    tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
+    approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
+) -> OdinResult<()> {
+    run_http_server_with_management_auth_and_budgets(
+        public_addr,
+        management_addr,
+        operator_token,
+        public_auth_token,
+        allow_insecure_non_loopback,
+        ResourceBudgetConfig::default(),
+        task_handler,
+        ws_manager,
+        tool_registry,
+        approval_gate,
+    )
+    .await
+}
+
+/// Run public and operator-only listeners with explicit central budgets.
+pub async fn run_http_server_with_management_auth_and_budgets(
+    public_addr: &str,
+    management_addr: &str,
+    operator_token: String,
+    public_auth_token: Option<String>,
+    allow_insecure_non_loopback: bool,
+    resource_budgets: ResourceBudgetConfig,
+    task_handler: Option<TaskHandlerFn>,
+    ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
+    tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
+    approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
+) -> OdinResult<()> {
     if operator_token.is_empty() || !operator_token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(odin_core::error::OdinError::Config(
             "the management API requires a non-empty visible-ASCII operator token".into(),
         ));
     }
+
+    validate_public_listener_auth(
+        public_addr,
+        public_auth_token.as_deref(),
+        allow_insecure_non_loopback,
+    )?;
 
     if let Ok(addr) = management_addr.parse::<std::net::SocketAddr>()
         && !addr.ip().is_loopback()
@@ -912,6 +1084,8 @@ pub async fn run_http_server_with_management(
         ws_manager,
         tool_registry: tool_registry.unwrap_or_else(|| Arc::new(build_tool_registry(None))),
         approval_gate,
+        public_auth_token: public_auth_token.map(Arc::<str>::from),
+        resource_budgets,
         ..Default::default()
     });
     let start_time = Arc::new(std::time::Instant::now());
@@ -1242,7 +1416,15 @@ async fn orchestrate_status_handler(
                 .into_response();
         }
     };
-    let _ = store.initialize().await;
+    if let Err(error) = store.initialize().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Store initialization error: {}", error)
+            })),
+        )
+            .into_response();
+    }
 
     match store.load_task_graph(&run_id).await {
         Ok(graph) => {
@@ -1305,7 +1487,15 @@ async fn orchestrate_pause_handler(
     let db_path = dirs_state_path("orchestration.db");
     match SqliteOrchestrationStore::new(&db_path).await {
         Ok(store) => {
-            let _ = store.initialize().await;
+            if let Err(e) = store.initialize().await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Store initialization error: {}", e)
+                    })),
+                )
+                    .into_response();
+            }
             match store.update_graph_status(&run_id, "paused").await {
                 Ok(()) => {
                     let command = odin_orchestrator::RunControlCommand::new(
@@ -1366,7 +1556,15 @@ async fn orchestrate_resume_handler(
     let db_path = dirs_state_path("orchestration.db");
     match SqliteOrchestrationStore::new(&db_path).await {
         Ok(store) => {
-            let _ = store.initialize().await;
+            if let Err(e) = store.initialize().await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Store initialization error: {}", e)
+                    })),
+                )
+                    .into_response();
+            }
             match store.update_graph_status(&run_id, "running").await {
                 Ok(()) => {
                     let command = odin_orchestrator::RunControlCommand::new(
@@ -1427,7 +1625,15 @@ async fn orchestrate_cancel_handler(
     let db_path = dirs_state_path("orchestration.db");
     match SqliteOrchestrationStore::new(&db_path).await {
         Ok(store) => {
-            let _ = store.initialize().await;
+            if let Err(e) = store.initialize().await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Store initialization error: {}", e)
+                    })),
+                )
+                    .into_response();
+            }
             match store.update_graph_status(&run_id, "cancelled").await {
                 Ok(()) => {
                     let command = odin_orchestrator::RunControlCommand::new(
@@ -1528,6 +1734,7 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
     if let Some(manager) = state.ws_manager.clone() {
         let config = Arc::new(crate::ws::WsConfig {
             enabled: true,
+            max_message_size: state.resource_budgets.max_request_bytes.min(65_536),
             ..Default::default()
         });
         router = router.route(
@@ -1536,7 +1743,18 @@ pub fn build_router(state: Arc<GatewayState>, start_time: Arc<std::time::Instant
         );
     }
 
-    router.layer(tower_http::trace::TraceLayer::new_for_http())
+    router = router
+        .layer(DefaultBodyLimit::max(
+            state.resource_budgets.max_request_bytes,
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+    if let Some(token) = state.public_auth_token.clone() {
+        router = router.layer(middleware::from_fn_with_state(
+            PublicAuth { token },
+            require_public,
+        ));
+    }
+    router
 }
 
 /// Build the authenticated operator-only management router.
@@ -1703,6 +1921,73 @@ mod tests {
         let config = odin_core::config::GatewayConfig::default();
         let addr: std::net::SocketAddr = config.management_addr.parse().unwrap();
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn non_loopback_public_listener_requires_authentication() {
+        assert!(validate_public_listener_auth("0.0.0.0:9177", None, false).is_err());
+        assert!(validate_public_listener_auth("0.0.0.0:9177", Some("public"), false).is_ok());
+        assert!(validate_public_listener_auth("127.0.0.1:9177", None, false).is_ok());
+        assert!(validate_public_listener_auth("0.0.0.0:9177", None, true).is_ok());
+        assert!(validate_public_listener_auth("not-an-address", None, false).is_err());
+        assert!(validate_public_listener_auth("127.0.0.1:9177", Some("bad token"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn public_router_requires_and_accepts_bearer_auth_when_configured() {
+        let state = Arc::new(GatewayState {
+            public_auth_token: Some(Arc::<str>::from("public-token")),
+            ..Default::default()
+        });
+        let router = build_router(state, Arc::new(std::time::Instant::now()));
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, "Bearer public-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_router_applies_central_request_budget() {
+        let budgets = odin_core::config::ResourceBudgetConfig {
+            max_request_bytes: 32,
+            ..Default::default()
+        };
+        let state = Arc::new(GatewayState {
+            resource_budgets: budgets,
+            ..Default::default()
+        });
+        let response = build_router(state, Arc::new(std::time::Instant::now()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"task":"this request is too large"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

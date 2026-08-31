@@ -135,7 +135,15 @@ impl Shell {
                         "timeout_secs": {
                             "type": "integer",
                             "description": "Timeout in seconds (optional, defaults to 60)",
-                            "default": 60
+                            "default": 60,
+                            "minimum": 1,
+                            "maximum": 300
+                        },
+                        "max_output_bytes": {
+                            "type": "integer",
+                            "description": "Maximum output bytes retained per stream",
+                            "minimum": 1,
+                            "maximum": 16777216
                         }
                     },
                     "required": ["command"]
@@ -173,8 +181,8 @@ impl Tool for Shell {
         false // shell is not inherently safe
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["shell", "system", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["shell".into(), "system".into(), "dangerous".into()]
     }
 
     fn is_dangerous(&self) -> bool {
@@ -248,19 +256,25 @@ impl Tool for Shell {
         cmd.current_dir(workdir);
 
         // Set timeout
-        let timeout = std::time::Duration::from_secs(parsed.timeout_secs.max(1));
+        let timeout_secs = parsed
+            .timeout_secs
+            .max(1)
+            .min(context.resource_budgets.max_tool_timeout_secs.max(1));
+        let timeout = std::time::Duration::from_secs(timeout_secs);
 
-        let max_bytes = if parsed.max_output_bytes == 0 {
+        let requested_max_bytes = if parsed.max_output_bytes == 0 {
             DEFAULT_MAX_OUTPUT_BYTES
         } else {
             parsed.max_output_bytes
         };
+        let max_bytes =
+            requested_max_bytes.min(context.resource_budgets.max_tool_output_bytes.max(1));
         let output = process::run_command(cmd, timeout, max_bytes)
             .await
             .map_err(|error| match error {
                 ProcessError::Timeout => OdinError::Timeout(format!(
                     "Shell command timed out after {}s: {command_str}",
-                    parsed.timeout_secs
+                    timeout_secs
                 )),
                 ProcessError::Io(error) => OdinError::Tool {
                     tool: self.name.clone(),
@@ -320,6 +334,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: std::env::current_dir().unwrap(),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 

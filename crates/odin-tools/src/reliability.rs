@@ -86,6 +86,7 @@ pub fn classify_tool_error(error: &OdinError) -> ReliabilityOutcome {
         | OdinError::Timeout(_)
         | OdinError::RateLimit(_)
         | OdinError::Provider { .. } => ReliabilityOutcome::TransportFailure,
+        OdinError::ProviderPermanent { .. } => ReliabilityOutcome::ToolFailure,
         OdinError::Tool {
             source: Some(source),
             ..
@@ -159,7 +160,10 @@ struct ReliabilityStore {
 
 impl ReliabilityStore {
     fn open(path: &Path) -> OdinResult<Self> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|error| {
                 OdinError::Database(format!(
                     "failed to create reliability directory '{}': {error}",
@@ -168,6 +172,12 @@ impl ReliabilityStore {
             })?;
         }
         let connection = Connection::open(path).map_err(store_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| OdinError::Io(std::io::Error::other(error)))?;
+        }
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(store_error)?;
@@ -303,7 +313,7 @@ fn store_error(error: rusqlite::Error) -> OdinError {
 pub struct ReliabilityTracker {
     config: ReliabilityConfig,
     records: RwLock<HashMap<String, Vec<CallRecord>>>,
-    store: Option<ReliabilityStore>,
+    store: Option<std::sync::Arc<ReliabilityStore>>,
 }
 
 impl Default for ReliabilityTracker {
@@ -323,7 +333,7 @@ impl ReliabilityTracker {
 
     /// Open a tracker that reads and writes the shared bounded SQLite store.
     pub fn persistent(path: impl AsRef<Path>, config: ReliabilityConfig) -> OdinResult<Self> {
-        let store = ReliabilityStore::open(path.as_ref())?;
+        let store = std::sync::Arc::new(ReliabilityStore::open(path.as_ref())?);
         let mut records = store.load()?;
         for entry in records.values_mut() {
             trim(entry, config.window_size);
@@ -347,12 +357,48 @@ impl ReliabilityTracker {
         self.record(tool_name, CallRecord::new(outcome, duration_ms));
     }
 
+    /// Record a sample while moving the synchronous SQLite append to Tokio's
+    /// blocking pool. The in-memory score is updated immediately; the
+    /// persistent sample is awaited so callers know the append task finished.
+    pub async fn record_outcome_async(
+        &self,
+        tool_name: &str,
+        outcome: ReliabilityOutcome,
+        duration_ms: u64,
+    ) {
+        let record = CallRecord::new(outcome, duration_ms);
+        self.record_in_memory(tool_name, record.clone());
+        let Some(store) = self.store.as_ref().cloned() else {
+            return;
+        };
+        let tool_name = tool_name.to_owned();
+        let worker_tool_name = tool_name.clone();
+        let window_size = self.config.window_size;
+        let result = tokio::task::spawn_blocking(move || {
+            store.append(&worker_tool_name, &record, window_size)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(tool = %tool_name, %error, "failed to persist reliability sample");
+            }
+            Err(error) => {
+                tracing::warn!(tool = %tool_name, %error, "reliability persistence worker failed");
+            }
+        }
+    }
+
     pub fn record(&self, tool_name: &str, record: CallRecord) {
         if let Some(store) = &self.store
             && let Err(error) = store.append(tool_name, &record, self.config.window_size)
         {
             tracing::warn!(tool = %tool_name, %error, "failed to persist reliability sample");
         }
+        self.record_in_memory(tool_name, record);
+    }
+
+    fn record_in_memory(&self, tool_name: &str, record: CallRecord) {
         let mut records = self
             .records
             .write()
@@ -572,6 +618,22 @@ mod tests {
         assert!(info.latest_timestamp.is_some());
     }
 
+    #[tokio::test]
+    async fn async_record_persists_through_the_blocking_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reliability-async.db");
+        let tracker = ReliabilityTracker::persistent(&path, ReliabilityConfig::default()).unwrap();
+
+        tracker
+            .record_outcome_async("tool", ReliabilityOutcome::TransportFailure, 7)
+            .await;
+        assert_eq!(tracker.get("tool").transport_failure_count, 1);
+
+        drop(tracker);
+        let reopened = ReliabilityTracker::persistent(&path, ReliabilityConfig::default()).unwrap();
+        assert_eq!(reopened.get("tool").transport_failure_count, 1);
+    }
+
     #[test]
     fn recent_successes_replace_old_failures() {
         let tracker = ReliabilityTracker::new(ReliabilityConfig {
@@ -601,6 +663,10 @@ mod tests {
         );
         assert_eq!(
             classify_tool_error(&OdinError::tool("tool", "secret")),
+            ReliabilityOutcome::ToolFailure
+        );
+        assert_eq!(
+            classify_tool_error(&OdinError::provider_permanent("provider", "bad request")),
             ReliabilityOutcome::ToolFailure
         );
     }

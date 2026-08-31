@@ -8,11 +8,59 @@ use odin_core::types::ToolResult;
 use rand::Rng;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::process::Command;
 
 use crate::Sandbox;
+use crate::process::{self, ProcessError};
+
+fn map_process_error(tool_name: &str, error: ProcessError) -> OdinError {
+    match error {
+        ProcessError::Timeout => OdinError::Timeout(format!(
+            "{tool_name} subprocess exceeded its resource budget"
+        )),
+        ProcessError::Io(error) => OdinError::Tool {
+            tool: tool_name.to_string(),
+            message: format!("Failed to execute subprocess: {error}"),
+            source: Some(Box::new(error)),
+        },
+    }
+}
+
+fn command_result(tool_name: &str, output: process::BoundedOutput, start: Instant) -> ToolResult {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut combined = stdout;
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("STDERR:\n");
+        combined.push_str(&stderr);
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        combined.push_str(&format!(
+            "\n\n[TRUNCATED: output exceeded the configured per-stream limit]"
+        ));
+    }
+
+    ToolResult {
+        call_id: String::new(),
+        tool_name: tool_name.to_string(),
+        success: output.status.success(),
+        output: combined.trim().to_string(),
+        error: (!output.status.success()).then(|| {
+            if stderr.is_empty() {
+                format!("subprocess exited with code {:?}", output.status.code())
+            } else {
+                stderr
+            }
+        }),
+        duration_ms: start.elapsed().as_millis() as u64,
+        timestamp: Utc::now(),
+    }
+}
 
 // ── file_list ─────────────────────────────────────────────────────────
 
@@ -65,8 +113,8 @@ impl Tool for FileList {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["filesystem", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["filesystem".into(), "read".into(), "safe".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -87,6 +135,8 @@ impl Tool for FileList {
             })
             .unwrap_or_else(|| ctx.working_dir.clone());
         let dir = self.sandbox.check_read(&requested)?;
+        let timeout = Duration::from_secs(ctx.resource_budgets.max_tool_timeout_secs.max(1));
+        let max_output_bytes = ctx.resource_budgets.max_tool_output_bytes.max(1);
         let mut cmd = Command::new("ls");
         cmd.arg("-1A"); // one per line, include dotfiles
         if let Some(ref pat) = args.pattern {
@@ -98,39 +148,18 @@ impl Tool for FileList {
                 .arg("1")
                 .arg("-name")
                 .arg(pat);
-            let output = find.output().map_err(OdinError::Io)?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            return Ok(ToolResult {
-                call_id: String::new(),
-                tool_name: self.name().to_string(),
-                success: output.status.success(),
-                output: stdout.trim().to_string(),
-                error: if !output.status.success() {
-                    Some(String::from_utf8_lossy(&output.stderr).to_string())
-                } else {
-                    None
-                },
-                duration_ms: start.elapsed().as_millis() as u64,
-                timestamp: Utc::now(),
-            });
+            let output = process::run_command(find, timeout, max_output_bytes)
+                .await
+                .map_err(|error| map_process_error(self.name(), error))?;
+            return Ok(command_result(self.name(), output, start));
         } else {
             cmd.current_dir(&dir);
         }
 
-        let output = cmd.output().map_err(OdinError::Io)?;
-        Ok(ToolResult {
-            call_id: String::new(),
-            tool_name: self.name().to_string(),
-            success: output.status.success(),
-            output: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            error: if !output.status.success() {
-                Some(String::from_utf8_lossy(&output.stderr).to_string())
-            } else {
-                None
-            },
-            duration_ms: start.elapsed().as_millis() as u64,
-            timestamp: Utc::now(),
-        })
+        let output = process::run_command(cmd, timeout, max_output_bytes)
+            .await
+            .map_err(|error| map_process_error(self.name(), error))?;
+        Ok(command_result(self.name(), output, start))
     }
 }
 
@@ -184,8 +213,8 @@ impl Tool for FileDelete {
     fn requires_approval(&self) -> bool {
         true
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["filesystem", "write", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["filesystem".into(), "write".into(), "dangerous".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -291,8 +320,8 @@ impl Tool for FileExists {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["filesystem", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["filesystem".into(), "read".into(), "safe".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -373,8 +402,13 @@ impl Tool for EnvVar {
     fn requires_approval(&self) -> bool {
         true
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["system", "environment", "sensitive", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec![
+            "system".into(),
+            "environment".into(),
+            "sensitive".into(),
+            "dangerous".into(),
+        ]
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -439,8 +473,8 @@ impl Tool for TimeNow {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["system", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["system".into(), "read".into(), "safe".into()]
     }
 
     async fn execute(
@@ -519,8 +553,8 @@ impl Tool for RandomNumber {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["utility", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["utility".into(), "safe".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -598,8 +632,8 @@ impl Tool for JsonValidate {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["data", "validation", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["data".into(), "validation".into(), "safe".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -693,8 +727,8 @@ impl Tool for TextSearch {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["data", "search", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["data".into(), "search".into(), "safe".into()]
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
@@ -791,34 +825,25 @@ impl Tool for ProcessList {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["system", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["system".into(), "read".into(), "safe".into()]
     }
 
-    async fn execute(
-        &self,
-        _args: serde_json::Value,
-        _ctx: &ToolContext,
-    ) -> OdinResult<ToolResult> {
+    async fn execute(&self, _args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
-        let output = Command::new("ps")
-            .arg("aux")
-            .output()
-            .map_err(OdinError::Io)?;
-
-        Ok(ToolResult {
-            call_id: String::new(),
-            tool_name: self.name().to_string(),
-            success: output.status.success(),
-            output: String::from_utf8_lossy(&output.stdout).to_string(),
-            error: if !output.status.success() {
-                Some(String::from_utf8_lossy(&output.stderr).to_string())
-            } else {
-                None
+        let output = process::run_command(
+            {
+                let mut command = Command::new("ps");
+                command.arg("aux");
+                command
             },
-            duration_ms: start.elapsed().as_millis() as u64,
-            timestamp: Utc::now(),
-        })
+            Duration::from_secs(ctx.resource_budgets.max_tool_timeout_secs.max(1)),
+            ctx.resource_budgets.max_tool_output_bytes.max(1),
+        )
+        .await
+        .map_err(|error| map_process_error(self.name(), error))?;
+
+        Ok(command_result(self.name(), output, start))
     }
 }
 
@@ -856,7 +881,7 @@ impl Tool for NetworkPing {
                     "required": ["host"],
                     "properties": {
                         "host": {"type": "string", "description": "Hostname or IP address to ping"},
-                        "count": {"type": "integer", "description": "Number of ping packets (default: 1)"}
+                        "count": {"type": "integer", "minimum": 1, "maximum": 32, "description": "Number of ping packets (default: 1)"}
                     }
                 }),
             },
@@ -871,40 +896,38 @@ impl Tool for NetworkPing {
     fn requires_approval(&self) -> bool {
         false
     }
-    fn capability_tags(&self) -> &[&str] {
-        &["network", "diagnostic", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["network".into(), "diagnostic".into(), "safe".into()]
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> OdinResult<ToolResult> {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> OdinResult<ToolResult> {
         let start = Instant::now();
         let args: NetworkPingArgs = serde_json::from_value(args)
             .map_err(|e| OdinError::tool("network_ping", format!("args: {e}")))?;
 
-        let output = Command::new("ping")
+        let max_count = ctx.resource_budgets.max_network_ping_count.max(1);
+        if args.count == 0 || args.count > max_count {
+            return Err(OdinError::Validation(format!(
+                "network_ping count must be between 1 and {max_count}"
+            )));
+        }
+
+        let mut command = Command::new("ping");
+        command
             .arg("-c")
             .arg(args.count.to_string())
             .arg("-W")
             .arg("5") // 5 second timeout
-            .arg(&args.host)
-            .output()
-            .map_err(OdinError::Io)?;
+            .arg(&args.host);
+        let output = process::run_command(
+            command,
+            Duration::from_secs(ctx.resource_budgets.max_tool_timeout_secs.max(1)),
+            ctx.resource_budgets.max_tool_output_bytes.max(1),
+        )
+        .await
+        .map_err(|error| map_process_error(self.name(), error))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        Ok(ToolResult {
-            call_id: String::new(),
-            tool_name: self.name().to_string(),
-            success: output.status.success(),
-            output: stdout,
-            error: if !output.status.success() {
-                Some(stderr)
-            } else {
-                None
-            },
-            duration_ms: start.elapsed().as_millis() as u64,
-            timestamp: Utc::now(),
-        })
+        Ok(command_result(self.name(), output, start))
     }
 }
 
@@ -924,6 +947,7 @@ mod tests {
                 "RAVEN_SAFE_TEST_VALUE".to_string(),
                 "allowlisted-value".to_string(),
             )]),
+            resource_budgets: Default::default(),
         }
     }
 

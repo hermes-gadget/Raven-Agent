@@ -87,8 +87,12 @@ pub trait Tool: Send + Sync {
     }
 
     /// Capability tags for this tool (e.g., ["filesystem", "read", "safe"]).
-    fn capability_tags(&self) -> &[&str] {
-        &[]
+    ///
+    /// Tags are returned as owned strings so adapters can expose dynamic
+    /// metadata without leaking process-lifetime allocations to manufacture a
+    /// `&'static str` slice.
+    fn capability_tags(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Quick check for dangerous tools.
@@ -98,34 +102,263 @@ pub trait Tool: Send + Sync {
 
     /// Validate arguments against the tool's JSON Schema.
     ///
-    /// Default implementation checks that required fields from the schema
-    /// are present in the arguments.
+    /// The default implementation applies the shared JSON Schema validator so
+    /// every execution surface enforces the same type, range, enum, nested,
+    /// and additional-property constraints.
     fn validate_args(&self, args: &serde_json::Value) -> OdinResult<()> {
         let schema = self.schema();
-        let params = &schema.function.parameters;
+        validate_json_schema(args, &schema.function.parameters).map_err(|error| {
+            crate::error::OdinError::Validation(format!("tool '{}': {error}", schema.function.name))
+        })
+    }
+}
 
-        // Must be an object
-        if !args.is_object() {
-            return Err(crate::error::OdinError::Validation(
-                "Arguments must be a JSON object".into(),
-            ));
+/// Validate a JSON value against the subset of JSON Schema used by tool
+/// contracts. The validator is deliberately centralized so callers cannot
+/// bypass type, range, enum, nested-object, or additional-property checks by
+/// choosing a different production surface.
+pub fn validate_json_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> OdinResult<()> {
+    validate_json_schema_at(value, schema, "$")
+}
+
+fn validate_json_schema_at(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> OdinResult<()> {
+    if schema == &serde_json::Value::Bool(true) {
+        return Ok(());
+    }
+    if schema == &serde_json::Value::Bool(false) {
+        return Err(crate::error::OdinError::Validation(format!(
+            "{path} is rejected by the schema"
+        )));
+    }
+    let Some(schema) = schema.as_object() else {
+        return Err(crate::error::OdinError::Validation(format!(
+            "{path} has an invalid schema"
+        )));
+    };
+
+    if let Some(expected) = schema.get("type") {
+        let matches_type = expected.as_str().map_or_else(
+            || {
+                expected
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|kind| matches_json_type(value, kind)))
+            },
+            |kind| matches_json_type(value, &serde_json::Value::String(kind.to_string())),
+        );
+        if !matches_type {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} has the wrong JSON type"
+            )));
         }
+    }
 
-        // Check required fields
-        if let Some(required) = params.get("required").and_then(|v| v.as_array()) {
-            for field in required {
-                if let Some(field_name) = field.as_str()
-                    && args.get(field_name).is_none()
-                {
+    if let Some(constant) = schema.get("const")
+        && value != constant
+    {
+        return Err(crate::error::OdinError::Validation(format!(
+            "{path} does not match const"
+        )));
+    }
+    if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !values.iter().any(|candidate| candidate == value)
+    {
+        return Err(crate::error::OdinError::Validation(format!(
+            "{path} is not one of the allowed enum values"
+        )));
+    }
+
+    for (keyword, requirement) in [("allOf", 1usize), ("anyOf", 1usize), ("oneOf", 1usize)] {
+        if let Some(branches) = schema.get(keyword).and_then(serde_json::Value::as_array) {
+            let matches = branches
+                .iter()
+                .filter(|branch| validate_json_schema_at(value, branch, path).is_ok())
+                .count();
+            let valid = match keyword {
+                "allOf" => matches == branches.len(),
+                "anyOf" => matches >= requirement,
+                "oneOf" => matches == requirement,
+                _ => false,
+            };
+            if !valid {
+                return Err(crate::error::OdinError::Validation(format!(
+                    "{path} does not satisfy {keyword}"
+                )));
+            }
+        }
+    }
+    if let Some(not) = schema.get("not")
+        && validate_json_schema_at(value, not, path).is_ok()
+    {
+        return Err(crate::error::OdinError::Validation(format!(
+            "{path} must not match the schema"
+        )));
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(minimum) = schema
+            .get("minProperties")
+            .and_then(serde_json::Value::as_u64)
+            && object.len() < minimum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} has too few properties"
+            )));
+        }
+        if let Some(maximum) = schema
+            .get("maxProperties")
+            .and_then(serde_json::Value::as_u64)
+            && object.len() > maximum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} has too many properties"
+            )));
+        }
+        if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+            for field in required.iter().filter_map(serde_json::Value::as_str) {
+                if !object.contains_key(field) {
                     return Err(crate::error::OdinError::Validation(format!(
-                        "Missing required field '{}' for tool '{}'",
-                        field_name, schema.function.name
+                        "{path}.{field} is required"
                     )));
                 }
             }
         }
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let additional_schema = schema.get("additionalProperties");
+        for (name, child) in object {
+            if let Some(property_schema) = properties.and_then(|properties| properties.get(name)) {
+                validate_json_schema_at(child, property_schema, &format!("{path}.{name}"))?;
+            } else {
+                match additional_schema {
+                    Some(serde_json::Value::Bool(false)) => {
+                        return Err(crate::error::OdinError::Validation(format!(
+                            "{path}.{name} is not an allowed property"
+                        )));
+                    }
+                    Some(serde_json::Value::Bool(true)) | None => {}
+                    Some(property_schema) => {
+                        validate_json_schema_at(child, property_schema, &format!("{path}.{name}"))?;
+                    }
+                }
+            }
+        }
+    }
 
-        Ok(())
+    if let Some(array) = value.as_array() {
+        if let Some(minimum) = schema.get("minItems").and_then(serde_json::Value::as_u64)
+            && array.len() < minimum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} has too few items"
+            )));
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(serde_json::Value::as_u64)
+            && array.len() > maximum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} has too many items"
+            )));
+        }
+        if schema
+            .get("uniqueItems")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            for (index, item) in array.iter().enumerate() {
+                if array.iter().skip(index + 1).any(|other| other == item) {
+                    return Err(crate::error::OdinError::Validation(format!(
+                        "{path} contains duplicate items"
+                    )));
+                }
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_json_schema_at(item, item_schema, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        if let Some(minimum) = schema.get("minLength").and_then(serde_json::Value::as_u64)
+            && string.chars().count() < minimum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} is shorter than minLength"
+            )));
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(serde_json::Value::as_u64)
+            && string.chars().count() > maximum as usize
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} is longer than maxLength"
+            )));
+        }
+        if let Some(pattern) = schema.get("pattern").and_then(serde_json::Value::as_str) {
+            let regex = regex::Regex::new(pattern).map_err(|error| {
+                crate::error::OdinError::Validation(format!(
+                    "{path} uses an invalid schema pattern: {error}"
+                ))
+            })?;
+            if !regex.is_match(string) {
+                return Err(crate::error::OdinError::Validation(format!(
+                    "{path} does not match the required pattern"
+                )));
+            }
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(serde_json::Value::as_f64)
+            && number < minimum
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} is below minimum"
+            )));
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(serde_json::Value::as_f64)
+            && number > maximum
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} is above maximum"
+            )));
+        }
+        if schema
+            .get("exclusiveMinimum")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|minimum| number <= minimum)
+            || schema
+                .get("exclusiveMaximum")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|maximum| number >= maximum)
+        {
+            return Err(crate::error::OdinError::Validation(format!(
+                "{path} violates an exclusive numeric bound"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn matches_json_type(value: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match expected.as_str() {
+        Some("null") => value.is_null(),
+        Some("boolean") => value.is_boolean(),
+        Some("object") => value.is_object(),
+        Some("array") => value.is_array(),
+        Some("string") => value.is_string(),
+        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+        Some("number") => value.is_number(),
+        _ => false,
     }
 }
 
@@ -136,6 +369,9 @@ pub struct ToolContext {
     pub session_id: SessionId,
     pub working_dir: std::path::PathBuf,
     pub env: HashMap<String, String>,
+    /// Central limits available to direct tool implementations as well as the
+    /// loop-level enforcement wrapper.
+    pub resource_budgets: crate::config::ResourceBudgetConfig,
 }
 
 // ── Memory Store Trait ──────────────────────────────────────────────
@@ -299,4 +535,125 @@ pub struct PhaseResult {
     pub output: Option<String>,
     pub confidence: ConfidenceScore,
     pub tool_results: Vec<ToolResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_json_schema;
+
+    #[test]
+    fn shared_schema_validator_enforces_nested_types_ranges_and_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name", "settings"],
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 2, "pattern": "^[a-z]+$"},
+                "settings": {
+                    "type": "object",
+                    "required": ["retries"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "retries": {"type": "integer", "minimum": 0, "maximum": 3}
+                    }
+                },
+                "tags": {
+                    "type": "array",
+                    "maxItems": 2,
+                    "uniqueItems": true,
+                    "items": {"type": "string"}
+                }
+            }
+        });
+
+        assert!(
+            validate_json_schema(
+                &serde_json::json!({
+                    "name": "raven",
+                    "settings": {"retries": 2},
+                    "tags": ["one", "two"]
+                }),
+                &schema
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_json_schema(
+                &serde_json::json!({"name": "Raven", "settings": {"retries": 2}}),
+                &schema
+            )
+            .is_err()
+        );
+        assert!(
+            validate_json_schema(
+                &serde_json::json!({"name": "raven", "settings": {"retries": 4}}),
+                &schema
+            )
+            .is_err()
+        );
+        assert!(
+            validate_json_schema(
+                &serde_json::json!({
+                    "name": "raven",
+                    "settings": {"retries": 2},
+                    "unexpected": true
+                }),
+                &schema
+            )
+            .is_err()
+        );
+        assert!(
+            validate_json_schema(
+                &serde_json::json!({
+                    "name": "raven",
+                    "settings": {"retries": 2},
+                    "tags": ["same", "same"]
+                }),
+                &schema
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_schema_validator_supports_boolean_and_combinator_schemas() {
+        assert!(
+            validate_json_schema(&serde_json::json!("anything"), &serde_json::json!(true)).is_ok()
+        );
+        assert!(
+            validate_json_schema(&serde_json::json!("anything"), &serde_json::json!(false))
+                .is_err()
+        );
+
+        let schema = serde_json::json!({
+            "anyOf": [
+                {"type": "string", "const": "safe"},
+                {"type": "integer", "minimum": 10}
+            ]
+        });
+        assert!(validate_json_schema(&serde_json::json!("safe"), &schema).is_ok());
+        assert!(validate_json_schema(&serde_json::json!(12), &schema).is_ok());
+        assert!(validate_json_schema(&serde_json::json!(3), &schema).is_err());
+    }
+
+    #[test]
+    fn shared_schema_validator_applies_schemas_to_additional_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"known": {"type": "string"}},
+            "additionalProperties": {"type": "integer", "minimum": 0}
+        });
+
+        assert!(
+            validate_json_schema(&serde_json::json!({"known": "ok", "count": 2}), &schema).is_ok()
+        );
+        assert!(
+            validate_json_schema(&serde_json::json!({"known": "ok", "count": -1}), &schema)
+                .is_err()
+        );
+        assert!(
+            validate_json_schema(&serde_json::json!({"known": "ok", "count": "two"}), &schema)
+                .is_err()
+        );
+    }
 }

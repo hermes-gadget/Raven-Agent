@@ -50,6 +50,16 @@ agent:
   compression_ratio: 0.5
   skills_dir: ~/.config/raven/skills
 
+# Shared ceilings applied to HTTP, CLI, TUI, scheduler, and model tool calls.
+budgets:
+  max_tool_calls_per_turn: 10
+  max_tool_calls_per_task: 100
+  max_tool_output_bytes: 1048576
+  max_tool_timeout_secs: 60
+  max_network_ping_count: 4
+  max_request_bytes: 131072
+  max_context_bytes: 65536
+
 tools:
   enabled:
     - file_read
@@ -121,6 +131,10 @@ gateway:
   management_addr: 127.0.0.1:9178
   # Operator credential for management HTTP and WebSocket control.
   control_token_env: RAVEN_OPERATOR_TOKEN
+  # Required for a non-loopback public listener (prefer an environment variable).
+  # public_auth_token_env: RAVEN_PUBLIC_TOKEN
+  # public_auth_token: direct-value-is-discouraged
+  # allow_insecure_non_loopback: false
   discord_enabled: false
   # discord_token: direct-value-is-discouraged
   discord_token_env: DISCORD_BOT_TOKEN

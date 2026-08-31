@@ -293,6 +293,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: std::collections::HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         let args = serde_json::json!({"message": "hello world"});

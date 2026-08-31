@@ -181,9 +181,9 @@ impl ToolValidator {
     pub fn validate_permissions(tool: &dyn Tool) -> ValidationReport {
         let mut report = ValidationReport::new(tool.name());
         let tags = tool.capability_tags();
-        let has_dangerous = tags.contains(&"dangerous");
-        let has_safe = tags.contains(&"safe");
-        let has_filesystem = tags.contains(&"filesystem");
+        let has_dangerous = tags.iter().any(|tag| tag == "dangerous");
+        let has_safe = tags.iter().any(|tag| tag == "safe");
+        let has_filesystem = tags.iter().any(|tag| tag == "filesystem");
 
         // ── dangerous tools ─────────────────────────────────────
         if has_dangerous {
@@ -659,8 +659,8 @@ impl ToolDoctor {
 
             // 6. Safety consistency
             let is_dangerous = tool.is_dangerous();
-            let has_dangerous_tag = tags.contains(&"dangerous");
-            let has_safe_tag = tags.contains(&"safe");
+            let has_dangerous_tag = tags.iter().any(|tag| tag == "dangerous");
+            let has_safe_tag = tags.iter().any(|tag| tag == "safe");
 
             if is_dangerous != has_dangerous_tag {
                 checks.push(DoctorCheckItem {
@@ -1065,7 +1065,7 @@ mod tests {
 
         for tool in &explicit_dangerous {
             assert!(
-                tool.capability_tags().contains(&"dangerous"),
+                tool.capability_tags().iter().any(|tag| tag == "dangerous"),
                 "tool '{}' should have 'dangerous' capability tag",
                 tool.name()
             );
@@ -1081,7 +1081,10 @@ mod tests {
         // but constrained by the sandbox boundary.
         let file_write = FileWrite::new(sandbox.clone());
         assert!(
-            file_write.capability_tags().contains(&"dangerous"),
+            file_write
+                .capability_tags()
+                .iter()
+                .any(|tag| tag == "dangerous"),
             "FileWrite should have 'dangerous' tag"
         );
 
@@ -1089,7 +1092,8 @@ mod tests {
         assert!(
             !FileRead::new(sandbox)
                 .capability_tags()
-                .contains(&"dangerous"),
+                .iter()
+                .any(|tag| tag == "dangerous"),
             "FileRead should not have 'dangerous' tag"
         );
     }
@@ -1105,7 +1109,7 @@ mod tests {
 
         for tool in &tools {
             assert!(
-                tool.capability_tags().contains(&"safe"),
+                tool.capability_tags().iter().any(|tag| tag == "safe"),
                 "tool '{}' should have 'safe' capability tag",
                 tool.name()
             );
@@ -1166,13 +1170,13 @@ mod tests {
             Box::new(Git::new()),
         ];
 
-        let expected: Vec<&[&str]> = vec![
-            &["filesystem", "read", "safe"],
-            &["filesystem", "write", "dangerous"],
-            &["shell", "system", "dangerous"],
-            &["web", "http", "read", "safe"],
-            &["web", "search", "read", "safe"],
-            &["version-control", "git", "dangerous"],
+        let expected: Vec<Vec<String>> = vec![
+            vec!["filesystem".into(), "read".into(), "safe".into()],
+            vec!["filesystem".into(), "write".into(), "dangerous".into()],
+            vec!["shell".into(), "system".into(), "dangerous".into()],
+            vec!["web".into(), "http".into(), "read".into(), "safe".into()],
+            vec!["web".into(), "search".into(), "read".into(), "safe".into()],
+            vec!["version-control".into(), "git".into(), "dangerous".into()],
         ];
 
         for (tool, expected_tags) in tools.iter().zip(expected.iter()) {
@@ -1262,8 +1266,8 @@ mod tests {
         fn requires_approval(&self) -> bool {
             false
         }
-        fn capability_tags(&self) -> &[&str] {
-            &["test"]
+        fn capability_tags(&self) -> Vec<String> {
+            vec!["test".into()]
         }
         async fn execute(
             &self,
