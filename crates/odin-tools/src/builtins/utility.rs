@@ -823,7 +823,7 @@ impl Tool for ProcessList {
         true
     }
     fn requires_approval(&self) -> bool {
-        false
+        true
     }
     fn capability_tags(&self) -> Vec<String> {
         vec!["system".into(), "read".into(), "safe".into()]
@@ -1144,5 +1144,11 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn process_list_requires_approval() {
+        assert!(ProcessList.requires_approval());
+        assert!(ProcessList.is_safe());
     }
 }
