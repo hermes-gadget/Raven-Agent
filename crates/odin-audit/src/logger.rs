@@ -2,7 +2,6 @@
 //!
 //! Implements the [`AuditLogger`] trait from odin-core with support for:
 //! - JSON file logging
-//! - SQLite-backed persistent storage
 //! - Querying by agent ID, session ID, and event type
 
 use async_trait::async_trait;
@@ -17,8 +16,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const MAX_AUDIT_QUERY_LIMIT: usize = 1_000;
 const AUDIT_READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -35,8 +37,6 @@ pub struct AuditLoggerConfig {
     pub enabled: bool,
     /// Path to a JSON log file (optional).
     pub file_path: Option<PathBuf>,
-    /// Path to a SQLite database (optional).
-    pub db_path: Option<PathBuf>,
     /// Whether to log in JSON format.
     pub json_format: bool,
     /// Maximum entries to keep in memory before flushing.
@@ -54,7 +54,6 @@ impl Default for AuditLoggerConfig {
         Self {
             enabled: true,
             file_path: None,
-            db_path: None,
             json_format: true,
             buffer_size: 100,
             history_size: default_history_size(),
@@ -74,7 +73,7 @@ struct BufferedEntry {
 /// Supports logging to:
 /// 1. A JSON lines file (`file_path`)
 /// 2. An in-memory buffer (always active for queries)
-/// 3. Optionally SQLite (when `db_path` is set — requires `sqlx` feature)
+/// 3. A bounded in-memory history for low-latency queries
 pub struct AuditLoggerImpl {
     /// Configuration.
     config: AuditLoggerConfig,
@@ -91,24 +90,19 @@ pub struct AuditLoggerImpl {
 }
 
 impl AuditLoggerImpl {
-    /// Create a new audit logger.
-    pub fn new(config: AuditLoggerConfig) -> Self {
+    /// Create a new audit logger, failing if a configured sink cannot open.
+    pub fn try_new(mut config: AuditLoggerConfig) -> OdinResult<Self> {
+        config.buffer_size = config.buffer_size.max(1);
+        if config.enabled && config.file_path.is_some() && !config.json_format {
+            return Err(OdinError::Config(
+                "durable audit sinks must use JSON Lines format".into(),
+            ));
+        }
         let file = if config.enabled {
             if let Some(ref path) = config.file_path {
-                match Self::open_file(path) {
-                    Ok(f) => {
-                        info!(file_path = %path.display(), "Audit log file opened");
-                        Some(f)
-                    }
-                    Err(e) => {
-                        error!(
-                            file_path = %path.display(),
-                            error = %e,
-                            "Failed to open audit log file"
-                        );
-                        None
-                    }
-                }
+                let file = Self::open_file(path)?;
+                info!(file_path = %path.display(), "Audit log file opened");
+                Some(file)
             } else {
                 None
             }
@@ -118,14 +112,22 @@ impl AuditLoggerImpl {
 
         let redactor = SecretRedactor::full();
 
-        Self {
+        Ok(Self {
             config,
             buffer: Arc::new(RwLock::new(Vec::new())),
             history: Arc::new(RwLock::new(VecDeque::new())),
             file: Arc::new(Mutex::new(file)),
             flush_lock: Arc::new(Mutex::new(())),
             redactor,
-        }
+        })
+    }
+
+    /// Backward-compatible constructor for in-memory/test loggers.
+    ///
+    /// Production composition should use [`Self::try_new`] so a required
+    /// durable sink failure aborts startup instead of silently degrading.
+    pub fn new(config: AuditLoggerConfig) -> Self {
+        Self::try_new(config).expect("audit logger sink must be openable")
     }
 
     /// Create a new audit logger with default configuration.
@@ -146,7 +148,10 @@ impl AuditLoggerImpl {
     /// Helper to open the log file.
     fn open_file(path: &Path) -> OdinResult<std::fs::File> {
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|e| {
                 OdinError::Io(std::io::Error::other(format!(
                     "Failed to create audit log directory '{}': {}",
@@ -156,17 +161,25 @@ impl AuditLoggerImpl {
             })?;
         }
 
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| {
-                OdinError::Io(std::io::Error::other(format!(
-                    "Failed to open audit log file '{}': {}",
-                    path.display(),
-                    e
-                )))
-            })
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path).map_err(|e| {
+            OdinError::Io(std::io::Error::other(format!(
+                "Failed to open audit log file '{}': {}",
+                path.display(),
+                e
+            )))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(OdinError::Io)?;
+        }
+        Ok(file)
     }
 
     /// Flush buffered entries to the file.
@@ -176,7 +189,11 @@ impl AuditLoggerImpl {
         let mut file_guard = self.file.lock().await;
         let file = match file_guard.as_mut() {
             Some(file) => file,
-            None => return Ok(()),
+            None => {
+                // In-memory loggers are intentionally usable by unit tests and
+                // embedders; production builders always configure a file sink.
+                return Ok(());
+            }
         };
 
         let original_len = file
@@ -396,18 +413,22 @@ impl AuditLoggerImpl {
             let mut buffer = self.buffer.write().await;
             buffer.push(buffered);
 
-            // Trim buffer if it exceeds the maximum
-            if buffer.len() > self.config.buffer_size * 2 {
+            // An in-memory-only logger has no durable sink to protect. Keep
+            // its historical bounded behavior, but never trim a durable
+            // queue: a sink outage must return an error rather than discard
+            // audit records that have not reached disk.
+            if self.config.file_path.is_none() && buffer.len() > self.config.buffer_size * 2 {
                 let excess = buffer.len() - self.config.buffer_size;
                 buffer.drain(0..excess);
             }
         }
 
-        // Flush if buffer is large enough
+        // Flush if buffer is large enough. Errors are returned to the caller so
+        // a sink outage cannot be mistaken for a durable audit write.
         if self.buffer.read().await.len() >= self.config.buffer_size
             && let Err(e) = self.flush_to_file().await
         {
-            warn!(error = %e, "Failed to flush audit buffer to file");
+            return Err(e);
         }
 
         Ok(())
@@ -553,6 +574,38 @@ impl AuditLoggerImpl {
         entry.details = self.redactor.redact_json(&entry.details);
 
         entry
+    }
+}
+
+impl Drop for AuditLoggerImpl {
+    fn drop(&mut self) {
+        // Normal production writes use a one-entry buffer and graceful owners
+        // call flush explicitly. This best-effort synchronous tail flush also
+        // protects short-lived embedders that drop a logger without an async
+        // shutdown hook.
+        let Ok(_flush_guard) = self.flush_lock.try_lock() else {
+            return;
+        };
+        let Ok(mut file_guard) = self.file.try_lock() else {
+            return;
+        };
+        let Some(file) = file_guard.as_mut() else {
+            return;
+        };
+        let Ok(mut buffer) = self.buffer.try_write() else {
+            return;
+        };
+        if buffer.is_empty() {
+            return;
+        }
+        let Ok(encoded) = self.serialize_entries(&buffer) else {
+            return;
+        };
+        if file.write_all(&encoded).is_ok() {
+            let _ = file.flush();
+            let _ = file.sync_data();
+            buffer.clear();
+        }
     }
 }
 
@@ -721,6 +774,65 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn startup_fails_when_audit_sink_cannot_be_opened() {
+        let directory = std::env::temp_dir();
+        let result = AuditLoggerImpl::try_new(AuditLoggerConfig {
+            file_path: Some(directory),
+            ..AuditLoggerConfig::default()
+        });
+        let Err(error) = result else {
+            panic!("a directory is not a usable audit sink")
+        };
+        assert!(error.to_string().contains("audit log file"));
+    }
+
+    #[tokio::test]
+    async fn durable_entries_are_json_and_correlatable() {
+        let path = std::env::temp_dir().join(format!("audit-{}.jsonl", Uuid::new_v4()));
+        let logger = AuditLoggerImpl::try_new(AuditLoggerConfig {
+            file_path: Some(path.clone()),
+            buffer_size: 2,
+            ..AuditLoggerConfig::default()
+        })
+        .unwrap();
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let first = make_entry(agent_id, session_id, AuditEventType::SessionStart);
+        let second = make_entry(agent_id, session_id, AuditEventType::ToolCall);
+        let first_id = first.id;
+        let second_id = second.id;
+        logger.log(first).await.unwrap();
+        logger.log(second).await.unwrap();
+        logger.flush().await.unwrap();
+
+        let lines: Vec<AuditEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].agent_id, agent_id);
+        assert_eq!(lines[0].session_id, session_id);
+        assert_eq!(lines[0].id, first_id);
+        assert_eq!(lines[1].id, second_id);
+        drop(logger);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn durable_text_format_is_rejected() {
+        let result = AuditLoggerImpl::try_new(AuditLoggerConfig {
+            file_path: Some(std::env::temp_dir().join(format!("audit-{}.log", Uuid::new_v4()))),
+            json_format: false,
+            ..AuditLoggerConfig::default()
+        });
+        let Err(error) = result else {
+            panic!("durable text output must be rejected")
+        };
+        assert!(error.to_string().contains("JSON Lines"));
     }
 
     #[tokio::test]

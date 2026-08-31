@@ -1,5 +1,6 @@
 //! Anthropic provider (Claude models).
 
+use crate::provider_http_error;
 use async_trait::async_trait;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{ChatStream, Provider};
@@ -60,7 +61,7 @@ impl AnthropicProvider {
                     for call in message.tool_calls() {
                         let input: Value =
                             serde_json::from_str(&call.function.arguments).map_err(|error| {
-                                OdinError::provider(
+                                OdinError::provider_permanent(
                                     "anthropic",
                                     format!(
                                         "Tool call '{}' has invalid JSON arguments: {error}",
@@ -150,7 +151,10 @@ impl AnthropicProvider {
             .and_then(Value::as_array)
             .filter(|blocks| !blocks.is_empty())
             .ok_or_else(|| {
-                OdinError::provider("anthropic", "Response is missing a non-empty content array")
+                OdinError::provider_permanent(
+                    "anthropic",
+                    "Response is missing a non-empty content array",
+                )
             })?;
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -158,19 +162,31 @@ impl AnthropicProvider {
             match block["type"].as_str() {
                 Some("text") => {
                     let text = block["text"].as_str().ok_or_else(|| {
-                        OdinError::provider("anthropic", "Text content block is malformed")
+                        OdinError::provider_permanent(
+                            "anthropic",
+                            "Text content block is malformed",
+                        )
                     })?;
                     text_parts.push(text.to_string());
                 }
                 Some("tool_use") => {
                     let id = block["id"].as_str().ok_or_else(|| {
-                        OdinError::provider("anthropic", "Tool-use block is missing its id")
+                        OdinError::provider_permanent(
+                            "anthropic",
+                            "Tool-use block is missing its id",
+                        )
                     })?;
                     let name = block["name"].as_str().ok_or_else(|| {
-                        OdinError::provider("anthropic", "Tool-use block is missing its name")
+                        OdinError::provider_permanent(
+                            "anthropic",
+                            "Tool-use block is missing its name",
+                        )
                     })?;
                     let input = block.get("input").ok_or_else(|| {
-                        OdinError::provider("anthropic", "Tool-use block is missing its input")
+                        OdinError::provider_permanent(
+                            "anthropic",
+                            "Tool-use block is missing its input",
+                        )
                     })?;
                     tool_calls.push(ToolCall {
                         id: id.to_string(),
@@ -178,7 +194,7 @@ impl AnthropicProvider {
                         function: FunctionCall {
                             name: name.to_string(),
                             arguments: serde_json::to_string(input).map_err(|error| {
-                                OdinError::provider(
+                                OdinError::provider_permanent(
                                     "anthropic",
                                     format!("Tool-use input could not be serialized: {error}"),
                                 )
@@ -191,7 +207,7 @@ impl AnthropicProvider {
         }
 
         if text_parts.is_empty() && tool_calls.is_empty() {
-            return Err(OdinError::provider(
+            return Err(OdinError::provider_permanent(
                 "anthropic",
                 "Response content contains no usable text or tool-use blocks",
             ));
@@ -276,17 +292,13 @@ impl Provider for AnthropicProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(OdinError::provider(
-                "anthropic",
-                format!("HTTP {}: {}", status.as_u16(), text),
-            ));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(provider_http_error("anthropic", status.as_u16(), body));
         }
 
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| OdinError::provider("anthropic", format!("Invalid response: {}", e)))?;
+        let json: Value = resp.json().await.map_err(|e| {
+            OdinError::provider_permanent("anthropic", format!("Invalid response: {}", e))
+        })?;
 
         Self::parse_response(&json, model)
     }

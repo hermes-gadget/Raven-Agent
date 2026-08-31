@@ -164,10 +164,8 @@ impl Tool for DryRunTool {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        // Preserve inner tags but add dry-run marker
-        // We need to return a static slice, so we mark as safe
-        &["dry-run", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["dry-run".into(), "safe".into()]
     }
 
     fn is_dangerous(&self) -> bool {
@@ -190,6 +188,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         let result = dry_run
@@ -216,6 +215,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         // A dangerous command (rm -rf) — should still work in dry-run
@@ -238,6 +238,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         // Missing required 'command' field
@@ -269,6 +270,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         let result = dry_run.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -292,6 +294,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         };
 
         let result = dry_run

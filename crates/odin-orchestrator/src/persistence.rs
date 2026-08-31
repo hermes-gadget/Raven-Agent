@@ -8,8 +8,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
-use sqlx_sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx_sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -60,10 +63,12 @@ pub trait OrchestrationStore: Send + Sync {
     /// Delete a task graph and all its associated agent lifecycles.
     async fn delete_task_graph(&self, root_id: &str) -> Result<(), StoreError>;
 
-    /// Save a file lock snapshot.
-    async fn save_lock_snapshot(&self, snapshot: &str) -> Result<(), StoreError>;
-    /// Load the most recent file lock snapshot.
-    async fn load_lock_snapshot(&self) -> Result<Option<String>, StoreError>;
+    /// Save a file lock snapshot keyed by its graph/run identity.
+    async fn save_lock_snapshot(&self, graph_id: &str, snapshot: &str) -> Result<(), StoreError>;
+    /// Load the file lock snapshot for one graph/run.
+    async fn load_lock_snapshot(&self, graph_id: &str) -> Result<Option<String>, StoreError>;
+    /// Load the newest snapshot when an operator has not selected a run.
+    async fn load_latest_lock_snapshot(&self) -> Result<Option<String>, StoreError>;
 
     /// Enqueue a live control command for a graph UUID.
     async fn enqueue_control(&self, command: &RunControlCommand) -> Result<(), StoreError>;
@@ -114,15 +119,26 @@ pub struct SqliteOrchestrationStore {
 impl SqliteOrchestrationStore {
     /// Create a new SQLite store at the given path.
     pub async fn new(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let path = path.into();
         let options = SqliteConnectOptions::new()
-            .filename(path.into())
+            .filename(&path)
             .create_if_missing(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
             .await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| StoreError::Database(sqlx_core::Error::Io(error)))?;
+        }
 
         Ok(Self { pool })
     }
@@ -131,7 +147,12 @@ impl SqliteOrchestrationStore {
     pub async fn new_in_memory() -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(
+                SqliteConnectOptions::from_str("sqlite::memory:")?
+                    .journal_mode(SqliteJournalMode::Memory)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .foreign_keys(true),
+            )
             .await?;
 
         Ok(Self { pool })
@@ -141,6 +162,17 @@ impl SqliteOrchestrationStore {
 #[async_trait]
 impl OrchestrationStore for SqliteOrchestrationStore {
     async fn initialize(&self) -> Result<(), StoreError> {
+        query(
+            r#"
+            CREATE TABLE IF NOT EXISTS orchestration_schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         query(
             r#"
             CREATE TABLE IF NOT EXISTS task_graphs (
@@ -195,7 +227,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         query(
             r#"
             CREATE TABLE IF NOT EXISTS lock_snapshots (
-                id INTEGER PRIMARY KEY,
+                graph_id TEXT PRIMARY KEY,
                 snapshot_json TEXT NOT NULL,
                 saved_at TEXT NOT NULL
             )
@@ -203,6 +235,39 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         )
         .execute(&self.pool)
         .await?;
+
+        // Migrate the pre-audit singleton snapshot table without losing the
+        // last snapshot. New writes are keyed by graph/run identity so one
+        // orchestration cannot overwrite another one's lock state.
+        let lock_columns =
+            query_as::<_, (String,)>("SELECT name FROM pragma_table_info('lock_snapshots')")
+                .fetch_all(&self.pool)
+                .await?;
+        if !lock_columns.iter().any(|(name,)| name == "graph_id") {
+            query("ALTER TABLE lock_snapshots RENAME TO lock_snapshots_legacy")
+                .execute(&self.pool)
+                .await?;
+            query(
+                r#"
+                CREATE TABLE lock_snapshots (
+                    graph_id TEXT PRIMARY KEY,
+                    snapshot_json TEXT NOT NULL,
+                    saved_at TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+            query(
+                "INSERT INTO lock_snapshots (graph_id, snapshot_json, saved_at)
+                 SELECT 'legacy', snapshot_json, saved_at FROM lock_snapshots_legacy",
+            )
+            .execute(&self.pool)
+            .await?;
+            query("DROP TABLE lock_snapshots_legacy")
+                .execute(&self.pool)
+                .await?;
+        }
 
         query(
             r#"
@@ -227,6 +292,50 @@ impl OrchestrationStore for SqliteOrchestrationStore {
             CREATE INDEX IF NOT EXISTS idx_run_controls_graph_status
             ON run_controls(graph_id, status, created_at)
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        query(
+            "INSERT OR IGNORE INTO orchestration_schema_migrations (version, applied_at)
+             VALUES (1, datetime('now'))",
+        )
+        .execute(&self.pool)
+        .await?;
+        query(
+            "INSERT OR IGNORE INTO orchestration_schema_migrations (version, applied_at)
+             VALUES (2, datetime('now'))",
+        )
+        .execute(&self.pool)
+        .await?;
+        query(
+            "INSERT OR IGNORE INTO orchestration_schema_migrations (version, applied_at)
+             VALUES (3, datetime('now'))",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Keep terminal orchestration history bounded while preserving active
+        // runs and recent diagnostics for operators.
+        query(
+            "DELETE FROM task_graphs
+             WHERE status IN ('complete', 'failed', 'cancelled')
+               AND updated_at < datetime('now', '-30 days')",
+        )
+        .execute(&self.pool)
+        .await?;
+        query(
+            "DELETE FROM agent_lifecycles
+             WHERE finished_at IS NOT NULL
+               AND finished_at < datetime('now', '-30 days')",
+        )
+        .execute(&self.pool)
+        .await?;
+        query(
+            "DELETE FROM run_controls
+             WHERE status = 'applied'
+               AND applied_at IS NOT NULL
+               AND applied_at < datetime('now', '-30 days')",
         )
         .execute(&self.pool)
         .await?;
@@ -418,7 +527,16 @@ impl OrchestrationStore for SqliteOrchestrationStore {
             "cancelled" | "canceled" => TaskGraphStatus::Cancelled,
             _ => return Err(StoreError::InvalidStatus(status.to_string())),
         };
-        let mut graph = self.load_task_graph(root_id).await?;
+        let mut tx = self.pool.begin().await?;
+        let row = query_as::<_, (String,)>(
+            "SELECT graph_json FROM task_graphs WHERE root_id = ? OR root_goal = ? ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(root_id)
+        .bind(root_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("Task graph '{}' not found", root_id)))?;
+        let mut graph: TaskGraph = serde_json::from_str(&row.0)?;
         graph.status = graph_status;
         let graph_json = serde_json::to_string(&graph)?;
         let now = Utc::now().to_rfc3339();
@@ -430,7 +548,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 .bind(&now)
                 .bind(root_id)
                 .bind(root_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
         if rows.rows_affected() == 0 {
@@ -439,6 +557,7 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 root_id
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -480,15 +599,17 @@ impl OrchestrationStore for SqliteOrchestrationStore {
     }
 
     async fn delete_task_graph(&self, root_id: &str) -> Result<(), StoreError> {
-        // Delete associated lifecycles first
+        let mut tx = self.pool.begin().await?;
+        // Delete associated lifecycles first, in the same transaction as the
+        // graph so a partial cleanup cannot leave orphaned state.
         query("DELETE FROM agent_lifecycles WHERE graph_root_id = ?")
             .bind(root_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         let rows = query("DELETE FROM task_graphs WHERE root_id = ?")
             .bind(root_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if rows.rows_affected() == 0 {
@@ -497,14 +618,25 @@ impl OrchestrationStore for SqliteOrchestrationStore {
                 root_id
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn save_lock_snapshot(&self, snapshot_json: &str) -> Result<(), StoreError> {
+    async fn save_lock_snapshot(
+        &self,
+        graph_id: &str,
+        snapshot_json: &str,
+    ) -> Result<(), StoreError> {
+        if graph_id.trim().is_empty() {
+            return Err(StoreError::NotFound(
+                "lock snapshot graph ID is empty".into(),
+            ));
+        }
         let now = Utc::now().to_rfc3339();
         query(
-            "INSERT INTO lock_snapshots (id, snapshot_json, saved_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json = excluded.snapshot_json, saved_at = excluded.saved_at",
+            "INSERT INTO lock_snapshots (graph_id, snapshot_json, saved_at) VALUES (?, ?, ?) ON CONFLICT(graph_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, saved_at = excluded.saved_at",
         )
+        .bind(graph_id)
         .bind(snapshot_json)
         .bind(&now)
         .execute(&self.pool)
@@ -512,9 +644,18 @@ impl OrchestrationStore for SqliteOrchestrationStore {
         Ok(())
     }
 
-    async fn load_lock_snapshot(&self) -> Result<Option<String>, StoreError> {
+    async fn load_lock_snapshot(&self, graph_id: &str) -> Result<Option<String>, StoreError> {
+        let row =
+            query_as::<_, (String,)>("SELECT snapshot_json FROM lock_snapshots WHERE graph_id = ?")
+                .bind(graph_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn load_latest_lock_snapshot(&self) -> Result<Option<String>, StoreError> {
         let row = query_as::<_, (String,)>(
-            "SELECT snapshot_json FROM lock_snapshots WHERE id = 1 ORDER BY saved_at DESC LIMIT 1",
+            "SELECT snapshot_json FROM lock_snapshots ORDER BY saved_at DESC LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -886,6 +1027,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lock_snapshots_are_isolated_by_graph_and_have_latest_fallback() {
+        let store = setup_store().await;
+        store
+            .save_lock_snapshot("run-a", "snapshot-a")
+            .await
+            .unwrap();
+        store
+            .save_lock_snapshot("run-b", "snapshot-b")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_lock_snapshot("run-a").await.unwrap().as_deref(),
+            Some("snapshot-a")
+        );
+        assert_eq!(
+            store.load_lock_snapshot("run-b").await.unwrap().as_deref(),
+            Some("snapshot-b")
+        );
+        assert_eq!(store.load_lock_snapshot("missing-run").await.unwrap(), None);
+        assert_eq!(
+            store.load_latest_lock_snapshot().await.unwrap().as_deref(),
+            Some("snapshot-b")
+        );
+    }
+
+    #[tokio::test]
     async fn control_commands_are_claimed_once_and_applied() {
         use crate::control::{RunControlCommand, RunControlKind, RunControlStatus};
 
@@ -914,5 +1082,79 @@ mod tests {
         store.mark_control_applied(claimed[0].id).await.unwrap();
         let listed = store.list_controls(&graph_id, 10).await.unwrap();
         assert_eq!(listed[0].status, RunControlStatus::Applied);
+    }
+
+    #[tokio::test]
+    async fn initialization_records_migrations_and_retires_old_terminal_state() {
+        let store = setup_store().await;
+        let old_graph = TaskGraph::new("old-terminal");
+        let old_root = old_graph.id.to_string();
+        query(
+            "INSERT INTO task_graphs
+             (root_id, root_goal, graph_json, status, node_count, created_at, updated_at)
+             VALUES (?, ?, ?, 'complete', 0, ?, ?)",
+        )
+        .bind(&old_root)
+        .bind(&old_graph.root_goal)
+        .bind(serde_json::to_string(&old_graph).unwrap())
+        .bind("2000-01-01T00:00:00+00:00")
+        .bind("2000-01-01T00:00:00+00:00")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let old_agent = Uuid::new_v4();
+        query(
+            "INSERT INTO agent_lifecycles
+             (agent_id, graph_root_id, phase, lifecycle_json, created_at, finished_at)
+             VALUES (?, ?, 'done', ?, ?, ?)",
+        )
+        .bind(old_agent.to_string())
+        .bind(&old_root)
+        .bind(serde_json::to_string(&AgentLifecycle::new(old_agent)).unwrap())
+        .bind("2000-01-01T00:00:00+00:00")
+        .bind("2000-01-01T00:00:00+00:00")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        store.initialize().await.unwrap();
+
+        let migration_count: i64 = query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM orchestration_schema_migrations WHERE version IN (1, 2, 3)",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+        .0;
+        let graph_count: i64 =
+            query_as::<_, (i64,)>("SELECT COUNT(*) FROM task_graphs WHERE root_id = ?")
+                .bind(&old_root)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+                .0;
+        let lifecycle_count: i64 =
+            query_as::<_, (i64,)>("SELECT COUNT(*) FROM agent_lifecycles WHERE agent_id = ?")
+                .bind(old_agent.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(migration_count, 3);
+        assert_eq!(graph_count, 0);
+        assert_eq!(lifecycle_count, 0);
+    }
+
+    #[tokio::test]
+    async fn file_store_enables_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orchestration.db");
+        let store = SqliteOrchestrationStore::new(&path).await.unwrap();
+        store.initialize().await.unwrap();
+        let (journal_mode,): (String,) = query_as("PRAGMA journal_mode")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
     }
 }

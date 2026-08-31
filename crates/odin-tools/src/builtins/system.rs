@@ -4,7 +4,7 @@
 //! command-line utilities (`uname`, `free`, `df`). They are safe, read-only
 //! diagnostic tools with no side effects.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -14,6 +14,21 @@ use tracing::instrument;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{Tool, ToolContext};
 use odin_core::types::{FunctionSchema, ToolResult, ToolSchema};
+
+use crate::process::{self, ProcessError};
+
+fn map_process_error(tool_name: &str, error: ProcessError) -> OdinError {
+    match error {
+        ProcessError::Timeout => OdinError::Timeout(format!(
+            "{tool_name} subprocess exceeded its resource budget"
+        )),
+        ProcessError::Io(error) => OdinError::Tool {
+            tool: tool_name.to_string(),
+            message: format!("Failed to execute subprocess: {error}"),
+            source: Some(Box::new(error)),
+        },
+    }
+}
 
 // ── system_info ─────────────────────────────────────────────────────
 
@@ -75,29 +90,31 @@ impl Tool for SystemInfo {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["diagnostic", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["diagnostic".into(), "read".into(), "safe".into()]
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         _args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
+        let timeout = Duration::from_secs(context.resource_budgets.max_tool_timeout_secs.max(1));
+        let max_output_bytes = context.resource_budgets.max_tool_output_bytes.max(1);
 
-        let uname_output = tokio::process::Command::new("uname")
-            .arg("-a")
-            .output()
+        let mut uname = tokio::process::Command::new("uname");
+        uname.arg("-a");
+        let uname_output = process::run_command(uname, timeout, max_output_bytes)
             .await
-            .map_err(OdinError::Io)?;
+            .map_err(|error| map_process_error(self.name(), error))?;
 
-        let free_output = tokio::process::Command::new("free")
-            .arg("-h")
-            .output()
+        let mut free = tokio::process::Command::new("free");
+        free.arg("-h");
+        let free_output = process::run_command(free, timeout, max_output_bytes)
             .await
-            .map_err(OdinError::Io)?;
+            .map_err(|error| map_process_error(self.name(), error))?;
 
         let sysname = String::from_utf8_lossy(&uname_output.stdout)
             .trim()
@@ -106,21 +123,28 @@ impl Tool for SystemInfo {
             .trim()
             .to_string();
 
-        let output = format!(
+        let mut output = format!(
             "── System Information ──\n\
              Kernel/OS: {sysname}\n\n\
              ── Memory ──\n\
              {memory}"
         );
+        if uname_output.stdout_truncated || free_output.stdout_truncated {
+            output.push_str("\n\n[TRUNCATED: output exceeded the configured per-stream limit]");
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         Ok(ToolResult {
             call_id: String::new(),
             tool_name: self.name.clone(),
-            success: true,
+            success: uname_output.status.success() && free_output.status.success(),
             output,
-            error: None,
+            error: if uname_output.status.success() && free_output.status.success() {
+                None
+            } else {
+                Some("one or more system diagnostic commands failed".into())
+            },
             duration_ms,
             timestamp: Utc::now(),
         })
@@ -198,15 +222,15 @@ impl Tool for DiskUsage {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["diagnostic", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["diagnostic".into(), "read".into(), "safe".into()]
     }
 
-    #[instrument(skip(self, _context), fields(tool = self.name))]
+    #[instrument(skip(self, context), fields(tool = self.name))]
     async fn execute(
         &self,
         args: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> OdinResult<ToolResult> {
         let start = Instant::now();
 
@@ -223,7 +247,13 @@ impl Tool for DiskUsage {
             cmd.arg(path);
         }
 
-        let output = cmd.output().await.map_err(OdinError::Io)?;
+        let output = process::run_command(
+            cmd,
+            Duration::from_secs(context.resource_budgets.max_tool_timeout_secs.max(1)),
+            context.resource_budgets.max_tool_output_bytes.max(1),
+        )
+        .await
+        .map_err(|error| map_process_error(self.name(), error))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -246,6 +276,9 @@ impl Tool for DiskUsage {
         if !stderr.is_empty() {
             out.push_str("\n--- stderr ---\n");
             out.push_str(&stderr);
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            out.push_str("\n\n[TRUNCATED: output exceeded the configured per-stream limit]");
         }
 
         Ok(ToolResult {
@@ -272,6 +305,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 

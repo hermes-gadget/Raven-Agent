@@ -19,6 +19,7 @@ use crate::phases::{
     RevisePhase, VerifyPhase,
 };
 use crate::small_model::SmallModelProfile;
+use crate::small_model::{is_substantive_action_output, verify_evidence};
 use crate::summarizer::StateSummarizer;
 
 /// The main loop engine implementation.
@@ -37,6 +38,8 @@ pub struct Engine {
     provider: Option<Arc<dyn Provider>>,
     /// Optional stronger provider for escalation (used when confidence is low)
     escalation_provider: Option<Arc<dyn Provider>>,
+    /// Optional stronger model name used after escalation.
+    escalation_model_name: Option<String>,
     /// Optional tool registry for dispatching tool calls
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     /// Optional policy engine for permission checking
@@ -49,8 +52,14 @@ pub struct Engine {
     reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
     /// Model name to pass to the provider (e.g., "deepseek-v4-pro", "gpt-4o")
     model_name: String,
+    /// Optional model dedicated to planning.
+    planning_model_name: Option<String>,
+    /// Optional model dedicated to critique, revision, and verification.
+    critique_model_name: Option<String>,
     /// Optional small/local model profile used to bound prompts, retries, and context.
     model_profile: Option<SmallModelProfile>,
+    /// Central limits shared by all tool execution paths.
+    resource_budgets: odin_core::config::ResourceBudgetConfig,
 }
 
 impl Engine {
@@ -64,13 +73,17 @@ impl Engine {
             max_iterations: 100,
             provider: None,
             escalation_provider: None,
+            escalation_model_name: None,
             tool_registry: None,
             policy_engine: None,
             skill_registry: None,
             audit_logger: None,
             reliability_tracker: None,
             model_name: String::new(),
+            planning_model_name: None,
+            critique_model_name: None,
             model_profile: None,
+            resource_budgets: odin_core::config::ResourceBudgetConfig::default(),
         }
     }
 
@@ -92,6 +105,18 @@ impl Engine {
         self
     }
 
+    /// Select a model dedicated to plan generation.
+    pub fn with_planning_model_name(mut self, name: impl Into<String>) -> Self {
+        self.planning_model_name = Some(name.into());
+        self
+    }
+
+    /// Select a model dedicated to critique, revision, and verification.
+    pub fn with_critique_model_name(mut self, name: impl Into<String>) -> Self {
+        self.critique_model_name = Some(name.into());
+        self
+    }
+
     /// Attach a small/local model profile for adaptive prompting and retries.
     pub fn with_small_model_profile(mut self, profile: SmallModelProfile) -> Self {
         self.model_profile = Some(profile);
@@ -101,6 +126,12 @@ impl Engine {
     /// Attach a stronger escalation provider for low-confidence scenarios.
     pub fn with_escalation_provider(mut self, provider: Arc<dyn Provider>) -> Self {
         self.escalation_provider = Some(provider);
+        self
+    }
+
+    /// Select a stronger model when the loop escalates.
+    pub fn with_escalation_model_name(mut self, model: impl Into<String>) -> Self {
+        self.escalation_model_name = Some(model.into());
         self
     }
 
@@ -151,6 +182,15 @@ impl Engine {
         self
     }
 
+    /// Set the central tool-call/output/time budgets used by every ACT phase.
+    pub fn with_resource_budgets(
+        mut self,
+        budgets: odin_core::config::ResourceBudgetConfig,
+    ) -> Self {
+        self.resource_budgets = budgets;
+        self
+    }
+
     /// Set custom confidence thresholds.
     pub fn with_confidence_thresholds(mut self, low: f64, high: f64) -> Self {
         self.confidence_scorer.low_threshold = low;
@@ -198,7 +238,10 @@ impl LoopEngineTrait for Engine {
 
         // Initialize loop state
         let mut state = LoopState {
-            task: task.clone(),
+            task: AgentTask {
+                max_iterations,
+                ..task.clone()
+            },
             messages: self.initial_messages(task),
             tool_results: vec![],
             current_phase: LoopPhase::Plan,
@@ -226,24 +269,28 @@ impl LoopEngineTrait for Engine {
             summarizer: self.summarizer.clone(),
             plan: Some(plan.clone()),
             model_name: self.model_name.clone(),
+            planning_model_name: self.planning_model_name.clone(),
+            critique_model_name: self.critique_model_name.clone(),
             provider: self.provider.clone(),
             escalation_provider: self.escalation_provider.clone(),
+            escalation_model_name: self.escalation_model_name.clone(),
             tool_registry: self.tool_registry.clone(),
             policy_engine: self.policy_engine.clone(),
             skill_registry: self.skill_registry.clone(),
             audit_logger: self.audit_logger.clone(),
             reliability_tracker: self.reliability_tracker.clone(),
             model_profile: self.model_profile.clone(),
+            resource_budgets: self.resource_budgets.clone(),
         };
 
         let mut total_tool_calls = 0u32;
         let mut last_confidence = ConfidenceScore::new(1.0);
 
         // Main loop
-        loop {
+        let termination = loop {
             if state.iteration >= max_iterations {
                 tracing::warn!("[LOOP] Max iterations reached");
-                break;
+                break TerminationReason::IterationLimit;
             }
 
             state.iteration += 1;
@@ -255,7 +302,7 @@ impl LoopEngineTrait for Engine {
                 context.plan = Some(plan.clone());
                 last_confidence = result.confidence;
                 if result.decision == LoopDecision::Stop {
-                    break;
+                    break TerminationReason::Stopped;
                 }
                 // After planning, go straight to ACT
                 state.current_phase = LoopPhase::Act;
@@ -299,30 +346,33 @@ impl LoopEngineTrait for Engine {
                         last_confidence.value() * 100.0
                     );
                     // If we have an escalation provider, switch and retry
-                    if context.escalation_provider.is_some() && context.provider.is_some() {
+                    if context.escalation_provider.is_some()
+                        || context.escalation_model_name.is_some()
+                    {
                         tracing::info!("[LOOP] Switching to escalation provider for retry");
-                        // Swap providers: escalation becomes primary for this retry
-                        let _ = std::mem::replace(
-                            &mut context.provider,
-                            context.escalation_provider.clone(),
-                        );
+                        if let Some(provider) = context.escalation_provider.clone() {
+                            context.provider = Some(provider);
+                        }
+                        if let Some(model) = context.escalation_model_name.clone() {
+                            context.model_name = model;
+                        }
                         state.current_phase = LoopPhase::Act;
                         continue;
                     }
                     // No escalation provider available — give up
-                    break;
+                    break TerminationReason::EscalationUnavailable;
                 }
                 LoopDecision::Retry => {
                     // ── REVISE ──
                     let revise = revise_phase.execute(&mut state, &context).await?;
                     if revise.decision == LoopDecision::Escalate {
-                        break;
+                        break TerminationReason::EscalationUnavailable;
                     }
                     // Go back to ACT with revised approach
                     state.current_phase = LoopPhase::Act;
                     continue;
                 }
-                LoopDecision::Stop => break,
+                LoopDecision::Stop => break TerminationReason::Stopped,
                 LoopDecision::Continue => {
                     // ── VERIFY ──
                     let verify = verify_phase.execute(&mut state, &context).await?;
@@ -331,8 +381,16 @@ impl LoopEngineTrait for Engine {
                     // ── DECIDE ──
                     let decide = decide_phase.execute(&mut state, &context).await?;
                     match decide.decision {
-                        LoopDecision::Stop => break,
-                        LoopDecision::Escalate => break,
+                        LoopDecision::Stop => {
+                            break if state.iteration >= max_iterations {
+                                TerminationReason::IterationLimit
+                            } else {
+                                TerminationReason::Stopped
+                            };
+                        }
+                        LoopDecision::Escalate => {
+                            break TerminationReason::EscalationUnavailable;
+                        }
                         LoopDecision::Retry => {
                             state.current_phase = LoopPhase::Act;
                             continue;
@@ -340,6 +398,7 @@ impl LoopEngineTrait for Engine {
                         LoopDecision::Continue => {
                             // Mark current sub-task as complete if confidence is high
                             if last_confidence.is_high()
+                                && latest_act_has_evidence(&state)
                                 && let Some(pending) = plan
                                     .sub_tasks
                                     .iter_mut()
@@ -347,6 +406,7 @@ impl LoopEngineTrait for Engine {
                             {
                                 pending.status = SubTaskStatus::Completed;
                                 pending.result = Some("Completed successfully".into());
+                                state.task.sub_tasks = plan.sub_tasks.clone();
                             }
 
                             // Check if all sub-tasks are done
@@ -356,7 +416,15 @@ impl LoopEngineTrait for Engine {
                                     || st.status == SubTaskStatus::Skipped
                             });
                             if all_done {
-                                break;
+                                break if plan
+                                    .sub_tasks
+                                    .iter()
+                                    .all(|task| task.status == SubTaskStatus::Completed)
+                                {
+                                    TerminationReason::Completed
+                                } else {
+                                    TerminationReason::Stopped
+                                };
                             }
 
                             state.current_phase = LoopPhase::Act;
@@ -365,18 +433,19 @@ impl LoopEngineTrait for Engine {
                     }
                 }
             }
-        }
+        };
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        let success = last_confidence.is_high();
-
-        let summary = format!(
-            "Task {} after {} iterations, {} tool calls. Confidence: {:.0}%",
-            if success { "completed" } else { "stopped" },
-            state.iteration,
-            total_tool_calls,
-            last_confidence.value() * 100.0
-        );
+        let acted = state
+            .history
+            .iter()
+            .any(|record| record.phase == LoopPhase::Act);
+        let evidence = verify_evidence(&state, &task.success_criteria);
+        let success = termination == TerminationReason::Completed
+            && acted
+            && evidence.verified
+            && last_confidence.is_high();
+        let summary = useful_final_summary(&state, &plan, termination);
 
         tracing::info!(task_id = %task.id, success, iterations = state.iteration, "Agent loop finished");
 
@@ -389,11 +458,7 @@ impl LoopEngineTrait for Engine {
             duration_ms,
             sub_tasks: plan.sub_tasks,
             confidence: last_confidence.value(),
-            error: if success {
-                None
-            } else {
-                Some("Did not meet confidence threshold".into())
-            },
+            error: completion_error(success, acted, evidence.verified, termination),
         })
     }
 
@@ -409,14 +474,18 @@ impl LoopEngineTrait for Engine {
             summarizer: self.summarizer.clone(),
             plan: None,
             model_name: self.model_name.clone(),
+            planning_model_name: self.planning_model_name.clone(),
+            critique_model_name: self.critique_model_name.clone(),
             provider: self.provider.clone(),
             escalation_provider: self.escalation_provider.clone(),
+            escalation_model_name: self.escalation_model_name.clone(),
             tool_registry: self.tool_registry.clone(),
             policy_engine: self.policy_engine.clone(),
             skill_registry: self.skill_registry.clone(),
             audit_logger: self.audit_logger.clone(),
             reliability_tracker: self.reliability_tracker.clone(),
             model_profile: self.model_profile.clone(),
+            resource_budgets: self.resource_budgets.clone(),
         };
 
         match phase {
@@ -462,6 +531,139 @@ impl LoopEngineTrait for Engine {
 
     fn confidence(&self) -> ConfidenceScore {
         ConfidenceScore::new(0.5)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationReason {
+    Completed,
+    IterationLimit,
+    Stopped,
+    EscalationUnavailable,
+}
+
+fn latest_act_has_evidence(state: &odin_core::traits::LoopState) -> bool {
+    let action = state
+        .history
+        .iter()
+        .rev()
+        .find(|record| record.phase == LoopPhase::Act)
+        .and_then(|record| record.output.as_deref())
+        .is_some_and(is_substantive_action_output);
+    action
+        || state
+            .tool_results
+            .last()
+            .is_some_and(|result| result.success)
+}
+
+fn useful_final_summary(
+    state: &odin_core::traits::LoopState,
+    plan: &DecomposedPlan,
+    termination: TerminationReason,
+) -> String {
+    let action = state
+        .history
+        .iter()
+        .rev()
+        .find(|record| record.phase == LoopPhase::Act)
+        .and_then(|record| record.output.as_deref())
+        .map(str::trim)
+        .filter(|output| !output.is_empty());
+    let substantive_action = action.filter(|output| is_substantive_action_output(output));
+    let tool_evidence = state.tool_results.last().map(|result| {
+        let detail = if result.success {
+            result.output.trim()
+        } else {
+            result.error.as_deref().unwrap_or("tool failed")
+        };
+        let detail: String = detail.chars().take(500).collect();
+        format!(
+            "{} {}{}",
+            result.tool_name,
+            if result.success {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )
+    });
+    let remaining = plan
+        .sub_tasks
+        .iter()
+        .filter(|task| task.status == SubTaskStatus::Pending)
+        .map(|task| task.description.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    match termination {
+        TerminationReason::Completed => substantive_action
+            .map(str::to_string)
+            .or(tool_evidence)
+            .unwrap_or_else(|| "Task completed with recorded verification evidence.".into()),
+        TerminationReason::IterationLimit if action.is_none() => format!(
+            "Iteration limit reached after planning, before any ACT could run. Planned work: {}",
+            if remaining.is_empty() {
+                "no executable sub-task was produced"
+            } else {
+                remaining.as_str()
+            }
+        ),
+        TerminationReason::IterationLimit => format!(
+            "Iteration limit reached. Work completed so far: {}.{}{}",
+            substantive_action
+                .or(action)
+                .unwrap_or("an action was attempted"),
+            tool_evidence
+                .map(|evidence| format!(" Tool evidence: {evidence}."))
+                .unwrap_or_default(),
+            if remaining.is_empty() {
+                String::new()
+            } else {
+                format!(" Remaining work: {remaining}.")
+            }
+        ),
+        TerminationReason::EscalationUnavailable => format!(
+            "Execution stopped because escalation was required but unavailable. Work completed so far: {}.",
+            substantive_action
+                .or(action)
+                .unwrap_or("no substantive action result")
+        ),
+        TerminationReason::Stopped => format!(
+            "Execution stopped before verified completion. Work completed so far: {}.{}",
+            substantive_action
+                .or(action)
+                .unwrap_or("no substantive action result"),
+            if remaining.is_empty() {
+                String::new()
+            } else {
+                format!(" Remaining work: {remaining}.")
+            }
+        ),
+    }
+}
+
+fn completion_error(
+    success: bool,
+    acted: bool,
+    evidence_verified: bool,
+    termination: TerminationReason,
+) -> Option<String> {
+    if success {
+        None
+    } else if termination == TerminationReason::IterationLimit {
+        Some("Iteration limit reached before verified completion".into())
+    } else if !acted {
+        Some("No ACT phase executed; completion cannot be claimed".into())
+    } else if !evidence_verified {
+        Some("Completion lacked observable evidence".into())
+    } else {
+        Some("Task stopped before all planned work was verified".into())
     }
 }
 
@@ -553,6 +755,27 @@ mod tests {
         let result = engine.execute_task(&task).await.unwrap();
 
         assert!(result.iterations <= 5);
+    }
+
+    #[tokio::test]
+    async fn one_iteration_cannot_succeed_without_act_and_returns_a_useful_response() {
+        let engine = Engine::new().with_max_iterations(1);
+        let mut task = make_task("Write and verify a file");
+        task.max_iterations = 1;
+
+        let result = engine.execute_task(&task).await.unwrap();
+
+        assert!(!result.success, "planning alone must never report success");
+        assert_eq!(result.iterations, 1);
+        assert_eq!(result.tool_calls, 0);
+        assert!(result.summary.contains("before any ACT could run"));
+        assert!(result.summary.contains("Planned work:"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Iteration limit"))
+        );
     }
 
     #[tokio::test]
@@ -728,7 +951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_error_graceful_degradation() {
+    async fn test_provider_error_remains_typed_and_fail_closed() {
         struct FailingProvider;
         #[async_trait]
         impl ProviderTrait for FailingProvider {
@@ -769,9 +992,9 @@ mod tests {
             .with_provider(Arc::new(FailingProvider))
             .with_max_iterations(5);
         let task = make_task("Do something");
-        let result = engine.execute_task(&task).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.is_some());
+        let error = engine.execute_task(&task).await.unwrap_err();
+        assert!(matches!(error, OdinError::Provider { .. }));
+        assert!(error.is_retryable());
     }
 
     #[tokio::test]
@@ -908,6 +1131,26 @@ mod tests {
         task.max_iterations = 10;
         let result = engine.execute_task(&task).await.unwrap();
         assert_eq!(result.iterations, 3);
+    }
+
+    #[tokio::test]
+    async fn iteration_exhaustion_reports_the_action_that_was_completed() {
+        let mock = Arc::new(MockProvider::new(vec![
+            mk_resp("NOT VERIFIED. Confidence: 0.2"),
+            mk_resp("The result needs more verification."),
+            mk_resp("I inspected the requested state and found two pending changes."),
+            mk_resp(r#"{"sub_tasks":[{"id":"task_1","description":"inspect state"}]}"#),
+        ]));
+        let engine = Engine::new().with_provider(mock).with_max_iterations(2);
+        let mut task = make_task("Inspect state and report findings");
+        task.max_iterations = 2;
+
+        let result = engine.execute_task(&task).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.summary.starts_with("Iteration limit reached."));
+        assert!(result.summary.contains("I inspected the requested state"));
+        assert!(!result.summary.trim().is_empty());
     }
 
     #[tokio::test]
@@ -1221,6 +1464,7 @@ mod tests {
             session_id: uuid::Uuid::default(),
             working_dir: std::path::PathBuf::from("/tmp"),
             env: std::collections::HashMap::new(),
+            resource_budgets: Default::default(),
         };
         let result = shell_tool.execute(args, &context).await.unwrap();
         assert!(!result.success, "Dangerous command should not succeed");

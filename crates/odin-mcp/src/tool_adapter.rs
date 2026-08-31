@@ -25,7 +25,7 @@ pub struct McpToolAdapter {
     /// Shared reference to the client managing the MCP connection.
     client: Arc<Mutex<McpClient>>,
     /// Capability tags for this tool.
-    tags: Vec<&'static str>,
+    tags: Vec<String>,
     /// Whether this tool requires user approval.
     requires_approval: bool,
     /// Whether this tool is safe.
@@ -40,7 +40,7 @@ impl McpToolAdapter {
     /// discovery does not include a portable safety classification.
     pub fn new(def: McpToolDef, client: Arc<Mutex<McpClient>>) -> Self {
         Self {
-            tags: vec!["mcp", "external", "dangerous"],
+            tags: vec!["mcp".into(), "external".into(), "dangerous".into()],
             requires_approval: true,
             safe: false,
             def,
@@ -55,10 +55,7 @@ impl McpToolAdapter {
         tags: Vec<String>,
     ) -> Self {
         Self {
-            tags: tags
-                .into_iter()
-                .map(|tag| Box::leak(tag.into_boxed_str()) as &'static str)
-                .collect(),
+            tags,
             requires_approval: true,
             safe: false,
             def,
@@ -75,9 +72,12 @@ impl McpToolAdapter {
     /// Mark this tool as safe or unsafe.
     pub fn with_safety(mut self, safe: bool) -> Self {
         self.safe = safe;
-        self.tags
-            .retain(|tag| *tag != "safe" && *tag != "dangerous");
-        self.tags.push(if safe { "safe" } else { "dangerous" });
+        self.tags.retain(|tag| tag != "safe" && tag != "dangerous");
+        self.tags.push(if safe {
+            "safe".into()
+        } else {
+            "dangerous".into()
+        });
         self
     }
 
@@ -176,8 +176,8 @@ impl Tool for McpToolAdapter {
         self.safe
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &self.tags
+    fn capability_tags(&self) -> Vec<String> {
+        self.tags.clone()
     }
 
     fn is_dangerous(&self) -> bool {
@@ -185,13 +185,31 @@ impl Tool for McpToolAdapter {
     }
 
     fn validate_args(&self, args: &serde_json::Value) -> OdinResult<()> {
-        // Basic validation: must be an object
-        if !args.is_object() && !args.is_null() {
-            return Err(OdinError::Validation(
-                "MCP tool arguments must be a JSON object".into(),
-            ));
-        }
-        Ok(())
+        let schema = self.schema();
+        // MCP permits a null params value for no-argument tools. Validate it
+        // as an empty object only when the advertised schema has no required
+        // fields; schemas with required fields must still reject null.
+        let value = if args.is_null()
+            && schema
+                .function
+                .parameters
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("object")
+            && schema
+                .function
+                .parameters
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty)
+        {
+            serde_json::json!({})
+        } else {
+            args.clone()
+        };
+        odin_core::traits::validate_json_schema(&value, &schema.function.parameters).map_err(
+            |error| OdinError::Validation(format!("MCP tool '{}': {error}", self.def.name)),
+        )
     }
 }
 
@@ -219,6 +237,7 @@ fn map_mcp_error(tool_name: &str, err: McpError) -> OdinError {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
+    use std::collections::HashMap;
 
     #[test]
     fn test_schema_conversion() {
@@ -363,6 +382,43 @@ mod tests {
     }
 
     #[test]
+    fn test_adapter_validation_enforces_mcp_schema() {
+        let def = McpToolDef {
+            name: "strict".into(),
+            description: "Strict arguments".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["count"],
+                "additionalProperties": false,
+                "properties": {"count": {"type": "integer", "minimum": 1, "maximum": 3}}
+            }),
+        };
+        let adapter = McpToolAdapter::new(
+            def,
+            Arc::new(Mutex::new(McpClient::new(Arc::new(Mutex::new(
+                MockTransport::new(HashMap::new()),
+            ))))),
+        );
+
+        assert!(
+            adapter
+                .validate_args(&serde_json::json!({"count": 2}))
+                .is_ok()
+        );
+        assert!(
+            adapter
+                .validate_args(&serde_json::json!({"count": 4}))
+                .is_err()
+        );
+        assert!(
+            adapter
+                .validate_args(&serde_json::json!({"count": 2, "extra": true}))
+                .is_err()
+        );
+        assert!(adapter.validate_args(&serde_json::Value::Null).is_err());
+    }
+
+    #[test]
     fn test_adapter_default_tags() {
         let def = McpToolDef {
             name: "tagged".into(),
@@ -381,7 +437,12 @@ mod tests {
         assert!(!adapter.is_safe());
         assert!(adapter.is_dangerous());
         assert!(adapter.requires_approval());
-        assert!(adapter.capability_tags().contains(&"dangerous"));
+        assert!(
+            adapter
+                .capability_tags()
+                .iter()
+                .any(|tag| tag == "dangerous")
+        );
     }
 
     #[test]

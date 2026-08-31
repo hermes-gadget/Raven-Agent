@@ -15,7 +15,7 @@ use chrono::Utc;
 use odin_core::error::{OdinError, OdinResult};
 use odin_core::traits::{ChatStream, Provider};
 use odin_core::types::*;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// State of the circuit breaker for a single provider in the chain.
 #[derive(Debug, Clone)]
@@ -108,6 +108,10 @@ struct FallbackInner {
     health_status: HashMap<String, Arc<Mutex<HealthStatus>>>,
     /// Whether the health check task has been spawned
     health_check_started: AtomicBool,
+    /// Signals the background health checker to stop when the chain is dropped.
+    health_check_cancelled: AtomicBool,
+    /// Wakes the health checker immediately when the chain is dropped.
+    health_check_shutdown: Notify,
     /// Health check interval in seconds
     health_check_interval: u64,
 }
@@ -178,6 +182,8 @@ impl FallbackProvider {
             circuit_breakers,
             health_status,
             health_check_started: AtomicBool::new(false),
+            health_check_cancelled: AtomicBool::new(false),
+            health_check_shutdown: Notify::new(),
             health_check_interval: health_check_interval_secs,
         });
 
@@ -209,11 +215,18 @@ impl FallbackProvider {
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
-            // First tick is immediate
-            ticker.tick().await;
-
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = inner.health_check_shutdown.notified() => break,
+                }
+
+                if inner
+                    .health_check_cancelled
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
 
                 // Check primary
                 let primary_healthy = inner.primary.1.health_check().await.unwrap_or(false);
@@ -313,6 +326,14 @@ impl FallbackProvider {
                     return Ok((name.to_string(), response));
                 }
                 Err(e) => {
+                    if !e.is_retryable() {
+                        tracing::warn!(
+                            "[FALLBACK] Provider '{}' returned a non-retryable failure: {}",
+                            name,
+                            e
+                        );
+                        return Err(e);
+                    }
                     tracing::warn!("[FALLBACK] Provider '{}' failed: {}", name, e);
                     // Record failure in circuit breaker
                     if let Some(cb) = self.inner.circuit_breakers.get(name) {
@@ -393,6 +414,9 @@ impl FallbackProvider {
                     return Ok(stream);
                 }
                 Err(e) => {
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     if let Some(cb) = self.inner.circuit_breakers.get(name) {
                         let mut state = cb.lock().await;
                         state.record_failure();
@@ -457,6 +481,15 @@ impl FallbackProvider {
             result.insert(name.clone(), (state.failure_count, state.circuit_open));
         }
         result
+    }
+}
+
+impl Drop for FallbackProvider {
+    fn drop(&mut self) {
+        self.inner
+            .health_check_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.health_check_shutdown.notify_waiters();
     }
 }
 
@@ -529,6 +562,7 @@ mod tests {
     struct MockProvider {
         name: String,
         chat_result: StdMutex<OdinResult<String>>,
+        permanent_error: bool,
         call_count: AtomicUsize,
         health_result: TokioMutex<bool>,
     }
@@ -538,6 +572,7 @@ mod tests {
             Self {
                 name: name.to_string(),
                 chat_result: StdMutex::new(Ok(response)),
+                permanent_error: false,
                 call_count: AtomicUsize::new(0),
                 health_result: TokioMutex::new(true),
             }
@@ -548,6 +583,7 @@ mod tests {
             Self {
                 name: name.to_string(),
                 chat_result: StdMutex::new(Err(OdinError::provider(name, msg))),
+                permanent_error: false,
                 call_count: AtomicUsize::new(0),
                 health_result: TokioMutex::new(true),
             }
@@ -557,6 +593,7 @@ mod tests {
             Self {
                 name: name.to_string(),
                 chat_result: StdMutex::new(result),
+                permanent_error: false,
                 call_count: AtomicUsize::new(0),
                 health_result: TokioMutex::new(health),
             }
@@ -564,6 +601,19 @@ mod tests {
 
         fn call_count(&self) -> usize {
             self.call_count.load(AtomicOrdering::SeqCst)
+        }
+
+        fn new_permanent_err(name: &str, error_msg: impl Into<String>) -> Self {
+            Self {
+                name: name.to_string(),
+                chat_result: StdMutex::new(Err(OdinError::provider_permanent(
+                    name,
+                    error_msg.into(),
+                ))),
+                permanent_error: true,
+                call_count: AtomicUsize::new(0),
+                health_result: TokioMutex::new(true),
+            }
         }
     }
 
@@ -580,6 +630,9 @@ mod tests {
                         model: self.name.clone(),
                     };
                     Ok(resp)
+                }
+                Err(e) if self.permanent_error => {
+                    Err(OdinError::provider_permanent(&self.name, e.to_string()))
                 }
                 Err(e) => Err(OdinError::provider(&self.name, format!("{}", e))),
             }
@@ -685,6 +738,34 @@ mod tests {
         // Both should have been called
         assert_eq!(primary.call_count(), 1);
         assert_eq!(fallback.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_provider_failure_does_not_fan_out_to_fallback() {
+        let primary = Arc::new(MockProvider::new_permanent_err(
+            "primary",
+            "invalid request",
+        ));
+        let fallback = Arc::new(MockProvider::new_ok(
+            "fallback",
+            make_response("should not run"),
+        ));
+        let fp = FallbackProvider::new(
+            "test-chain",
+            "primary",
+            primary.clone(),
+            vec![("fallback".into(), fallback.clone())],
+            0,
+            0,
+        );
+
+        let error = fp
+            .chat("test-model", &[], &[], &CompletionOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OdinError::ProviderPermanent { .. }));
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(fallback.call_count(), 0);
     }
 
     /// All fail → error with chain info

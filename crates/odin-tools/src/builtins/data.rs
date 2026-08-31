@@ -146,8 +146,8 @@ impl Tool for JsonExtract {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["data", "transform", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["data".into(), "transform".into(), "safe".into()]
     }
 
     #[instrument(skip(self, _context), fields(tool = self.name))]
@@ -206,6 +206,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: PathBuf::from("/tmp"),
             env: HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 

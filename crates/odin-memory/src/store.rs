@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use odin_core::{MemoryCategory, MemoryEntry, OdinError, error::OdinResult, traits::MemoryStore};
 use rusqlite::{Connection, params};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::instrument;
 
 /// Persistent memory store backed by SQLite.
@@ -17,6 +18,7 @@ use tracing::instrument;
 #[derive(Debug, Clone)]
 pub struct SqliteMemoryStore {
     conn: Arc<Mutex<Connection>>,
+    retention_limit: usize,
 }
 
 impl SqliteMemoryStore {
@@ -26,10 +28,20 @@ impl SqliteMemoryStore {
     pub fn new(path: &str) -> OdinResult<Self> {
         let conn = Connection::open(path)
             .map_err(|e| OdinError::Database(format!("Failed to open database at {path}: {e}")))?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
+            OdinError::Database(format!("Failed to configure database timeout: {e}"))
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            retention_limit: 1_000,
         };
         store.init_tables()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(OdinError::Io)?;
+        }
         tracing::info!(path = %path, "Opened SQLite memory store");
         Ok(store)
     }
@@ -38,11 +50,22 @@ impl SqliteMemoryStore {
     pub fn in_memory() -> OdinResult<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| OdinError::Database(format!("Failed to open in-memory database: {e}")))?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
+            OdinError::Database(format!("Failed to configure database timeout: {e}"))
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            retention_limit: 1_000,
         };
         store.init_tables()?;
         Ok(store)
+    }
+
+    /// Bound retained rows so long-lived memory databases cannot grow without
+    /// limit. The newest rows by update time are retained.
+    pub fn with_retention_limit(mut self, limit: usize) -> Self {
+        self.retention_limit = limit.max(1);
+        self
     }
 
     /// Initialise the database schema.
@@ -55,7 +78,16 @@ impl SqliteMemoryStore {
             .map_err(|error| OdinError::Database(format!("Memory store lock poisoned: {error}")))?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memory_entries (
+            "PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA foreign_keys=ON;
+
+            CREATE TABLE IF NOT EXISTS memory_schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entries (
                 id         TEXT PRIMARY KEY,
                 content    TEXT    NOT NULL,
                 category   TEXT    NOT NULL,
@@ -73,20 +105,29 @@ impl SqliteMemoryStore {
         )
         .map_err(|e| OdinError::Database(format!("Failed to initialise schema: {e}")))?;
 
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_schema_migrations (version, applied_at)
+             VALUES (?1, datetime('now'))",
+            [1_i64],
+        )
+        .map_err(|e| {
+            OdinError::Database(format!("Failed to record memory schema migration: {e}"))
+        })?;
+
         Ok(())
     }
 
     async fn run_db<T, F>(&self, operation: F) -> OdinResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> OdinResult<T> + Send + 'static,
+        F: FnOnce(&mut Connection) -> OdinResult<T> + Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|error| {
+            let mut conn = conn.lock().map_err(|error| {
                 OdinError::Database(format!("Memory store lock poisoned: {error}"))
             })?;
-            operation(&conn)
+            operation(&mut conn)
         })
         .await
         .map_err(|error| OdinError::Database(format!("SQLite worker failed: {error}")))?
@@ -98,8 +139,12 @@ impl MemoryStore for SqliteMemoryStore {
     #[instrument(skip(self, entry), fields(entry_id = %entry.id))]
     async fn store(&self, entry: MemoryEntry) -> OdinResult<()> {
         let row = MemoryRow::from_entry(&entry);
+        let retention_limit = self.retention_limit;
         self.run_db(move |conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                OdinError::Database(format!("Failed to begin memory transaction: {e}"))
+            })?;
+            tx.execute(
                 "INSERT INTO memory_entries (id, content, category, created_at, updated_at, tags, importance)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
@@ -119,6 +164,21 @@ impl MemoryStore for SqliteMemoryStore {
                 ],
             )
             .map_err(|e| OdinError::Database(format!("Failed to store memory entry: {e}")))?;
+
+            tx.execute(
+                "DELETE FROM memory_entries
+                 WHERE id IN (
+                     SELECT id FROM memory_entries
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+                params![retention_limit as i64],
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to enforce memory retention: {e}")))?;
+
+            tx.commit().map_err(|e| {
+                OdinError::Database(format!("Failed to commit memory transaction: {e}"))
+            })?;
 
             Ok(())
         })
@@ -502,5 +562,49 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path_str);
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_only_the_newest_entries() {
+        let store = SqliteMemoryStore::in_memory()
+            .unwrap()
+            .with_retention_limit(2);
+        let mut oldest = make_entry("oldest", MemoryCategory::Fact);
+        oldest.updated_at = Utc::now() - chrono::TimeDelta::hours(2);
+        let mut middle = make_entry("middle", MemoryCategory::Fact);
+        middle.updated_at = Utc::now() - chrono::TimeDelta::hours(1);
+        let newest = make_entry("newest", MemoryCategory::Fact);
+
+        store.store(oldest).await.unwrap();
+        store.store(middle).await.unwrap();
+        store.store(newest).await.unwrap();
+
+        assert_eq!(store.count().await.unwrap(), 2);
+        let entries = store.search("", 10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "newest");
+        assert_eq!(entries[1].content, "middle");
+    }
+
+    #[test]
+    fn file_store_uses_wal_and_records_schema_version() {
+        let path = std::env::temp_dir().join(format!("odin-memory-{}.db", Uuid::new_v4()));
+        let store = SqliteMemoryStore::new(path.to_str().unwrap()).unwrap();
+        let connection = store.conn.lock().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(migration_count, 1);
+        drop(connection);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

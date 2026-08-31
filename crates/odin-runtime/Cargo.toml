@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 odin-core.workspace = true
 odin-loop.workspace = true
+odin-providers.workspace = true
+odin-permissions.workspace = true
+odin-tools.workspace = true
+odin-skills.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
@@ -17,6 +21,7 @@ serde_json.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+shellexpand = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

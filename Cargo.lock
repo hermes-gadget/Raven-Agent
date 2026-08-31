@@ -1764,6 +1764,7 @@ dependencies = [
 name = "odin-eval"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "odin-core",
  "odin-loop",
@@ -1899,6 +1900,7 @@ dependencies = [
  "dashmap",
  "futures",
  "odin-core",
+ "odin-permissions",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1920,8 +1922,13 @@ dependencies = [
  "futures",
  "odin-core",
  "odin-loop",
+ "odin-permissions",
+ "odin-providers",
+ "odin-skills",
+ "odin-tools",
  "serde",
  "serde_json",
+ "shellexpand",
  "tokio",
  "tracing",
  "uuid",
@@ -1996,6 +2003,7 @@ dependencies = [
  "odin-orchestrator",
  "odin-permissions",
  "odin-providers",
+ "odin-runtime",
  "odin-skills",
  "odin-tools",
  "ratatui",

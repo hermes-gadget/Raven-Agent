@@ -68,6 +68,9 @@ pub struct PolicyEngine {
     rules: HashMap<String, PermissionRule>,
     /// Dangerous command patterns (regex).
     dangerous_patterns: Vec<Regex>,
+    /// Configuration error retained so the compatibility constructor fails
+    /// closed at the first policy check instead of silently weakening safety.
+    configuration_error: Option<String>,
     /// Path boundaries for filesystem operations.
     path_boundary: Result<ResolvedPathBoundary, String>,
     /// Rate limit trackers: key = "agent_id:tool_name"
@@ -99,18 +102,22 @@ impl PolicyEngine {
             .map(|r| (r.tool_name.clone(), r))
             .collect();
 
+        let mut configuration_error = None;
         let dangerous_patterns: Vec<Regex> = dangerous_commands
             .iter()
-            .filter_map(|pattern| {
-                Regex::new(pattern)
-                    .map_err(|e| {
-                        warn!(
-                            pattern = %pattern,
-                            error = %e,
-                            "Invalid dangerous command regex pattern"
-                        );
-                    })
-                    .ok()
+            .filter_map(|pattern| match Regex::new(pattern) {
+                Ok(regex) => Some(regex),
+                Err(error) => {
+                    warn!(
+                        pattern = %pattern,
+                        error = %error,
+                        "Invalid dangerous command regex pattern; policy will fail closed"
+                    );
+                    configuration_error.get_or_insert_with(|| {
+                        format!("invalid dangerous command regex '{pattern}': {error}")
+                    });
+                    None
+                }
             })
             .collect();
 
@@ -120,6 +127,7 @@ impl PolicyEngine {
         Self {
             rules: rules_map,
             dangerous_patterns,
+            configuration_error,
             path_boundary,
             rate_trackers: Arc::new(RwLock::new(HashMap::new())),
             default_max_rate,
@@ -127,6 +135,16 @@ impl PolicyEngine {
             approval_gate: None,
             audit_logger: None,
         }
+    }
+
+    /// Return a configuration error, if construction found an invalid safety
+    /// rule. Keeping this check available makes direct embedders fail closed
+    /// even when they do not use the top-level configuration validator.
+    pub fn validate(&self) -> OdinResult<()> {
+        if let Some(error) = &self.configuration_error {
+            return Err(OdinError::Config(error.clone()));
+        }
+        Ok(())
     }
 
     /// Connect an interactive approval gate.
@@ -143,9 +161,11 @@ impl PolicyEngine {
 
     /// Check if a shell command matches any dangerous pattern.
     pub fn is_dangerous_command(&self, command: &str) -> bool {
-        self.dangerous_patterns
-            .iter()
-            .any(|re| re.is_match(command))
+        self.configuration_error.is_some()
+            || self
+                .dangerous_patterns
+                .iter()
+                .any(|re| re.is_match(command))
     }
 
     /// Whether tools marked as approval-required must be gated.
@@ -155,6 +175,7 @@ impl PolicyEngine {
 
     /// Validate that a path is within the allowed boundaries.
     pub fn check_path_boundary(&self, path: &std::path::Path, write: bool) -> OdinResult<()> {
+        self.validate()?;
         let boundary = self.path_boundary.as_ref().map_err(|error| {
             OdinError::Validation(format!(
                 "Invalid filesystem boundary configuration: {error}"
@@ -166,6 +187,83 @@ impl PolicyEngine {
             boundary.check_read(path)?;
         }
         Ok(())
+    }
+
+    /// Request approval while preserving the caller's session correlation ID.
+    /// The trait-compatible method below remains available for older callers
+    /// that do not have a session ID.
+    pub async fn request_approval_for_session(
+        &self,
+        agent_id: AgentId,
+        session_id: uuid::Uuid,
+        action: &str,
+        details: &str,
+    ) -> OdinResult<bool> {
+        self.validate()?;
+        let redactor = crate::redact::SecretRedactor::full();
+        let Some(gate) = self.approval_gate.as_ref() else {
+            if let Some(logger) = self.audit_logger.as_ref() {
+                logger
+                    .log(AuditEntry {
+                        id: uuid::Uuid::new_v4(),
+                        timestamp: Utc::now(),
+                        agent_id,
+                        session_id,
+                        event_type: AuditEventType::PermissionCheck,
+                        action: redactor.redact(action),
+                        details: serde_json::json!({
+                            "details": redactor.redact(details),
+                            "status": "denied_no_responder",
+                        }),
+                        result: AuditResult::Denied,
+                    })
+                    .await?;
+            }
+            warn!(
+                action = %redactor.redact(action),
+                details = %redactor.redact(details),
+                "Approval requested but no approval responder is connected; denying"
+            );
+            return Ok(false);
+        };
+
+        let (request, status) = gate
+            .request(agent_id, action.to_owned(), details.to_owned())
+            .await;
+        let approved = status == crate::approval::ApprovalStatus::Approved;
+
+        if let Some(logger) = self.audit_logger.as_ref() {
+            // Redact here as well as at the durable audit boundary so custom
+            // AuditLogger implementations never receive raw approval details.
+            let entry = AuditEntry {
+                id: uuid::Uuid::new_v4(),
+                timestamp: Utc::now(),
+                agent_id,
+                session_id,
+                event_type: AuditEventType::PermissionCheck,
+                action: redactor.redact(action),
+                details: serde_json::json!({
+                    "request_id": request.id,
+                    "details": redactor.redact(details),
+                    "argument_fingerprint": request.argument_fingerprint,
+                    "status": status,
+                }),
+                result: if approved {
+                    AuditResult::Success
+                } else {
+                    AuditResult::Denied
+                },
+            };
+            logger.log(entry).await?;
+        }
+
+        warn!(
+            action = %redactor.redact(action),
+            details = %redactor.redact(details),
+            ?status,
+            "Approval request completed"
+        );
+        Ok(approved)
     }
 }
 
@@ -253,6 +351,7 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> OdinResult<PermissionAction> {
+        self.validate()?;
         // Check for explicit rules
         if let Some(rule) = self.rules.get(tool_name) {
             let action = if rule.action == PermissionAction::Deny {
@@ -300,6 +399,7 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
         agent_id: AgentId,
         command: &str,
     ) -> OdinResult<PermissionAction> {
+        self.validate()?;
         if self.is_dangerous_command(command) {
             warn!(agent_id = %agent_id, "Dangerous command detected; approval required");
             return Ok(PermissionAction::AskUser);
@@ -315,6 +415,7 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
 
     /// Check rate limits for a specific agent and tool.
     async fn check_rate_limit(&self, agent_id: AgentId, tool_name: &str) -> OdinResult<bool> {
+        self.validate()?;
         let key = format!("{}:{}", agent_id, tool_name);
 
         // Determine max rate for this tool
@@ -367,55 +468,8 @@ impl odin_core::traits::PermissionEngine for PolicyEngine {
         action: &str,
         details: &str,
     ) -> OdinResult<bool> {
-        let redactor = crate::redact::SecretRedactor::full();
-        let Some(gate) = self.approval_gate.as_ref() else {
-            warn!(
-                action = %redactor.redact(action),
-                details = %redactor.redact(details),
-                "Approval requested but no approval responder is connected; denying"
-            );
-            return Ok(false);
-        };
-
-        let (request, status) = gate
-            .request(agent_id, action.to_owned(), details.to_owned())
-            .await;
-        let approved = status == crate::approval::ApprovalStatus::Approved;
-
-        if let Some(logger) = self.audit_logger.as_ref() {
-            // Redact here as well as at the durable audit boundary so custom
-            // AuditLogger implementations never receive raw approval details.
-            let entry = AuditEntry {
-                id: uuid::Uuid::new_v4(),
-                timestamp: Utc::now(),
-                agent_id,
-                session_id: uuid::Uuid::default(),
-                event_type: AuditEventType::PermissionCheck,
-                action: redactor.redact(action),
-                details: serde_json::json!({
-                    "request_id": request.id,
-                    "details": redactor.redact(details),
-                    "argument_fingerprint": request.argument_fingerprint,
-                    "status": status,
-                }),
-                result: if approved {
-                    AuditResult::Success
-                } else {
-                    AuditResult::Denied
-                },
-            };
-            if let Err(error) = logger.log(entry).await {
-                warn!(error = %error, "Failed to write approval audit record");
-            }
-        }
-
-        warn!(
-            action = %redactor.redact(action),
-            details = %redactor.redact(details),
-            ?status,
-            "Approval request completed"
-        );
-        Ok(approved)
+        self.request_approval_for_session(agent_id, uuid::Uuid::new_v4(), action, details)
+            .await
     }
 }
 
@@ -605,6 +659,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_dangerous_pattern_fails_closed() {
+        let engine = PolicyEngine::new(
+            vec![],
+            &["[unterminated".into()],
+            PathBoundary::default(),
+            60,
+            true,
+        );
+        assert!(engine.validate().is_err());
+        assert!(engine.is_dangerous_command("echo harmless"));
+        assert!(
+            engine
+                .check_command(test_agent(), "echo harmless")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .check_path_boundary(std::path::Path::new("."), false)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn test_command_permission() {
         let engine = PolicyEngine::default();
         let agent = test_agent();
@@ -625,6 +703,7 @@ mod tests {
     async fn approval_audit_record_is_redacted() {
         let gate = Arc::new(crate::approval::ApprovalGate::new(false, 30));
         let logger = Arc::new(CaptureAuditLogger::default());
+        let session_id = Uuid::new_v4();
         let engine = Arc::new(
             PolicyEngine::new(vec![], &[], PathBoundary::default(), 60, true)
                 .with_approval_gate(gate.clone())
@@ -637,7 +716,7 @@ mod tests {
             let engine = engine.clone();
             tokio::spawn(async move {
                 engine
-                    .request_approval(test_agent(), "shell", &details)
+                    .request_approval_for_session(test_agent(), session_id, "shell", &details)
                     .await
                     .unwrap()
             })
@@ -651,9 +730,29 @@ mod tests {
 
         let entries = logger.recent(1).await.unwrap();
         let serialized = serde_json::to_string(&entries[0]).unwrap();
+        assert_eq!(entries[0].session_id, session_id);
         assert!(!serialized.contains(secret));
         assert!(!serialized.contains("user@example.com"));
         assert!(serialized.contains("[REDACTED:"));
+    }
+
+    #[tokio::test]
+    async fn approval_without_responder_is_audited_as_denied() {
+        let logger = Arc::new(CaptureAuditLogger::default());
+        let session_id = Uuid::new_v4();
+        let engine = PolicyEngine::new(vec![], &[], PathBoundary::default(), 60, true)
+            .with_audit_logger(logger.clone());
+
+        assert!(
+            !engine
+                .request_approval_for_session(test_agent(), session_id, "shell", "{}")
+                .await
+                .unwrap()
+        );
+        let entries = logger.recent(1).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, session_id);
+        assert_eq!(entries[0].result, AuditResult::Denied);
     }
 
     #[tokio::test]

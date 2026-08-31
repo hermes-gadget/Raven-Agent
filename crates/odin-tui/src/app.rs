@@ -1048,7 +1048,7 @@ impl App {
             Ok(s) => s,
             Err(_) => return Ok(()),
         };
-        let _ = store.initialize().await;
+        store.initialize().await?;
 
         let mut agent_node_info: std::collections::HashMap<
             String,
@@ -1192,7 +1192,15 @@ impl App {
             std::collections::HashMap::new();
         let mut queued_locks_by_agent: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        if let Ok(Some(snapshot)) = store.load_lock_snapshot().await
+        let lock_snapshot_id = self
+            .active_run_id
+            .clone()
+            .or_else(|| self.orch.active_runs.first().map(|run| run.run_id.clone()));
+        let lock_snapshot = match lock_snapshot_id {
+            Some(run_id) => store.load_lock_snapshot(&run_id).await,
+            None => store.load_latest_lock_snapshot().await,
+        };
+        if let Ok(Some(snapshot)) = lock_snapshot
             && let Ok(snapshot) =
                 serde_json::from_str::<odin_orchestrator::file_lock::LockSnapshot>(&snapshot)
         {

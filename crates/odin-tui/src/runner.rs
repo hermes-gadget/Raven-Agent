@@ -26,6 +26,9 @@ use odin_orchestrator::lifecycle::AgentPhase;
 use odin_orchestrator::merge::{MergeStrategy, SubAgentResult};
 use odin_orchestrator::persistence::{OrchestrationStore, SqliteOrchestrationStore};
 use odin_orchestrator::task_graph::{TaskGraph, TaskGraphStatus, TaskNodeStatus};
+use odin_runtime::{
+    CompositionResources, EngineBuildOptions, ExecutionSurface, ProductionComposition,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -173,31 +176,18 @@ struct AgentExecution {
 
 #[derive(Clone)]
 struct ExecutionResources {
-    provider: Option<Arc<dyn Provider>>,
-    policy_engine: Option<Arc<odin_permissions::PolicyEngine>>,
+    composition: ProductionComposition,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     audit_logger: Option<Arc<dyn AuditLogger>>,
-    reliability_tracker: Option<Arc<odin_tools::ReliabilityTracker>>,
     memory: Option<Arc<odin_memory::SqliteMemoryStore>>,
     memory_max_entries: usize,
-    model_name: String,
     run_id: String,
 }
 
 impl ExecutionResources {
     async fn from_environment() -> Result<Self> {
         let config = load_config(None)?;
-
-        let provider_name = &config.models.default_provider;
-        let provider_cfg = config
-            .models
-            .providers
-            .get(provider_name)
-            .cloned()
-            .unwrap_or_else(default_provider_config);
-        let provider =
-            odin_providers::create_provider_chain(&provider_cfg, &config.models.providers)
-                .or_else(|_| odin_providers::create_provider(&provider_cfg))?;
+        let composition = ProductionComposition::from_config(&config)?;
 
         let policy_engine = Arc::new(odin_permissions::PolicyEngine::new(
             config.safety.permissions.clone(),
@@ -215,18 +205,12 @@ impl ExecutionResources {
         );
         load_mcp_tools(&tool_registry, &config).await;
 
-        let audit_logger: Arc<dyn AuditLogger> = Arc::new(build_audit_logger(&config));
+        let audit_logger: Arc<dyn AuditLogger> = Arc::new(build_audit_logger(&config)?);
         let reliability_path = configured_data_dir(&config).join("reliability.db");
         let reliability_tracker = Arc::new(odin_tools::ReliabilityTracker::persistent(
             &reliability_path,
             odin_tools::ReliabilityConfig::default(),
         )?);
-        let model_name = config
-            .models
-            .default_model
-            .clone()
-            .or_else(|| provider_cfg.default_model.clone())
-            .unwrap_or_default();
         let memory = if config.memory.enabled {
             let path = config.memory.db_path.as_ref().map_or_else(
                 || configured_data_dir(&config).join("memory.db"),
@@ -239,22 +223,27 @@ impl ExecutionResources {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            Some(Arc::new(odin_memory::SqliteMemoryStore::new(
-                &path.to_string_lossy(),
-            )?))
+            Some(Arc::new(
+                odin_memory::SqliteMemoryStore::new(&path.to_string_lossy())?
+                    .with_retention_limit(config.memory.max_entries),
+            ))
         } else {
             None
         };
 
-        Ok(Self {
-            provider: Some(provider),
+        let composition = composition.with_resources(CompositionResources {
             policy_engine: Some(policy_engine),
+            tool_registry: Some(tool_registry.clone()),
+            audit_logger: Some(audit_logger.clone()),
+            reliability_tracker: Some(reliability_tracker),
+        });
+
+        Ok(Self {
+            composition,
             tool_registry: Some(tool_registry),
             audit_logger: Some(audit_logger),
-            reliability_tracker: Some(reliability_tracker),
             memory,
             memory_max_entries: config.memory.max_entries.max(1),
-            model_name,
             run_id: String::new(),
         })
     }
@@ -296,7 +285,7 @@ pub async fn spawn_run(db_path: PathBuf, goal: String, max_iterations: u32) -> R
         exec_agents.iter().map(|agent| agent.agent_id),
     )
     .await?;
-    persist_locks(&store, &composer).await?;
+    persist_locks(&store, &composer, &run_id).await?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -845,7 +834,7 @@ async fn start_ready_agents(
                         }
                         persist_graph(store, composer, goal_key, Some(TaskGraphStatus::Running))
                             .await?;
-                        persist_locks(store, composer).await?;
+                        persist_locks(store, composer, &graph_root_id).await?;
                         let _ = event_tx.send(RunnerEvent::AgentStarted {
                             agent_id: agent.agent_id.to_string(),
                             label: agent.label.clone(),
@@ -875,7 +864,7 @@ async fn start_ready_agents(
                                 Some(TaskGraphStatus::Running),
                             )
                             .await?;
-                            persist_locks(store, composer).await?;
+                            persist_locks(store, composer, &graph_root_id).await?;
                         }
                         if phase != AgentPhase::WaitingForLock {
                             let _ = event_tx.send(RunnerEvent::AgentQueued {
@@ -976,41 +965,42 @@ fn spawn_agent_execution(
                 max_iterations,
                 created_at: chrono::Utc::now(),
             };
-            let mut engine = odin_loop::LoopEngine::new().with_max_iterations(max_iterations);
-            if let Some(provider) = resources.provider.clone() {
-                engine = engine.with_provider(Arc::new(ProgressProvider::new(
-                    provider,
-                    agent.agent_id,
-                    agent.label.clone(),
-                    event_tx.clone(),
-                )));
-            }
-            if !resources.model_name.is_empty() {
-                engine = engine.with_model_name(resources.model_name.clone());
-            }
-            if let Some(policy_engine) = resources.policy_engine.clone() {
-                engine = engine.with_policy_engine(policy_engine);
-            }
-            if let Some(registry) = resources.tool_registry.clone() {
-                let scoped = registry.scoped(&agent.allowed_tools).map_err(|error| {
-                    odin_core::error::OdinError::Validation(format!(
-                        "invalid tool scope for agent '{}': {error}",
-                        agent.label
-                    ))
-                })?;
-                engine = engine.with_tool_registry(Arc::new(scoped));
-            }
-            if let Some(audit_logger) = resources.audit_logger.clone() {
-                engine = engine.with_audit_logger(Arc::new(ProgressAuditLogger::new(
+            let scoped_registry = if let Some(registry) = resources.tool_registry.clone() {
+                Some(Arc::new(registry.scoped(&agent.allowed_tools).map_err(
+                    |error| {
+                        odin_core::error::OdinError::Validation(format!(
+                            "invalid tool scope for agent '{}': {error}",
+                            agent.label
+                        ))
+                    },
+                )?))
+            } else {
+                None
+            };
+            let audit_logger = resources.audit_logger.clone().map(|audit_logger| {
+                Arc::new(ProgressAuditLogger::new(
                     audit_logger,
                     agent.agent_id,
                     agent.label.clone(),
                     event_tx.clone(),
-                )));
-            }
-            if let Some(reliability_tracker) = resources.reliability_tracker.clone() {
-                engine = engine.with_reliability_tracker(reliability_tracker);
-            }
+                )) as Arc<dyn AuditLogger>
+            });
+            let provider: Arc<dyn Provider> = Arc::new(ProgressProvider::new(
+                resources.composition.provider(),
+                agent.agent_id,
+                agent.label.clone(),
+                event_tx.clone(),
+            ));
+            let engine = resources.composition.build_engine(
+                ExecutionSurface::Tui,
+                EngineBuildOptions {
+                    max_iterations: Some(max_iterations),
+                    principal_id: Some(agent.agent_id),
+                    provider: Some(provider),
+                    tool_registry: scoped_registry,
+                    audit_logger,
+                },
+            );
             let result = engine.execute_task(&task).await;
             if let (Some(memory), Ok(task_result)) = (resources.memory.as_ref(), result.as_ref()) {
                 let redacted =
@@ -1343,7 +1333,7 @@ async fn finish_agent_execution(
             .await?;
     }
     persist_graph(store, composer, goal_key, None).await?;
-    persist_locks(store, composer).await?;
+    persist_locks(store, composer, &graph_root_id).await?;
     Ok(())
 }
 
@@ -1356,7 +1346,11 @@ async fn persist_all(
 ) -> Result<()> {
     persist_graph(store, composer, goal_key, status_override).await?;
     persist_agent_lifecycles(store, composer, goal_key, agent_ids).await?;
-    persist_locks(store, composer).await?;
+    let graph_root_id = composer
+        .get_graph(goal_key)
+        .map(|graph| graph.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("orchestration graph '{goal_key}' not found"))?;
+    persist_locks(store, composer, &graph_root_id).await?;
     Ok(())
 }
 
@@ -1401,26 +1395,14 @@ async fn persist_agent_lifecycles(
     Ok(())
 }
 
-async fn persist_locks(store: &SqliteOrchestrationStore, composer: &Composer) -> Result<()> {
+async fn persist_locks(
+    store: &SqliteOrchestrationStore,
+    composer: &Composer,
+    graph_root_id: &str,
+) -> Result<()> {
     let snapshot = serde_json::to_string(&composer.file_locks().snapshot())?;
-    store.save_lock_snapshot(&snapshot).await?;
+    store.save_lock_snapshot(graph_root_id, &snapshot).await?;
     Ok(())
-}
-
-fn default_provider_config() -> odin_core::config::ProviderConfig {
-    odin_core::config::ProviderConfig {
-        provider_type: "openai_compat".into(),
-        base_url: Some("http://localhost:11434/v1".into()),
-        api_key: None,
-        api_key_env: None,
-        default_model: None,
-        headers: Default::default(),
-        timeout_secs: 120,
-        max_retries: 3,
-        fallback_chain: None,
-        health_check_interval_secs: 0,
-        circuit_breaker_threshold: 0,
-    }
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<OdinConfig> {
@@ -1487,19 +1469,19 @@ fn configured_audit_path(config: &OdinConfig) -> PathBuf {
     )
 }
 
-fn build_audit_logger(config: &OdinConfig) -> odin_audit::AuditLoggerImpl {
-    odin_audit::AuditLoggerImpl::new(odin_audit::AuditLoggerConfig {
+fn build_audit_logger(config: &OdinConfig) -> Result<odin_audit::AuditLoggerImpl> {
+    odin_audit::AuditLoggerImpl::try_new(odin_audit::AuditLoggerConfig {
         enabled: config.audit.enabled,
         file_path: config
             .audit
             .enabled
             .then_some(configured_audit_path(config)),
-        db_path: None,
-        json_format: config.audit.json_format,
-        buffer_size: 100,
+        json_format: true,
+        buffer_size: 1,
         history_size: 1_000,
         mask_secrets: true,
     })
+    .map_err(|error| anyhow::anyhow!("failed to open audit sink: {error}"))
 }
 
 async fn load_mcp_tools(registry: &odin_tools::ToolRegistry, config: &OdinConfig) {
@@ -1522,11 +1504,21 @@ async fn load_mcp_tools(registry: &odin_tools::ToolRegistry, config: &OdinConfig
             continue;
         }
 
-        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = Arc::new(Mutex::new(
+        let transport = Arc::new(Mutex::new(
             StdioTransport::new(&server_cfg.command, server_cfg.args.clone())
                 .with_env(server_cfg.env.clone()),
         ));
 
+        if let Err(error) = transport.lock().await.connect().await {
+            tracing::warn!(
+                "[TUI/MCP] Failed to spawn server '{}': {}",
+                server_cfg.name,
+                error
+            );
+            continue;
+        }
+
+        let transport: Arc<Mutex<dyn odin_mcp::transport::McpTransport>> = transport;
         let mut client = McpClient::new(transport);
         let shared_client = match client.connect().await {
             Ok(()) => Arc::new(Mutex::new(client)),

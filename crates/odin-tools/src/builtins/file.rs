@@ -77,8 +77,8 @@ impl Tool for FileRead {
         Self::make_schema(&self.name)
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["filesystem", "read", "safe"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["filesystem".into(), "read".into(), "safe".into()]
     }
 
     #[instrument(skip(self, _context), fields(tool = self.name))]
@@ -195,8 +195,8 @@ impl Tool for FileWrite {
         true
     }
 
-    fn capability_tags(&self) -> &[&str] {
-        &["filesystem", "write", "dangerous"]
+    fn capability_tags(&self) -> Vec<String> {
+        vec!["filesystem".into(), "write".into(), "dangerous".into()]
     }
 
     #[instrument(skip(self, _context), fields(tool = self.name))]
@@ -265,6 +265,7 @@ mod tests {
             session_id: Default::default(),
             working_dir: PathBuf::from("/tmp"),
             env: std::collections::HashMap::new(),
+            resource_budgets: Default::default(),
         }
     }
 

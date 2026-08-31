@@ -5,9 +5,14 @@
 //! parallel task execution.
 
 pub mod agent;
+pub mod composition;
 pub mod runtime;
 pub mod session;
 
 pub use agent::Agent;
+pub use composition::{
+    CompositionResources, EngineBuildOptions, ExecutionSurface, ProductionComposition,
+    ResolvedComposition,
+};
 pub use runtime::Runtime;
 pub use session::Session;

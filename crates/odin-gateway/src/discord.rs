@@ -750,8 +750,13 @@ impl DiscordEventHandler {
         match odin_orchestrator::persistence::SqliteOrchestrationStore::new(&db_path).await {
             Ok(store) => {
                 use odin_orchestrator::persistence::OrchestrationStore;
-                let _ = store.initialize().await;
-                Some(store)
+                match store.initialize().await {
+                    Ok(()) => Some(store),
+                    Err(e) => {
+                        tracing::warn!("[DISCORD] Failed to initialize orchestration store: {e}");
+                        None
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("[DISCORD] Failed to open orchestration store: {e}");
@@ -1023,7 +1028,7 @@ impl DiscordEventHandler {
 
         use odin_orchestrator::persistence::OrchestrationStore;
         let content = match self.get_orchestration_store().await {
-            Some(store) => match store.load_lock_snapshot().await {
+            Some(store) => match store.load_latest_lock_snapshot().await {
                 Ok(Some(snapshot)) => {
                     let redacted = odin_permissions::SecretRedactor::full().redact(&snapshot);
                     let preview: String = redacted.chars().take(1500).collect();

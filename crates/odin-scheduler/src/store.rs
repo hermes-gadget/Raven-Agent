@@ -1,8 +1,7 @@
 //! Scheduler persistence — `SchedulerStore` trait and SQLite implementation.
 //!
 //! Provides the abstraction for persisting scheduled jobs to durable storage,
-//! and a concrete [`SqliteSchedulerStore`] backed by the same SQLite database
-//! used by `odin-memory`.
+//! and a concrete [`SqliteSchedulerStore`] backed by a durable SQLite database.
 
 use crate::job::{Job, JobId, Schedule};
 use async_trait::async_trait;
@@ -10,9 +9,11 @@ use chrono::{DateTime, Utc};
 use odin_core::error::OdinError;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
+
+const MAX_SCHEDULER_RUNS: usize = 10_000;
 
 /// Durable outcome of one scheduled execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,12 +241,11 @@ pub trait SchedulerStore: Send + Sync {
 
 // ── SqliteSchedulerStore ──────────────────────────────────────────────
 
-/// A [`SchedulerStore`] backed by SQLite, sharing the same connection pattern
-/// as `odin_memory::SqliteMemoryStore`.
+/// A [`SchedulerStore`] backed by SQLite.
 ///
 /// The `scheduler_jobs` table is created automatically in the constructor.
-/// Pass the same `Arc<Mutex<Connection>>` from a `SqliteMemoryStore` to
-/// share the same database file.
+/// Synchronous SQLite work is moved to Tokio's blocking pool so scheduler
+/// ticks do not block an async executor worker.
 #[derive(Debug, Clone)]
 pub struct SqliteSchedulerStore {
     conn: Arc<Mutex<Connection>>,
@@ -257,10 +257,19 @@ impl SqliteSchedulerStore {
         let conn = Connection::open(path).map_err(|e| {
             OdinError::Database(format!("Failed to open scheduler database at {path}: {e}"))
         })?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
+            OdinError::Database(format!("Failed to configure database timeout: {e}"))
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
         store.init_tables()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(OdinError::Io)?;
+        }
         tracing::info!(path = %path, "Opened SQLite scheduler store");
         Ok(store)
     }
@@ -270,6 +279,9 @@ impl SqliteSchedulerStore {
         let conn = Connection::open_in_memory().map_err(|e| {
             OdinError::Database(format!("Failed to open in-memory scheduler database: {e}"))
         })?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
+            OdinError::Database(format!("Failed to configure database timeout: {e}"))
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -277,23 +289,25 @@ impl SqliteSchedulerStore {
         Ok(store)
     }
 
-    /// Share an existing connection (e.g. from `SqliteMemoryStore`).
-    ///
-    /// Call `init_tables` separately if the connection wasn't already
-    /// initialised.
-    pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
-    }
-
     /// Create the `scheduler_jobs` table if it doesn't exist.
     pub fn init_tables(&self) -> odin_core::error::OdinResult<()> {
         let conn = self
             .conn
             .try_lock()
-            .expect("store just created, no contention");
+            .map_err(|_| OdinError::Database("Scheduler store lock is poisoned or busy".into()))?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS scheduler_jobs (
+            "PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA foreign_keys=ON;
+            PRAGMA busy_timeout=5000;
+
+            CREATE TABLE IF NOT EXISTS scheduler_schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scheduler_jobs (
                 id          TEXT PRIMARY KEY,
                 name        TEXT    NOT NULL,
                 cron_expr   TEXT    NOT NULL,
@@ -338,6 +352,23 @@ impl SqliteSchedulerStore {
             })?;
         }
 
+        conn.execute(
+            "INSERT OR IGNORE INTO scheduler_schema_migrations (version, applied_at)
+             VALUES (?1, datetime('now'))",
+            params![1_i64],
+        )
+        .map_err(|e| {
+            OdinError::Database(format!("Failed to record scheduler schema migration: {e}"))
+        })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO scheduler_schema_migrations (version, applied_at)
+             VALUES (?1, datetime('now'))",
+            params![2_i64],
+        )
+        .map_err(|e| {
+            OdinError::Database(format!("Failed to record scheduler schema migration: {e}"))
+        })?;
+
         Ok(())
     }
 }
@@ -345,135 +376,142 @@ impl SqliteSchedulerStore {
 #[async_trait]
 impl SchedulerStore for SqliteSchedulerStore {
     async fn save_job(&self, job: &PersistedJob) -> odin_core::error::OdinResult<()> {
-        let conn = self.conn.lock().await;
-
-        conn.execute(
-            "INSERT INTO scheduler_jobs
-                (id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
-                 last_run, next_run, run_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(id) DO UPDATE SET
-                name           = excluded.name,
-                cron_expr      = excluded.cron_expr,
-                task_goal      = excluded.task_goal,
-                agent_selector = excluded.agent_selector,
-                max_iterations = excluded.max_iterations,
-                enabled        = excluded.enabled,
-                last_run       = excluded.last_run,
-                next_run       = excluded.next_run,
-                run_count      = excluded.run_count",
-            params![
-                job.id.to_string(),
-                job.name,
-                job.cron_expr,
-                job.task_goal,
-                job.agent_selector,
-                job.max_iterations,
-                job.enabled as i32,
-                job.last_run.map(|t| t.to_rfc3339()),
-                job.next_run.map(|t| t.to_rfc3339()),
-                job.run_count as i64,
-                job.created_at.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| OdinError::Database(format!("Failed to save scheduler job: {e}")))?;
-
-        Ok(())
+        let job = job.clone();
+        self.run_db(move |conn| {
+            conn.execute(
+                "INSERT INTO scheduler_jobs
+                    (id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
+                     last_run, next_run, run_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name           = excluded.name,
+                    cron_expr      = excluded.cron_expr,
+                    task_goal      = excluded.task_goal,
+                    agent_selector = excluded.agent_selector,
+                    max_iterations = excluded.max_iterations,
+                    enabled        = excluded.enabled,
+                    last_run       = excluded.last_run,
+                    next_run       = excluded.next_run,
+                    run_count      = excluded.run_count",
+                params![
+                    job.id.to_string(),
+                    job.name,
+                    job.cron_expr,
+                    job.task_goal,
+                    job.agent_selector,
+                    job.max_iterations,
+                    job.enabled as i32,
+                    job.last_run.map(|t| t.to_rfc3339()),
+                    job.next_run.map(|t| t.to_rfc3339()),
+                    job.run_count as i64,
+                    job.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to save scheduler job: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn load_all_jobs(&self) -> odin_core::error::OdinResult<Vec<PersistedJob>> {
-        let conn = self.conn.lock().await;
+        self.run_db(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
+                            last_run, next_run, run_count, created_at
+                     FROM scheduler_jobs
+                     ORDER BY created_at ASC",
+                )
+                .map_err(|e| {
+                    OdinError::Database(format!("Failed to prepare load statement: {e}"))
+                })?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, cron_expr, task_goal, agent_selector, max_iterations, enabled,
-                        last_run, next_run, run_count, created_at
-                 FROM scheduler_jobs
-                 ORDER BY created_at ASC",
-            )
-            .map_err(|e| OdinError::Database(format!("Failed to prepare load statement: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0)?;
+                    let last_run_str: Option<String> = row.get(7)?;
+                    let next_run_str: Option<String> = row.get(8)?;
+                    let created_at_str: String = row.get(10)?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let id_str: String = row.get(0)?;
-                let last_run_str: Option<String> = row.get(7)?;
-                let next_run_str: Option<String> = row.get(8)?;
-                let created_at_str: String = row.get(10)?;
-
-                Ok(PersistedJobRaw {
-                    id: id_str,
-                    name: row.get(1)?,
-                    cron_expr: row.get(2)?,
-                    task_goal: row.get(3)?,
-                    agent_selector: row.get(4)?,
-                    max_iterations: row.get::<_, i64>(5)? as u32,
-                    enabled: row.get::<_, i64>(6)? != 0,
-                    last_run: last_run_str,
-                    next_run: next_run_str,
-                    run_count: row.get::<_, i64>(9)? as u64,
-                    created_at: created_at_str,
+                    Ok(PersistedJobRaw {
+                        id: id_str,
+                        name: row.get(1)?,
+                        cron_expr: row.get(2)?,
+                        task_goal: row.get(3)?,
+                        agent_selector: row.get(4)?,
+                        max_iterations: row.get::<_, i64>(5)? as u32,
+                        enabled: row.get::<_, i64>(6)? != 0,
+                        last_run: last_run_str,
+                        next_run: next_run_str,
+                        run_count: row.get::<_, i64>(9)? as u64,
+                        created_at: created_at_str,
+                    })
                 })
-            })
-            .map_err(|e| OdinError::Database(format!("Failed to query scheduler jobs: {e}")))?;
+                .map_err(|e| OdinError::Database(format!("Failed to query scheduler jobs: {e}")))?;
 
-        let mut jobs = Vec::new();
-        for row in rows {
-            let raw = row.map_err(|e| {
-                OdinError::Database(format!("Error reading scheduler job row: {e}"))
-            })?;
+            let mut jobs = Vec::new();
+            for row in rows {
+                let raw = row.map_err(|e| {
+                    OdinError::Database(format!("Error reading scheduler job row: {e}"))
+                })?;
 
-            let last_run = raw
-                .last_run
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+                let last_run = raw
+                    .last_run
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
 
-            let next_run = raw
-                .next_run
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+                let next_run = raw
+                    .next_run
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
 
-            let created_at = DateTime::parse_from_rfc3339(&raw.created_at)
-                .map_err(|e| OdinError::Database(format!("Invalid created_at: {e}")))?
-                .with_timezone(&Utc);
+                let created_at = DateTime::parse_from_rfc3339(&raw.created_at)
+                    .map_err(|e| OdinError::Database(format!("Invalid created_at: {e}")))?
+                    .with_timezone(&Utc);
 
-            let id = Uuid::parse_str(&raw.id)
-                .map_err(|e| OdinError::Database(format!("Invalid job id '{}': {e}", raw.id)))?;
+                let id = Uuid::parse_str(&raw.id).map_err(|e| {
+                    OdinError::Database(format!("Invalid job id '{}': {e}", raw.id))
+                })?;
 
-            jobs.push(PersistedJob {
-                id,
-                name: raw.name,
-                cron_expr: raw.cron_expr,
-                task_goal: raw.task_goal,
-                agent_selector: raw.agent_selector,
-                max_iterations: raw.max_iterations,
-                enabled: raw.enabled,
-                last_run,
-                next_run,
-                run_count: raw.run_count,
-                created_at,
-            });
-        }
+                jobs.push(PersistedJob {
+                    id,
+                    name: raw.name,
+                    cron_expr: raw.cron_expr,
+                    task_goal: raw.task_goal,
+                    agent_selector: raw.agent_selector,
+                    max_iterations: raw.max_iterations,
+                    enabled: raw.enabled,
+                    last_run,
+                    next_run,
+                    run_count: raw.run_count,
+                    created_at,
+                });
+            }
 
-        Ok(jobs)
+            Ok(jobs)
+        })
+        .await
     }
 
     async fn delete_job(&self, id: &JobId) -> odin_core::error::OdinResult<()> {
-        let conn = self.conn.lock().await;
+        let id_string = id.to_string();
+        self.run_db(move |conn| {
+            let affected = conn
+                .execute(
+                    "DELETE FROM scheduler_jobs WHERE id = ?1",
+                    params![id_string],
+                )
+                .map_err(|e| OdinError::Database(format!("Failed to delete scheduler job: {e}")))?;
 
-        let affected = conn
-            .execute(
-                "DELETE FROM scheduler_jobs WHERE id = ?1",
-                params![id.to_string()],
-            )
-            .map_err(|e| OdinError::Database(format!("Failed to delete scheduler job: {e}")))?;
+            if affected == 0 {
+                tracing::warn!(job_id = %id_string, "Attempted to delete non-existent scheduler job");
+            }
 
-        if affected == 0 {
-            tracing::warn!(job_id = %id, "Attempted to delete non-existent scheduler job");
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn update_job_state(
@@ -484,46 +522,73 @@ impl SchedulerStore for SqliteSchedulerStore {
         next_run: Option<DateTime<Utc>>,
         run_count: u64,
     ) -> odin_core::error::OdinResult<()> {
-        let conn = self.conn.lock().await;
+        let id_string = id.to_string();
+        let last_run = last_run.map(|time| time.to_rfc3339());
+        let next_run = next_run.map(|time| time.to_rfc3339());
+        self.run_db(move |conn| {
+            conn.execute(
+                "UPDATE scheduler_jobs SET
+                    enabled   = ?1,
+                    last_run  = ?2,
+                    next_run  = ?3,
+                    run_count = ?4
+                 WHERE id = ?5",
+                params![
+                    enabled as i32,
+                    last_run,
+                    next_run,
+                    run_count as i64,
+                    id_string,
+                ],
+            )
+            .map_err(|e| {
+                OdinError::Database(format!("Failed to update scheduler job state: {e}"))
+            })?;
 
-        conn.execute(
-            "UPDATE scheduler_jobs SET
-                enabled   = ?1,
-                last_run  = ?2,
-                next_run  = ?3,
-                run_count = ?4
-             WHERE id = ?5",
-            params![
-                enabled as i32,
-                last_run.map(|t| t.to_rfc3339()),
-                next_run.map(|t| t.to_rfc3339()),
-                run_count as i64,
-                id.to_string(),
-            ],
-        )
-        .map_err(|e| OdinError::Database(format!("Failed to update scheduler job state: {e}")))?;
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn record_run_started(&self, run: &JobRun) -> odin_core::error::OdinResult<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT OR REPLACE INTO scheduler_runs
-                (task_id, job_id, job_name, started_at, finished_at, status, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                run.task_id.to_string(),
-                run.job_id.to_string(),
-                run.job_name,
-                run.started_at.to_rfc3339(),
-                run.finished_at.map(|value| value.to_rfc3339()),
-                run.status.as_str(),
-                run.error,
-            ],
-        )
-        .map_err(|e| OdinError::Database(format!("Failed to record scheduler run: {e}")))?;
-        Ok(())
+        let run = run.clone();
+        self.run_db(move |conn| {
+            let tx = conn.transaction().map_err(|e| {
+                OdinError::Database(format!("Failed to begin scheduler run transaction: {e}"))
+            })?;
+            tx.execute(
+                "INSERT OR REPLACE INTO scheduler_runs
+                    (task_id, job_id, job_name, started_at, finished_at, status, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    run.task_id.to_string(),
+                    run.job_id.to_string(),
+                    run.job_name,
+                    run.started_at.to_rfc3339(),
+                    run.finished_at.map(|value| value.to_rfc3339()),
+                    run.status.as_str(),
+                    run.error,
+                ],
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to record scheduler run: {e}")))?;
+            tx.execute(
+                "DELETE FROM scheduler_runs
+                 WHERE task_id IN (
+                     SELECT task_id FROM scheduler_runs
+                     ORDER BY started_at DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+                params![MAX_SCHEDULER_RUNS as i64],
+            )
+            .map_err(|e| {
+                OdinError::Database(format!("Failed to enforce scheduler retention: {e}"))
+            })?;
+            tx.commit().map_err(|e| {
+                OdinError::Database(format!("Failed to commit scheduler run transaction: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
     }
 
     async fn record_run_finished(
@@ -532,71 +597,77 @@ impl SchedulerStore for SqliteSchedulerStore {
         status: JobRunStatus,
         error: Option<&str>,
     ) -> odin_core::error::OdinResult<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE scheduler_runs
-             SET finished_at = ?1, status = ?2, error = ?3
-             WHERE task_id = ?4",
-            params![
-                Utc::now().to_rfc3339(),
-                status.as_str(),
-                error,
-                task_id.to_string(),
-            ],
-        )
-        .map_err(|e| OdinError::Database(format!("Failed to finish scheduler run: {e}")))?;
-        Ok(())
+        let task_id = task_id.to_string();
+        let error = error.map(str::to_owned);
+        self.run_db(move |conn| {
+            conn.execute(
+                "UPDATE scheduler_runs
+                 SET finished_at = ?1, status = ?2, error = ?3
+                 WHERE task_id = ?4",
+                params![Utc::now().to_rfc3339(), status.as_str(), error, task_id,],
+            )
+            .map_err(|e| OdinError::Database(format!("Failed to finish scheduler run: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn recent_runs(&self, limit: usize) -> odin_core::error::OdinResult<Vec<JobRun>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT task_id, job_id, job_name, started_at, finished_at, status, error
-                 FROM scheduler_runs
-                 ORDER BY started_at DESC
-                 LIMIT ?1",
-            )
-            .map_err(|e| OdinError::Database(format!("Failed to prepare run query: {e}")))?;
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .map_err(|e| OdinError::Database(format!("Failed to query scheduler runs: {e}")))?;
+        let limit = limit.min(1_000);
+        self.run_db(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT task_id, job_id, job_name, started_at, finished_at, status, error
+                     FROM scheduler_runs
+                     ORDER BY started_at DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| OdinError::Database(format!("Failed to prepare run query: {e}")))?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(|e| OdinError::Database(format!("Failed to query scheduler runs: {e}")))?;
 
-        let mut runs = Vec::new();
-        for row in rows {
-            let (task_id, job_id, job_name, started_at, finished_at, status, error) =
-                row.map_err(|e| OdinError::Database(format!("Failed to read scheduler run: {e}")))?;
-            runs.push(JobRun {
-                task_id: Uuid::parse_str(&task_id)
-                    .map_err(|e| OdinError::Database(format!("Invalid task id: {e}")))?,
-                job_id: Uuid::parse_str(&job_id)
-                    .map_err(|e| OdinError::Database(format!("Invalid job id: {e}")))?,
-                job_name,
-                started_at: DateTime::parse_from_rfc3339(&started_at)
-                    .map_err(|e| OdinError::Database(format!("Invalid started_at: {e}")))?
-                    .with_timezone(&Utc),
-                finished_at: finished_at
-                    .map(|value| {
-                        DateTime::parse_from_rfc3339(&value)
-                            .map(|date| date.with_timezone(&Utc))
-                            .map_err(|e| OdinError::Database(format!("Invalid finished_at: {e}")))
-                    })
-                    .transpose()?,
-                status: JobRunStatus::parse(&status)?,
-                error,
-            });
-        }
-        Ok(runs)
+            let mut runs = Vec::new();
+            for row in rows {
+                let (task_id, job_id, job_name, started_at, finished_at, status, error) = row
+                    .map_err(|e| {
+                        OdinError::Database(format!("Failed to read scheduler run: {e}"))
+                    })?;
+                runs.push(JobRun {
+                    task_id: Uuid::parse_str(&task_id)
+                        .map_err(|e| OdinError::Database(format!("Invalid task id: {e}")))?,
+                    job_id: Uuid::parse_str(&job_id)
+                        .map_err(|e| OdinError::Database(format!("Invalid job id: {e}")))?,
+                    job_name,
+                    started_at: DateTime::parse_from_rfc3339(&started_at)
+                        .map_err(|e| OdinError::Database(format!("Invalid started_at: {e}")))?
+                        .with_timezone(&Utc),
+                    finished_at: finished_at
+                        .map(|value| {
+                            DateTime::parse_from_rfc3339(&value)
+                                .map(|date| date.with_timezone(&Utc))
+                                .map_err(|e| {
+                                    OdinError::Database(format!("Invalid finished_at: {e}"))
+                                })
+                        })
+                        .transpose()?,
+                    status: JobRunStatus::parse(&status)?,
+                    error,
+                });
+            }
+            Ok(runs)
+        })
+        .await
     }
 }
 
@@ -615,6 +686,24 @@ struct PersistedJobRaw {
     next_run: Option<String>,
     run_count: u64,
     created_at: String,
+}
+
+impl SqliteSchedulerStore {
+    async fn run_db<T, F>(&self, operation: F) -> odin_core::error::OdinResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> odin_core::error::OdinResult<T> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().map_err(|error| {
+                OdinError::Database(format!("Scheduler store lock poisoned: {error}"))
+            })?;
+            operation(&mut conn)
+        })
+        .await
+        .map_err(|error| OdinError::Database(format!("SQLite worker failed: {error}")))?
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -797,5 +886,63 @@ mod tests {
         let store = SqliteSchedulerStore::in_memory().unwrap();
         let loaded = store.load_all_jobs().await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_store_uses_wal_and_records_schema_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scheduler.db");
+        let store = SqliteSchedulerStore::new(path.to_str().unwrap()).unwrap();
+        let connection = store.conn.lock().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduler_schema_migrations WHERE version IN (1, 2)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(migration_count, 2);
+    }
+
+    #[tokio::test]
+    async fn run_retention_is_enforced_inside_the_start_transaction() {
+        let store = SqliteSchedulerStore::in_memory().unwrap();
+        {
+            let connection = store.conn.lock().unwrap();
+            for _ in 0..=MAX_SCHEDULER_RUNS {
+                connection
+                    .execute(
+                        "INSERT INTO scheduler_runs
+                         (task_id, job_id, job_name, started_at, status)
+                         VALUES (?1, ?2, 'retention', ?3, 'succeeded')",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            Uuid::new_v4().to_string(),
+                            Utc::now().to_rfc3339(),
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let run = JobRun {
+            task_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            job_name: "newest".into(),
+            started_at: Utc::now(),
+            finished_at: None,
+            status: JobRunStatus::Running,
+            error: None,
+        };
+        store.record_run_started(&run).await.unwrap();
+        let connection = store.conn.lock().unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scheduler_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, MAX_SCHEDULER_RUNS as i64);
     }
 }
