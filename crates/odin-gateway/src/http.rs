@@ -2236,6 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn anonymous_client_cannot_obtain_or_use_operator_capabilities() {
         const OPERATOR_TOKEN: &str = "test-operator-token";
+        const ORDINARY_TOKEN: &str = "test-public-token";
 
         let gate = Arc::new(odin_permissions::ApprovalGate::new(false, 30));
         let handler_gate = gate.clone();
@@ -2263,6 +2264,7 @@ mod tests {
         let state = Arc::new(GatewayState {
             task_handler: Some(handler),
             approval_gate: Some(gate.clone()),
+            public_auth_token: Some(Arc::<str>::from(ORDINARY_TOKEN)),
             ..Default::default()
         });
         state.mark_ready();
@@ -2278,6 +2280,7 @@ mod tests {
                     .method("POST")
                     .uri("/chat")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
                     .body(Body::from(r#"{"task":"run a dangerous command"}"#))
                     .unwrap(),
             )
@@ -2308,6 +2311,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2322,6 +2326,7 @@ mod tests {
                     .method("POST")
                     .uri("/orchestrate")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
                     .body(Body::from(r#"{"goal":"take control"}"#))
                     .unwrap(),
             )
@@ -2367,6 +2372,34 @@ mod tests {
             .unwrap();
         assert_eq!(anonymous_orchestration.status(), StatusCode::UNAUTHORIZED);
 
+        let ordinary_list = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_list.status(), StatusCode::UNAUTHORIZED);
+
+        let ordinary_orchestration = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/orchestrate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
+                    .body(Body::from(r#"{"goal":"take control"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_orchestration.status(), StatusCode::UNAUTHORIZED);
+
         let anonymous_decision = management
             .clone()
             .oneshot(
@@ -2383,6 +2416,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anonymous_decision.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            gate.get_request(&request.id).await.unwrap().status,
+            odin_permissions::ApprovalStatus::Pending
+        );
+
+        let ordinary_decision = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/approvals/{}", request.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {ORDINARY_TOKEN}"))
+                    .body(Body::from(r#"{"approved":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_decision.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             gate.get_request(&request.id).await.unwrap().status,
             odin_permissions::ApprovalStatus::Pending

@@ -50,7 +50,17 @@ async fn read_bounded_body(
         }
     }
 
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        truncated = true;
+    }
+
+    Ok((text, truncated))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1106,6 +1116,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_bounded_body_keeps_multibyte_output_within_byte_budget() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("xé"))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        let (body, truncated) = read_bounded_body(response, 2).await.unwrap();
+
+        assert_eq!(body, "x");
+        assert!(truncated);
+        assert!(body.len() <= 2);
+    }
+
+    #[tokio::test]
     async fn test_web_fetch_invalid_url() {
         let fetch = WebFetch::new();
         let args = serde_json::json!({
@@ -1152,6 +1180,38 @@ mod tests {
             .execute(args, &test_context())
             .await
             .expect_err("private search destinations must be blocked");
+        assert!(matches!(error, OdinError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn redirects_to_private_destinations_are_blocked() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data"),
+            )
+            .mount(&server)
+            .await;
+
+        let policy = EgressPolicy::with_allowlist(
+            std::iter::empty::<String>(),
+            ["127.0.0.1/32".to_string()],
+        )
+        .unwrap();
+        let error = send_with_egress_policy(
+            reqwest::Method::GET,
+            parse_http_url(&server.uri()).unwrap(),
+            &reqwest::header::HeaderMap::new(),
+            None,
+            &policy,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+
         assert!(matches!(error, OdinError::PermissionDenied(_)));
     }
 
