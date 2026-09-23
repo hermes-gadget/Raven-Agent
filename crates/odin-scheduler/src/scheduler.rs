@@ -559,8 +559,8 @@ impl Scheduler {
                         }
                     }
 
-                    if let Some(logger) = &audit_logger {
-                        if let Err(error) = logger
+                    if let Some(logger) = &audit_logger
+                        && let Err(error) = logger
                             .log(AuditEntry {
                                 id: Uuid::new_v4(),
                                 timestamp: Utc::now(),
@@ -578,9 +578,8 @@ impl Scheduler {
                                 result: AuditResult::Pending,
                             })
                             .await
-                        {
-                            error!(job_id = %job_id, "Failed to write scheduler start audit record: {error}");
-                        }
+                    {
+                        error!(job_id = %job_id, "Failed to write scheduler start audit record: {error}");
                     }
 
                     let execution_agent_id = runtime_dispatch
@@ -723,8 +722,8 @@ impl Scheduler {
         {
             warn!(task_id = %execution.task_id, "Failed to persist cancelled scheduler run: {persist_error}");
         }
-        if let Some(logger) = &self.audit_logger {
-            if let Err(error) = logger
+        if let Some(logger) = &self.audit_logger
+            && let Err(error) = logger
                 .log(AuditEntry {
                     id: Uuid::new_v4(),
                     timestamp: Utc::now(),
@@ -741,9 +740,8 @@ impl Scheduler {
                     result: AuditResult::Failure,
                 })
                 .await
-            {
-                error!(job_id = %execution.job_id, "Failed to write scheduler cancellation audit record: {error}");
-            }
+        {
+            error!(job_id = %execution.job_id, "Failed to write scheduler cancellation audit record: {error}");
         }
     }
 
@@ -798,8 +796,8 @@ impl ExecutionCompletion {
         {
             warn!(task_id = %self.task_id, "Failed to persist scheduler outcome: {persist_error}");
         }
-        if let Some(logger) = self.audit_logger {
-            if let Err(error) = logger
+        if let Some(logger) = self.audit_logger
+            && let Err(error) = logger
                 .log(AuditEntry {
                     id: Uuid::new_v4(),
                     timestamp: Utc::now(),
@@ -820,9 +818,8 @@ impl ExecutionCompletion {
                     },
                 })
                 .await
-            {
-                error!(job_id = %self.job_id, "Failed to write scheduler completion audit record: {error}");
-            }
+        {
+            error!(job_id = %self.job_id, "Failed to write scheduler completion audit record: {error}");
         }
         self.running_guard.release().await;
     }
