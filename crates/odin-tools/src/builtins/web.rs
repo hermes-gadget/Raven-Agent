@@ -18,13 +18,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_HTTP_BODY_BYTES: usize = 100_000;
 
 fn http_timeout(context: &ToolContext) -> std::time::Duration {
-    std::time::Duration::from_secs(
-        context
-            .resource_budgets
-            .max_tool_timeout_secs
-            .max(1)
-            .min(30),
-    )
+    std::time::Duration::from_secs(context.resource_budgets.max_tool_timeout_secs.clamp(1, 30))
 }
 
 fn http_body_limit(context: &ToolContext) -> usize {
@@ -47,7 +41,7 @@ async fn read_bounded_body(
     let mut truncated = false;
 
     while let Some(chunk) = response.chunk().await? {
-        let remaining = MAX_HTTP_BODY_BYTES.saturating_sub(bytes.len());
+        let remaining = max_bytes.saturating_sub(bytes.len());
         let keep = remaining.min(chunk.len());
         bytes.extend_from_slice(&chunk[..keep]);
         if keep < chunk.len() {
@@ -1092,6 +1086,23 @@ mod tests {
         assert_eq!(http_timeout(&context), std::time::Duration::from_secs(7));
         assert_eq!(http_body_limit(&context), 512);
         assert_eq!(http_request_body_limit(&context), 256);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_body_honors_requested_limit() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("0123456789"))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.unwrap();
+        let (body, truncated) = read_bounded_body(response, 4).await.unwrap();
+
+        assert_eq!(body, "0123");
+        assert!(truncated);
     }
 
     #[tokio::test]

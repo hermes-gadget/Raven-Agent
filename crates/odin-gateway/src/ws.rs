@@ -722,16 +722,16 @@ async fn handle_ws_connection(socket: WebSocket, conn_mgr: Arc<WsConnectionManag
                             // this connection to it before acknowledging only
                             // the submitting client.
                             let payload = ws_msg.payload.clone().unwrap_or_default();
-                            if let Some(scope) = requested_scope(&payload) {
-                                if let Err(error) = conn_mgr.subscribe(&conn_id_clone, &scope) {
-                                    let response = WsMessage {
-                                        msg_type: "task_error".into(),
-                                        payload: Some(serde_json::json!({"error": error})),
-                                        correlation_id: ws_msg.correlation_id.clone(),
-                                    };
-                                    let _ = conn_mgr.send_to(&conn_id_clone, &response);
-                                    continue;
-                                }
+                            if let Some(scope) = requested_scope(&payload)
+                                && let Err(error) = conn_mgr.subscribe(&conn_id_clone, &scope)
+                            {
+                                let response = WsMessage {
+                                    msg_type: "task_error".into(),
+                                    payload: Some(serde_json::json!({"error": error})),
+                                    correlation_id: ws_msg.correlation_id.clone(),
+                                };
+                                let _ = conn_mgr.send_to(&conn_id_clone, &response);
+                                continue;
                             }
                             let response = WsMessage {
                                 msg_type: "task_submitted".into(),

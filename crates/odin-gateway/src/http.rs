@@ -38,6 +38,28 @@ pub type TaskHandlerFn = Arc<
         + Sync,
 >;
 
+/// Listener and authentication settings for separate public and management servers.
+pub struct ManagementAuthParams {
+    /// Public task-submission listener address.
+    pub public_addr: String,
+    /// Authenticated management listener address.
+    pub management_addr: String,
+    /// Bearer credential required by the management listener.
+    pub operator_token: String,
+    /// Optional bearer credential required by the public listener.
+    pub public_auth_token: Option<String>,
+    /// Whether to permit a public listener on a non-loopback address without public auth.
+    pub allow_insecure_non_loopback: bool,
+}
+
+/// Listener, authentication, and resource-budget settings for the HTTP servers.
+pub struct ManagementAuthBudgetParams {
+    /// Listener and authentication settings.
+    pub auth: ManagementAuthParams,
+    /// Central request and execution budgets.
+    pub resource_budgets: ResourceBudgetConfig,
+}
+
 /// Shared state for the HTTP server.
 #[derive(Clone)]
 pub struct GatewayState {
@@ -1006,11 +1028,13 @@ pub async fn run_http_server_with_management(
     approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
 ) -> OdinResult<()> {
     run_http_server_with_management_auth(
-        public_addr,
-        management_addr,
-        operator_token,
-        None,
-        false,
+        ManagementAuthParams {
+            public_addr: public_addr.to_owned(),
+            management_addr: management_addr.to_owned(),
+            operator_token,
+            public_auth_token: None,
+            allow_insecure_non_loopback: false,
+        },
         task_handler,
         ws_manager,
         tool_registry,
@@ -1021,23 +1045,17 @@ pub async fn run_http_server_with_management(
 
 /// Run public and operator-only listeners with independent authentication.
 pub async fn run_http_server_with_management_auth(
-    public_addr: &str,
-    management_addr: &str,
-    operator_token: String,
-    public_auth_token: Option<String>,
-    allow_insecure_non_loopback: bool,
+    params: ManagementAuthParams,
     task_handler: Option<TaskHandlerFn>,
     ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
 ) -> OdinResult<()> {
     run_http_server_with_management_auth_and_budgets(
-        public_addr,
-        management_addr,
-        operator_token,
-        public_auth_token,
-        allow_insecure_non_loopback,
-        ResourceBudgetConfig::default(),
+        ManagementAuthBudgetParams {
+            auth: params,
+            resource_budgets: ResourceBudgetConfig::default(),
+        },
         task_handler,
         ws_manager,
         tool_registry,
@@ -1048,17 +1066,24 @@ pub async fn run_http_server_with_management_auth(
 
 /// Run public and operator-only listeners with explicit central budgets.
 pub async fn run_http_server_with_management_auth_and_budgets(
-    public_addr: &str,
-    management_addr: &str,
-    operator_token: String,
-    public_auth_token: Option<String>,
-    allow_insecure_non_loopback: bool,
-    resource_budgets: ResourceBudgetConfig,
+    params: ManagementAuthBudgetParams,
     task_handler: Option<TaskHandlerFn>,
     ws_manager: Option<Arc<crate::ws::WsConnectionManager>>,
     tool_registry: Option<Arc<odin_tools::ToolRegistry>>,
     approval_gate: Option<Arc<odin_permissions::ApprovalGate>>,
 ) -> OdinResult<()> {
+    let ManagementAuthBudgetParams {
+        auth:
+            ManagementAuthParams {
+                public_addr,
+                management_addr,
+                operator_token,
+                public_auth_token,
+                allow_insecure_non_loopback,
+            },
+        resource_budgets,
+    } = params;
+
     if operator_token.is_empty() || !operator_token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(odin_core::error::OdinError::Config(
             "the management API requires a non-empty visible-ASCII operator token".into(),
@@ -1066,7 +1091,7 @@ pub async fn run_http_server_with_management_auth_and_budgets(
     }
 
     validate_public_listener_auth(
-        public_addr,
+        &public_addr,
         public_auth_token.as_deref(),
         allow_insecure_non_loopback,
     )?;
@@ -1095,16 +1120,21 @@ pub async fn run_http_server_with_management_auth_and_budgets(
 
     // Bind both sockets before announcing readiness, so a management bind
     // failure cannot leave only the public task surface running.
-    let public_listener = TcpListener::bind(public_addr).await.map_err(|error| {
-        odin_core::error::OdinError::Network(format!(
-            "Failed to bind public HTTP listener to {public_addr}: {error}"
-        ))
-    })?;
-    let management_listener = TcpListener::bind(management_addr).await.map_err(|error| {
-        odin_core::error::OdinError::Network(format!(
-            "Failed to bind management HTTP listener to {management_addr}: {error}"
-        ))
-    })?;
+    let public_listener = TcpListener::bind(public_addr.as_str())
+        .await
+        .map_err(|error| {
+            odin_core::error::OdinError::Network(format!(
+                "Failed to bind public HTTP listener to {public_addr}: {error}"
+            ))
+        })?;
+    let management_listener =
+        TcpListener::bind(management_addr.as_str())
+            .await
+            .map_err(|error| {
+                odin_core::error::OdinError::Network(format!(
+                    "Failed to bind management HTTP listener to {management_addr}: {error}"
+                ))
+            })?;
 
     state.mark_ready();
     tracing::info!("[GATEWAY] Public HTTP server listening on {public_addr}");
