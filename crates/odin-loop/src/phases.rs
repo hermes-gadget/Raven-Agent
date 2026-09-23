@@ -1511,12 +1511,20 @@ fn truncate_string(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
     }
-    let mut end = max_bytes;
+    const SUFFIX: &str = " [truncated]";
+    let content_limit = if max_bytes >= SUFFIX.len() {
+        max_bytes - SUFFIX.len()
+    } else {
+        max_bytes
+    };
+    let mut end = content_limit.min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
     value.truncate(end);
-    value.push_str(" [truncated]");
+    if max_bytes >= SUFFIX.len() {
+        value.push_str(SUFFIX);
+    }
 }
 
 fn should_record_reliability(arguments: &str, capability_tags: &[String]) -> bool {
@@ -1640,7 +1648,7 @@ fn fallback_revise_strategy(retry_count: u32) -> String {
 
 #[cfg(test)]
 mod reliability_tests {
-    use super::should_record_reliability;
+    use super::{should_record_reliability, truncate_string};
 
     #[test]
     fn dry_run_requests_are_excluded_from_reliability() {
@@ -1651,5 +1659,18 @@ mod reliability_tests {
         ));
         assert!(should_record_reliability(r#"{"dry_run":false}"#, &[]));
         assert!(should_record_reliability("{}", &[]));
+    }
+
+    #[test]
+    fn output_truncation_is_utf8_safe_and_within_byte_budget() {
+        let mut output = "a🦊bcdefghijklm".to_string();
+        truncate_string(&mut output, 14);
+        assert_eq!(output, "a [truncated]");
+        assert!(output.len() <= 14);
+
+        let mut short_output = "a🦊bcdefghijklm".to_string();
+        truncate_string(&mut short_output, 4);
+        assert_eq!(short_output, "a");
+        assert!(short_output.len() <= 4);
     }
 }
