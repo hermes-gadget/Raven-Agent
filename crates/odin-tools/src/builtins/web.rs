@@ -18,13 +18,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_HTTP_BODY_BYTES: usize = 100_000;
 
 fn http_timeout(context: &ToolContext) -> std::time::Duration {
-    std::time::Duration::from_secs(
-        context
-            .resource_budgets
-            .max_tool_timeout_secs
-            .max(1)
-            .min(30),
-    )
+    std::time::Duration::from_secs(context.resource_budgets.max_tool_timeout_secs.clamp(1, 30))
 }
 
 fn http_body_limit(context: &ToolContext) -> usize {

@@ -40,9 +40,7 @@ fn command_result(tool_name: &str, output: process::BoundedOutput, start: Instan
         combined.push_str(&stderr);
     }
     if output.stdout_truncated || output.stderr_truncated {
-        combined.push_str(&format!(
-            "\n\n[TRUNCATED: output exceeded the configured per-stream limit]"
-        ));
+        combined.push_str("\n\n[TRUNCATED: output exceeded the configured per-stream limit]");
     }
 
     ToolResult {
