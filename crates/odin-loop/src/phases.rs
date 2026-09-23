@@ -386,7 +386,7 @@ impl Phase for ActPhase {
                                                             .await;
                                                     }
                                                     let tr = tool_arg_error_result(
-                                                        &tc,
+                                                        tc,
                                                         &tool_name,
                                                         format!(
                                                             "Invalid tool args: {}",
@@ -441,7 +441,7 @@ impl Phase for ActPhase {
                                                         .await;
                                                 }
                                                 let tr = tool_arg_error_result(
-                                                    &tc,
+                                                    tc,
                                                     &tool_name,
                                                     format!("Invalid tool args: {}", parse_error),
                                                 );
