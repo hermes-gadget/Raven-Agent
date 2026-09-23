@@ -2357,12 +2357,16 @@ async fn cmd_serve(addr: Option<String>, config_path: Option<PathBuf>) -> anyhow
             .with_control(orch_store, Some(operator_token.clone())),
     );
     let server_result = odin_gateway::run_http_server_with_management_auth_and_budgets(
-        &addr,
-        &management_addr,
-        operator_token,
-        public_auth_token,
-        config.gateway.allow_insecure_non_loopback,
-        config.effective_resource_budgets(),
+        odin_gateway::ManagementAuthBudgetParams {
+            auth: odin_gateway::ManagementAuthParams {
+                public_addr: addr,
+                management_addr,
+                operator_token,
+                public_auth_token,
+                allow_insecure_non_loopback: config.gateway.allow_insecure_non_loopback,
+            },
+            resource_budgets: config.effective_resource_budgets(),
+        },
         Some(handler),
         Some(ws_manager),
         Some(tool_registry),
